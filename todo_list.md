@@ -1,70 +1,194 @@
-# Training Pipeline — Review Findings & TODO
+# Training Pipeline — Remediation Plan
 
-## Critical Bugs
+## Recommended Execution Order
 
-- [x] **LR grid search ignores `l1_ratio` — missing `penalty='elasticnet'`**
-  Fixed: added `penalty="elasticnet"` to LR in both `train_logistic_regression` and `train_stacking`. Also added `l1_ratio=0.5` to the grid.
+- [x] **Phase 0 — Freeze overclaims and define the official baseline**
+- [x] **Phase 1 — Repair temporal validity and leakage in `training.py`**
+- [x] **Phase 2 — Repair statistical inference and benchmark comparisons**
+- [x] **Phase 3 — Reduce feature-selection optimism**
+- [x] **Phase 4 — Add rolling out-of-time validation**
+- [x] **Phase 5 — Reassess population design if the use case is underwriting**
 
-- [x] **Target leakage in RFECV**
-  Fixed: `run_rfecv` now builds its own OrdinalEncoder-based preprocessor internally (no TargetEncoder, so no target leakage when pre-fitting on all data).
+## Phase 0 — Freeze Overclaims
 
-- [x] **Target leakage in categorical interaction screening**
-  Fixed: replaced in-sample `groupby().transform("mean")` with leave-one-out target encoding (`_loo_target_encode`) for both base AUC computation and categorical pair screening.
+- [x] **Remove unsupported significance language from outputs and README**
+- [x] **Treat `--reject-inference` as experimental, not part of the official benchmark**
+- [x] **Treat stacking as experimental until temporal validity is restored**
+- [x] **Clarify whether the target population is booked-only monitoring or underwriting-stage scoring**
 
-- [x] **Stacking LightGBM uses wrong preprocessor**
-  Documented as known limitation: StackingClassifier does not support per-estimator fit_params, so stacking LGBM uses TargetEncoder (generic preprocessor) instead of OrdinalEncoder + native categoricals. The meta-learner compensates.
+## `training.py` Checklist
 
-## Methodological Issues
+### 1. Temporal CV
 
-- [x] **No early stopping for tree models**
-  Fixed: Optuna objectives now use manual CV with early stopping (n_estimators ceiling=2000, early_stopping_rounds=50). Median best_iteration across folds is tracked and used for the final model fit.
+- [x] **Refactor `TemporalExpandingCV` to split by time blocks, not row-count boundaries**
+- [x] **Guarantee each fold satisfies `max(train_date) < min(val_date)`**
+- [x] **Prevent the same date cohort from appearing in both train and validation**
+- [x] **Add diagnostics for fold date ranges, row counts, and positive counts**
+- [x] **Fail early when folds are too small for stable evaluation**
 
-- [x] **Poor probability calibration**
-  Fixed: added `CalibratedClassifierCV(cv="prefit", method="isotonic")` calibration step using a 15% held-out calibration set for LR, LightGBM, and XGBoost. Both calibrated and uncalibrated versions are evaluated.
+### 2. Reject Inference
 
-- [x] **Interaction sample naming is misleading**
-  Fixed: removed misleading `pos`/`neg`/`sample` variables; code now uses `df_search` and `y_search` directly.
+- [x] **Restrict `compute_score_band_bad_rates()` to booked rows with `mis_Date < SPLIT_DATE`**
+- [x] **Ensure no post-split matured outcomes are used to estimate pseudo-label rates**
+- [x] **Keep `create_reject_pseudo_labels()` limited to pre-split rejects only**
+- [x] **Add assertions that pseudo-label source statistics come from the allowed time window**
+- [x] **Keep reject inference opt-in and excluded from the official summary tables**
 
-- [x] **`product_type_1` and `acct_booked_H0` not in interaction search**
-  Fixed: added both to `DROP_COLS` — they are single-value columns with no discriminative power.
+### 3. Calibration
 
-- [ ] **No monotonicity constraints for credit risk features**
-  Features like INCOME, AGE, TENOR have business-expected monotonic relationships with default probability. LightGBM and XGBoost both support `monotone_constraints`. Not using them risks non-intuitive model behavior and regulatory challenge.
+- [x] **Replace the random calibration split in `main()` with a temporal calibration block**
+- [x] **Use the latest pre-split booked window for calibration and earlier data for fitting**
+- [x] **Ensure calibration uses booked-only ground-truth rows even when reject inference is enabled**
+- [x] **Log calibration date range, row count, and positive count**
 
-- [x] **CV folds mismatch between notebook and script**
-  Script uses `n_splits=5` consistently. Notebook was the development version; `training.py` is the source of truth.
+### 4. Stacking
 
-## Additional Features & Improvements
+- [ ] **Remove `StratifiedKFold(shuffle=True)` from official stacking**
+- [ ] **Either exclude stacking from official evaluation or rebuild it using temporal out-of-fold predictions**
+- [ ] **If rebuilding, train the meta-learner only on temporally valid out-of-fold base predictions**
+- [ ] **Keep stacking labeled experimental until the temporal implementation is complete**
 
-- [ ] **Add SHAP explainability**
-  Compute SHAP values for the best tree model. Critical for regulatory explainability (IRB/IFRS9) and model governance. Plot summary, dependence, and force plots.
+### 5. Feature Discovery and Selection
 
-- [ ] **Add PSI / CSI stability metrics**
-  Population Stability Index (score drift) and Characteristic Stability Index (feature drift) between train/test. Standard in credit risk model monitoring.
+- [x] **Separate interaction screening from final model estimation**
+- [x] **Move `search_interactions()` and RFECV into a nested temporal workflow or a dedicated development window**
+- [x] **Freeze the feature set before final out-of-time testing**
+- [x] **Track feature provenance: raw, engineered, interaction, frequency, group-stat, RFECV-kept**
+- [x] **Run ablations for raw features, engineered features, interaction search, RFECV, calibration, and reject inference**
 
-- [ ] **Add KS statistic and Gini coefficient**
-  KS (max separation of cumulative distributions) and Gini (2 * AUC - 1) are standard credit risk discrimination metrics. Add to evaluation output.
+### 6. Statistical Comparison Utilities
 
-- [ ] **Add confusion matrix at business thresholds**
-  Compute precision/recall/F1 at relevant approval-rate cutoffs (e.g., top 5%, 10%, 20% risk). Show lift tables and capture rates.
+- [x] **Keep `evaluate()` for marginal per-model summaries**
+- [x] **Add paired bootstrap delta functions for AUC, PR AUC, and Brier**
+- [x] **Add DeLong ROC AUC comparison or another defensible paired AUC test**
+- [x] **Write a new comparison output comparing each candidate model to `risk_score_rf` and `score_RF`**
+- [x] **Stop using overlap of marginal confidence intervals as the decision rule for model comparisons**
 
-- [ ] **Add WoE / IV analysis**
-  Weight of Evidence binning and Information Value for individual feature assessment. Standard regulatory requirement for scorecard development.
+### 7. Output and Control Flow
 
-- [ ] **Model persistence**
-  Save trained models (`joblib.dump`) and preprocessing artifacts for deployment and reproducibility. Currently nothing is saved.
+- [x] **Make development, calibration, and test populations explicit in `main()` variable naming**
+- [x] **Separate official outputs from experimental outputs**
+- [x] **Exclude experimental modes from the primary leaderboard CSVs**
+- [x] **Update logging so every training stage reports its date window and sample definition**
 
-- [ ] **Experiment tracking**
-  Integrate MLflow or similar to log hyperparameters, metrics, and artifacts across runs.
+### 8. Population Design (Underwriting)
 
-- [ ] **Reject inference**
-  Only booked accounts are modeled. Rejected/canceled accounts (95.7% of data) are discarded. Consider reject inference techniques (e.g., parceling, augmentation, bivariate) to reduce selection bias.
+- [x] **Add explicit `population_mode` handling for booked monitoring vs underwriting**
+- [x] **Load booked plus rejected/canceled decisioned applications for underwriting runs**
+- [x] **Keep booked-only evaluation explicitly labeled as a proxy population in underwriting mode**
+- [x] **Tag benchmark, rolling OOT, and ablation outputs with `population_mode` and `evaluation_population`**
+- [x] **Write `population_summary.csv` and `applicant_scores_post_split.csv` for underwriting runs**
 
-- [ ] **Score distribution plots**
-  Add score distribution histograms split by target class for train and test sets to visually assess discrimination and stability.
+## Test Suite Checklist
 
-- [ ] **Feature importance export**
-  Save feature importance rankings (split-based and gain-based for trees, coefficients for LR) to a CSV/JSON artifact for model documentation.
+### 1. Fix Stale Tests First
 
-- [ ] **Add stratified bootstrap confidence intervals**
-  Report confidence intervals for AUC, PR AUC, and Brier on the test set via bootstrap resampling. Point estimates alone are insufficient for model comparison with this sample size.
+- [ ] **Update `tests/test_features.py` to match current `engineer_features()` column names**
+- [x] **Update all callers to the current `temporal_split()` return signature**
+- [x] **Update `tests/test_pipeline.py` to the current `train_stacking()` signature**
+- [ ] **Remove or rewrite assertions that reflect outdated methodology**
+
+### 2. Temporal Split and CV Tests
+
+- [x] **Add tests that each temporal fold satisfies strict past-to-future ordering**
+- [x] **Add tests that date cohorts are not split across train and validation**
+- [x] **Add tests that training folds expand monotonically over time**
+- [x] **Add tests that tiny time windows fail clearly**
+
+### 3. Reject Inference Tests
+
+- [x] **Add tests that `compute_score_band_bad_rates()` excludes rows on or after `SPLIT_DATE`**
+- [x] **Add a regression test where post-split outcomes would change band bad rates if leakage existed**
+- [x] **Add tests that pseudo-labeled rejects are always pre-split**
+- [x] **Add tests that rows without `risk_score_rf` are excluded from pseudo-labeling**
+- [x] **Add tests that booked-only rows are the sole source of band bad-rate estimation**
+
+### 4. Calibration Tests
+
+- [x] **Add tests that the calibration block is later than the fit block**
+- [ ] **Add tests that calibration remains pre-test**
+- [x] **Add tests that calibration uses only booked ground-truth rows**
+- [ ] **Add tests for calibration metadata and date-range logging helpers if introduced**
+
+### 5. Stacking Tests
+
+- [ ] **If stacking is removed from official runs, add tests that it is excluded by default**
+- [ ] **If temporal stacking is implemented, add tests that each row receives exactly one temporal out-of-fold prediction**
+- [ ] **Add regression tests proving the meta-learner never trains on future-informed predictions**
+
+### 6. Statistical Comparison Tests
+
+- [x] **Create `tests/test_statistics.py`**
+- [x] **Test paired bootstrap deltas on identical score arrays**
+- [x] **Test paired bootstrap deltas on clearly better score arrays**
+- [x] **Test comparison output schema and column names**
+- [x] **If DeLong is implemented, add sanity tests for identical and clearly distinct predictors**
+
+### 7. End-to-End Pipeline Tests
+
+- [x] **Refocus `tests/test_pipeline.py` on the official non-experimental path**
+- [x] **Add an official-baseline smoke test with temporal calibration and no reject inference**
+- [x] **Add an experimental-mode smoke test only if reject inference or stacking remains available**
+- [x] **Assert artifact presence by mode so official and experimental outputs remain separated**
+
+### 8. Underwriting Population Tests
+
+- [x] **Add targeted tests for `build_population_summary_df()`**
+- [x] **Add targeted tests for `build_applicant_score_frame()`**
+- [x] **Add artifact assertions for underwriting output CSVs**
+- [x] **Run a broader regression subset around the underwriting refactor**
+
+## File-Level Breakdown
+
+### `training.py`
+
+- [ ] **Edit `TemporalExpandingCV`**
+- [ ] **Edit `compute_score_band_bad_rates()`**
+- [ ] **Edit `create_reject_pseudo_labels()` guardrails**
+- [ ] **Edit calibration split logic in `main()`**
+- [ ] **Edit `train_stacking()` or remove it from the official flow**
+- [x] **Add paired comparison utilities**
+- [x] **Update artifact writing for paired comparison outputs**
+
+### `tests/conftest.py`
+
+- [x] **Fix `temporal_split()` fixture unpacking**
+- [x] **Add fixtures with explicit time structure**
+- [ ] **Add fixtures that expose leakage if post-split rows are mistakenly used**
+
+### `tests/test_features.py`
+
+- [ ] **Update stale expected engineered feature names**
+- [ ] **Keep assertions aligned with the current implementation**
+
+### `tests/test_reject_inference.py`
+
+- [x] **Add leakage-specific tests**
+- [x] **Add time-boundary and source-population tests**
+
+### `tests/test_split_and_eval.py`
+
+- [x] **Update `temporal_split()` unpacking**
+- [x] **Add stricter temporal invariants**
+- [ ] **Keep metric smoke tests**
+
+### `tests/test_pipeline.py`
+
+- [x] **Fix outdated `train_stacking()` usage**
+- [x] **Refocus on official pipeline behavior**
+- [x] **Add mode-aware artifact assertions**
+
+### `tests/test_statistics.py`
+
+- [x] **Create the file**
+- [x] **Add paired bootstrap delta tests**
+- [x] **Add comparison schema tests**
+- [x] **Add inferential edge-case tests**
+
+## Acceptance Criteria
+
+- [ ] **No official training path uses future labels**
+- [ ] **All validation, calibration, and ensemble construction are temporally defensible**
+- [ ] **The test suite matches the actual current API**
+- [ ] **Benchmark claims are backed by paired model-comparison outputs**
+- [ ] **Experimental modes are clearly separated from official results**
