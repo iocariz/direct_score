@@ -50,7 +50,7 @@ class _DummyStudy:
     def __init__(self, best_params: dict | None = None):
         self.best_value = 0.10
         self.best_trial = SimpleNamespace(number=0)
-        self.best_params = best_params or {"C": 1.0}
+        self.best_params = {"C": 1.0} if best_params is None else best_params
 
 
 class _IdentityCalibrator:
@@ -150,11 +150,7 @@ def _patch_fast_main_dependencies(monkeypatch, structured_raw_df_with_rejects):
     monkeypatch.setattr(
         training_module,
         "train_stacking",
-        lambda X_train, y_train, preprocessor, lr_study, lgbm_best_n, lgbm_study, xgb_best_n, xgb_study, catboost_best_n, catboost_study, pos_weight, cv, monotone_constraints=None: _fit_quick_pipeline(
-            X_train,
-            y_train,
-            preprocessor,
-        ),
+        lambda X_train, y_train, base_models, cv, sample_weight=None: next(iter(base_models.values())),
     )
 
     def _fake_rolling_oot(*args, **kwargs):
@@ -308,7 +304,7 @@ def _patch_fast_main_dependencies(monkeypatch, structured_raw_df_with_rejects):
 @pytest.fixture()
 def pipeline_data(train_test_data):
     """Prepare data ready for model training (cardinality reduced, preprocessors built)."""
-    X_train, y_train, X_test, y_test, num_cols, cat_cols, feature_cols = train_test_data
+    X_train, y_train, X_test, y_test, num_cols, cat_cols, feature_cols, train_dates = train_test_data
 
     if len(X_train) < 20 or y_train.sum() < 2:
         pytest.skip("Not enough data for model training")
@@ -327,6 +323,33 @@ def pipeline_data(train_test_data):
         "lgbm_cat_indices": lgbm_cat_indices,
         "pos_weight": pos_weight,
         "cv": cv,
+        "train_dates": pd.to_datetime(np.asarray(train_dates)),
+    }
+
+
+@pytest.fixture()
+def temporal_pipeline_data(structured_raw_df):
+    df = engineer_features(structured_raw_df)
+    feature_cols, num_cols, cat_cols = select_features(df)
+    X_train, y_train, X_test, y_test, _, _, train_dates = temporal_split(df, feature_cols)
+    X_train, X_test, _ = reduce_cardinality(X_train, X_test, cat_cols)
+    preprocessor, lgbm_preprocessor, lgbm_cat_indices = build_preprocessors(num_cols, cat_cols)
+    pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+    temporal_cv = training_module.make_temporal_cv(train_dates, max_splits=3)
+    return {
+        "X_train": X_train,
+        "y_train": y_train,
+        "X_test": X_test,
+        "y_test": y_test,
+        "num_cols": num_cols,
+        "cat_cols": cat_cols,
+        "feature_cols": feature_cols,
+        "preprocessor": preprocessor,
+        "lgbm_preprocessor": lgbm_preprocessor,
+        "lgbm_cat_indices": lgbm_cat_indices,
+        "pos_weight": pos_weight,
+        "temporal_cv": temporal_cv,
+        "train_dates": pd.to_datetime(np.asarray(train_dates)),
     }
 
 
@@ -388,33 +411,44 @@ class TestTrainXgboost:
 
 
 class TestTrainStacking:
-    def test_returns_fitted_model(self, pipeline_data):
-        d = pipeline_data
-        # Train base models first (minimal)
-        _, lr_study = train_logistic_regression(
-            d["X_train"], d["y_train"], d["preprocessor"], d["cv"], n_trials=2,
-        )
-        _, lgbm_study, lgbm_n = train_lgbm(
-            d["X_train"], d["y_train"],
-            d["lgbm_preprocessor"], d["lgbm_cat_indices"],
-            d["pos_weight"], d["cv"], n_trials=2,
-        )
-        _, xgb_study, xgb_n = train_xgboost(
-            d["X_train"], d["y_train"], d["preprocessor"],
-            d["pos_weight"], d["cv"], n_trials=2,
-        )
-        _, catboost_study, catboost_n = train_catboost(
-            d["X_train"], d["y_train"],
-            d["lgbm_preprocessor"], d["pos_weight"], d["cv"], n_trials=2,
-        )
+    def test_returns_fitted_temporal_model(self, temporal_pipeline_data):
+        d = temporal_pipeline_data
+        base_models = {
+            "Logistic Regression": _fit_quick_pipeline(d["X_train"], d["y_train"], d["preprocessor"]),
+            "LightGBM": _fit_quick_pipeline(d["X_train"], d["y_train"], d["lgbm_preprocessor"]),
+        }
 
         stack = train_stacking(
-            d["X_train"], d["y_train"], d["preprocessor"],
-            lr_study, max(lgbm_n, 1), lgbm_study, max(xgb_n, 1), xgb_study,
-            max(catboost_n, 1), catboost_study, d["pos_weight"], d["cv"],
+            d["X_train"],
+            d["y_train"],
+            base_models,
+            d["temporal_cv"],
         )
         proba = stack.predict_proba(d["X_test"])
         assert proba.shape == (len(d["X_test"]), 2)
+        assert set(stack.named_estimators_) == {"Logistic Regression", "LightGBM"}
+        assert len(stack.fold_validation_positions_) > 0
+
+    def test_uses_temporal_oof_predictions_without_future_leakage(self, temporal_pipeline_data):
+        d = temporal_pipeline_data
+        base_models = {
+            "Logistic Regression": _fit_quick_pipeline(d["X_train"], d["y_train"], d["preprocessor"]),
+        }
+
+        stack = train_stacking(
+            d["X_train"],
+            d["y_train"],
+            base_models,
+            d["temporal_cv"],
+        )
+
+        validation_positions = np.concatenate(stack.fold_validation_positions_)
+        assert len(validation_positions) == len(np.unique(validation_positions))
+        assert np.array_equal(np.sort(validation_positions), np.sort(stack.meta_training_positions_))
+
+        train_dates = d["train_dates"]
+        for train_idx, val_idx in zip(stack.fold_training_positions_, stack.fold_validation_positions_, strict=True):
+            assert pd.Timestamp(train_dates[train_idx].max()) < pd.Timestamp(train_dates[val_idx].min())
 
 
 class TestEvaluateAll:

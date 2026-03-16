@@ -160,7 +160,7 @@ def train_test_data(engineered_df):
     """Minimal train/test split arrays for model testing."""
     from training import select_features, temporal_split
     feature_cols, num_cols, cat_cols = select_features(engineered_df)
-    X_train, y_train, X_test, y_test, bench_risk, bench_score, _ = temporal_split(
+    X_train, y_train, X_test, y_test, bench_risk, bench_score, train_dates = temporal_split(
         engineered_df, feature_cols,
     )
-    return X_train, y_train, X_test, y_test, num_cols, cat_cols, feature_cols
+    return X_train, y_train, X_test, y_test, num_cols, cat_cols, feature_cols, train_dates

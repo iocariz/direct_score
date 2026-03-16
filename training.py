@@ -16,9 +16,7 @@ import warnings
 from contextlib import contextmanager
 from itertools import combinations
 from pathlib import Path
-from statistics import NormalDist
 
-import joblib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -32,13 +30,11 @@ from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import StackingClassifier
 from sklearn.feature_selection import RFECV
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
-    brier_score_loss,
     roc_auc_score,
 )
 from sklearn.model_selection import (
@@ -49,6 +45,60 @@ from sklearn.preprocessing import OrdinalEncoder, StandardScaler, TargetEncoder
 from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 from catboost import CatBoostClassifier
 from xgboost import XGBClassifier
+
+from training_constants import (
+    BENCHMARK_MODEL_NAMES,
+    CALIBRATION_FRACTION,
+    DROP_COLS,
+    EARLY_STOPPING_ROUNDS,
+    EXPERIMENTAL_STACKING_NAME,
+    FEATURE_DISCOVERY_FRACTION,
+    MATURITY_CUTOFF,
+    MAX_CATEGORIES,
+    MIN_LIFT,
+    MIN_VALID,
+    MISS_CANDIDATES,
+    MONOTONE_MAP,
+    N_BOOTSTRAP,
+    N_ESTIMATORS_CEILING,
+    OFFICIAL_MODEL_NAMES,
+    POPULATION_MODE_BOOKED_MONITORING,
+    POPULATION_MODE_UNDERWRITING,
+    RANDOM_STATE,
+    RAW_CAT,
+    RAW_NUM,
+    REJECT_MAX_RATIO,
+    REJECT_MULTIPLIER,
+    REJECT_N_BINS,
+    REJECT_SAMPLE_WEIGHT,
+    REJECT_SCORE_COL,
+    ROLLING_OOT_MAX_WINDOWS,
+    SPLIT_DATE,
+    SUMMARY_MODEL_NAMES,
+    TARGET,
+    UNDERWRITING_DECISION_STATUSES,
+)
+from training_reporting import (
+    _compute_midrank,
+    _fast_delong,
+    _ks_statistic,
+    _metric_improvement,
+    _score_is_probability,
+    _score_metric,
+    bootstrap_confidence_intervals,
+    build_holdout_score_frame,
+    delong_auc_test,
+    evaluate,
+    evaluate_all,
+    evaluate_safely,
+    extract_feature_importance,
+    paired_bootstrap_benchmark_comparisons,
+    paired_bootstrap_metric_delta,
+    plot_score_distributions,
+    sanitize_output_name,
+    save_artifacts,
+    split_leaderboard_results,
+)
 
 
 # ── Logging & warnings setup ──────────────────────────────────────────────────
@@ -101,99 +151,6 @@ def _log_step(step_num: int | str, description: str):
         logger.info("  done ({:.0f}m {:.0f}s)", elapsed // 60, elapsed % 60)
     else:
         logger.info("  done ({:.1f}s)", elapsed)
-
-# ── Constants ──────────────────────────────────────────────────────────────────
-
-TARGET = "basel_bad"
-MATURITY_CUTOFF = "2025-01-01"
-SPLIT_DATE = "2024-07-01"
-RANDOM_STATE = 42
-MAX_CATEGORIES = 20
-MIN_LIFT = 0.01
-MIN_VALID = 5_000
-N_ESTIMATORS_CEILING = 2000
-EARLY_STOPPING_ROUNDS = 50
-N_BOOTSTRAP = 1000
-CALIBRATION_FRACTION = 0.15
-FEATURE_DISCOVERY_FRACTION = 0.50
-ROLLING_OOT_MAX_WINDOWS = 4
-POPULATION_MODE_BOOKED_MONITORING = "booked_monitoring"
-POPULATION_MODE_UNDERWRITING = "underwriting"
-UNDERWRITING_DECISION_STATUSES = ("Booked", "Rejected", "Canceled")
-OFFICIAL_MODEL_NAMES = [
-    "Logistic Regression",
-    "LightGBM",
-    "XGBoost",
-    "CatBoost",
-]
-EXPERIMENTAL_STACKING_NAME = "Stacking (experimental)"
-SUMMARY_MODEL_NAMES = OFFICIAL_MODEL_NAMES + [EXPERIMENTAL_STACKING_NAME]
-BENCHMARK_MODEL_NAMES = [
-    "risk_score_rf (benchmark)",
-    "score_RF (benchmark)",
-]
-
-# Reject inference (score-anchored parceling)
-REJECT_SCORE_COL = "risk_score_rf"
-REJECT_N_BINS = 10
-REJECT_MULTIPLIER = 1.5
-REJECT_MAX_RATIO = 1.0
-REJECT_SAMPLE_WEIGHT = 0.5
-
-DROP_COLS = [
-    TARGET,
-    "authorization_id",
-    "mis_Date",
-    "rf_business_name",
-    "rf_ext_business_name",
-    "a_business_name",
-    "ext_business_name",
-    "SCRPLUST1",
-    "reject_reason",
-    "status_name",
-    "risk_score_rf",
-    "score_RF",
-    "product_type_1",    # single-value column, no discriminative power
-    "acct_booked_H0",    # single-value column, no discriminative power
-    "INCOME_T2",         # co-debtor income: raw value excluded (CSI > 1.0), derived features kept
-]
-
-RAW_NUM = [
-    "CODRAMA", "TOTAL_AMT", "INSTALLMENT_AMT",
-    "TOTAL_CARD_NBR", "TOTAL_LOAN_NBR", "BOOK_CARD_NBR", "BOOK_LOAN_NBR",
-    "AGE_T1", "LEFT_TO_LIVE", "HOUSE_YEARS", "TENOR",
-    "MAX_CREDIT_TJ_AV", "INCOME_T1", "INCIT1_L12", "flag_risk3",
-]
-
-RAW_CAT = [
-    "CUSTOMER_TYPE", "FAMILY_SITUATION", "HOUSE_TYPE",
-    "product_type_2", "product_type_3", "CSP", "CPRO", "CMAT",
-    "ESTCLI1", "ESTCLI2", "CSECTOR", "FLAG_COTIT",
-]
-
-MISS_CANDIDATES = ["MAX_CREDIT_TJ_AV", "INCIT1_L12", "HOUSE_YEARS", "ESTCLI1", "ESTCLI2"]
-
-# Monotonicity constraints for tree models: expected direction with P(default).
-#   -1 = higher value → lower default risk
-#    1 = higher value → higher default risk
-#    0 = unconstrained (default for unmapped features + all categoricals)
-MONOTONE_MAP = {
-    # Income / capacity → more = safer
-    "INCOME_T1": -1, "LOG_INCOME_T1": -1, "HOUSEHOLD_INCOME": -1,
-    "MAX_CREDIT_TJ_AV": -1, "LOG_MAX_CREDIT": -1,
-    "HAS_CODEBTOR": -1, "CODEBTOR_INCOME_SHARE": -1,
-    "BOOK_RATIO_LOAN": -1, "BOOK_RATIO_CARD": -1,
-    # Demographics → older / more settled = safer
-    "AGE_T1": -1, "LEFT_TO_LIVE": -1, "HOUSE_YEARS": -1,
-    # Affordability → higher burden = riskier
-    "INSTALLMENT_TO_INCOME": 1, "TOTAL_AMT_TO_INCOME": 1,
-    "INSTALLMENT_TO_HOUSEHOLD": 1, "TOTAL_AMT_TO_HOUSEHOLD": 1,
-    "AMT_PER_MONTH": 1,
-    # Bureau-normalised burden → higher = riskier
-    "INSTALLMENT_AMT_DIV_MAX_CREDIT_TJ_AV": 1,
-    "TENOR_DIV_MAX_CREDIT_TJ_AV": 1,
-}
-
 
 # ── Temporal CV ────────────────────────────────────────────────────────────────
 
@@ -486,16 +443,6 @@ def _loo_target_encode(groups: np.ndarray, y: np.ndarray) -> np.ndarray:
     loo_mean = (group_sum - df_temp["y"]) / (group_count - 1)
     loo_mean = loo_mean.fillna(y.mean())
     return loo_mean.values
-
-
-def _ks_statistic(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """Kolmogorov-Smirnov statistic: max separation between pos/neg CDFs."""
-    pos = np.sort(y_score[y_true == 1])
-    neg = np.sort(y_score[y_true == 0])
-    all_s = np.sort(y_score)
-    pos_cdf = np.searchsorted(pos, all_s, side="right") / len(pos)
-    neg_cdf = np.searchsorted(neg, all_s, side="right") / len(neg)
-    return float(np.max(np.abs(pos_cdf - neg_cdf)))
 
 
 def _safe_auc(y: np.ndarray, s: np.ndarray) -> tuple[float, int]:
@@ -1321,15 +1268,21 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
             )
             y_pred = clf.predict_proba(X_va_t)[:, 1]
             fold_scores.append(average_precision_score(y_f_va, y_pred))
-            fold_best_iters.append(clf.best_iteration_)
+            fold_best_iters.append(normalize_estimator_count(clf.best_iteration_, fallback=N_ESTIMATORS_CEILING))
 
-        trial.set_user_attr("best_n_estimators", int(np.median(fold_best_iters)))
+        trial.set_user_attr(
+            "best_n_estimators",
+            normalize_estimator_count(np.median(fold_best_iters), fallback=N_ESTIMATORS_CEILING),
+        )
         return np.mean(fold_scores)
 
     study = optuna.create_study(direction="maximize", study_name="lgbm")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
-    best_n_estimators = study.best_trial.user_attrs["best_n_estimators"]
+    best_n_estimators = normalize_estimator_count(
+        study.best_trial.user_attrs["best_n_estimators"],
+        fallback=N_ESTIMATORS_CEILING,
+    )
     bp = study.best_params
     logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
     logger.info("  n_estimators={} (early stop), lr={:.4f}, leaves={}, depth={}, min_child={}",
@@ -1413,7 +1366,10 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
     study = optuna.create_study(direction="maximize", study_name="xgb")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
-    best_n_estimators = study.best_trial.user_attrs["best_n_estimators"]
+    best_n_estimators = normalize_estimator_count(
+        study.best_trial.user_attrs["best_n_estimators"],
+        fallback=N_ESTIMATORS_CEILING,
+    )
     bp = study.best_params
     logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
     logger.info("  n_estimators={} (early stop), lr={:.4f}, depth={}, min_child_w={}",
@@ -1484,15 +1440,26 @@ def train_catboost(X_train, y_train, lgbm_preprocessor, pos_weight, cv, n_trials
             )
             y_pred = clf.predict_proba(X_va_t)[:, 1]
             fold_scores.append(average_precision_score(y_f_va, y_pred))
-            fold_best_iters.append(clf.best_iteration_)
+            fold_best_iters.append(
+                normalize_estimator_count(
+                    None if clf.best_iteration_ is None else clf.best_iteration_ + 1,
+                    fallback=N_ESTIMATORS_CEILING,
+                )
+            )
 
-        trial.set_user_attr("best_n_estimators", int(np.median(fold_best_iters)))
+        trial.set_user_attr(
+            "best_n_estimators",
+            normalize_estimator_count(np.median(fold_best_iters), fallback=N_ESTIMATORS_CEILING),
+        )
         return np.mean(fold_scores)
 
     study = optuna.create_study(direction="maximize", study_name="catboost")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
-    best_n_estimators = study.best_trial.user_attrs["best_n_estimators"]
+    best_n_estimators = normalize_estimator_count(
+        study.best_trial.user_attrs["best_n_estimators"],
+        fallback=N_ESTIMATORS_CEILING,
+    )
     bp = study.best_params
     logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
     logger.info("  iterations={} (early stop), lr={:.4f}, depth={}, min_data_in_leaf={}",
@@ -1517,128 +1484,165 @@ def train_catboost(X_train, y_train, lgbm_preprocessor, pos_weight, cv, n_trials
     return catboost_model, study, best_n_estimators
 
 
+class TemporalStackingClassifier:
+    def __init__(
+        self,
+        named_estimators_: dict[str, Pipeline],
+        final_estimator_: LogisticRegression,
+        base_model_names_: list[str],
+        meta_feature_names_: list[str],
+        meta_training_positions_: np.ndarray,
+        fold_training_positions_: list[np.ndarray],
+        fold_validation_positions_: list[np.ndarray],
+    ):
+        self.named_estimators_ = named_estimators_
+        self.final_estimator_ = final_estimator_
+        self.base_model_names_ = base_model_names_
+        self.meta_feature_names_ = meta_feature_names_
+        self.meta_training_positions_ = np.asarray(meta_training_positions_, dtype=int)
+        self.fold_training_positions_ = [np.asarray(idx, dtype=int) for idx in fold_training_positions_]
+        self.fold_validation_positions_ = [np.asarray(idx, dtype=int) for idx in fold_validation_positions_]
+        self.classes_ = final_estimator_.classes_
+
+    def _build_meta_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        meta_features = {
+            feature_name: self.named_estimators_[model_name].predict_proba(X)[:, 1]
+            for model_name, feature_name in zip(self.base_model_names_, self.meta_feature_names_, strict=True)
+        }
+        return pd.DataFrame(meta_features, index=X.index)
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        return self.final_estimator_.predict_proba(self._build_meta_features(X))
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        return self.final_estimator_.predict(self._build_meta_features(X))
+
+
+def fit_pipeline_from_template(
+    model_template: Pipeline,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    sample_weight: np.ndarray | None = None,
+) -> Pipeline:
+    fitted_model = build_fresh_pipeline_from_fitted(model_template)
+    class_counts = pd.Series(y_train).value_counts()
+    if len(class_counts) >= 2:
+        safe_target_encoder_cv = int(min(5, len(y_train), class_counts.min()))
+        params = fitted_model.get_params()
+        if "preprocessor__cat__encoder__cv" in params:
+            fitted_model.set_params(preprocessor__cat__encoder__cv=max(2, safe_target_encoder_cv))
+
+    classifier = fitted_model.named_steps["classifier"]
+    fit_kwargs = {}
+    if sample_weight is not None:
+        fit_kwargs["classifier__sample_weight"] = sample_weight
+    if isinstance(classifier, LGBMClassifier):
+        preprocessor = fitted_model.named_steps["preprocessor"]
+        num_cols = list(preprocessor.transformers[0][2])
+        cat_cols = list(preprocessor.transformers[1][2])
+        fit_kwargs["classifier__categorical_feature"] = list(range(len(num_cols), len(num_cols) + len(cat_cols)))
+    fitted_model.fit(X_train, y_train, **fit_kwargs)
+    return fitted_model
+
+
 def train_stacking(
-    X_train, y_train,
-    preprocessor, lr_study,
-    lgbm_best_n_estimators, lgbm_study,
-    xgb_best_n_estimators, xgb_study,
-    catboost_best_n_estimators, catboost_study,
-    pos_weight, cv, monotone_constraints=None,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    base_models: dict[str, Pipeline],
+    cv,
+    sample_weight: np.ndarray | None = None,
 ):
-    logger.info("4 base learners (LR + LGBM + XGB + CatBoost) -> LR meta-learner, {} CV folds", cv.n_splits)
-    xgb_monotone_constraints = normalize_xgboost_monotone_constraints(monotone_constraints)
-    lgbm_best_n_estimators = normalize_estimator_count(lgbm_best_n_estimators, fallback=1)
-    xgb_best_n_estimators = normalize_estimator_count(xgb_best_n_estimators, fallback=1)
-    catboost_best_n_estimators = normalize_estimator_count(catboost_best_n_estimators, fallback=1)
-    # Note: stacking uses TargetEncoder (generic preprocessor) for all base learners
-    # because StackingClassifier does not support per-estimator fit_params.
-    # Hyperparameters from Optuna are used as reasonable starting values;
-    # the meta-learner compensates for any preprocessing mismatch.
-    stack_estimators = [
-        ("lr", Pipeline([
-            ("preprocessor", preprocessor),
-            ("classifier", LogisticRegression(
-                class_weight="balanced", max_iter=5000,
-                random_state=RANDOM_STATE, solver="lbfgs",
-                **lr_study.best_params,
-            )),
-        ])),
-        ("lgbm", Pipeline([
-            ("preprocessor", preprocessor),
-            ("classifier", LGBMClassifier(
-                n_estimators=lgbm_best_n_estimators,
-                scale_pos_weight=pos_weight,
-                monotone_constraints=monotone_constraints,
-                random_state=RANDOM_STATE, n_jobs=1, verbosity=-1,
-                **lgbm_study.best_params,
-            )),
-        ])),
-        ("xgb", Pipeline([
-            ("preprocessor", preprocessor),
-            ("classifier", XGBClassifier(
-                n_estimators=xgb_best_n_estimators,
-                scale_pos_weight=pos_weight,
-                monotone_constraints=xgb_monotone_constraints,
-                random_state=RANDOM_STATE, n_jobs=1, verbosity=0,
-                eval_metric="aucpr", **xgb_study.best_params,
-            )),
-        ])),
-        ("catboost", Pipeline([
-            ("preprocessor", preprocessor),
-            ("classifier", CatBoostClassifier(
-                iterations=catboost_best_n_estimators,
-                auto_class_weights="Balanced",
-                monotone_constraints=monotone_constraints,
-                random_seed=RANDOM_STATE, verbose=0,
-                **catboost_study.best_params,
-            )),
-        ])),
-    ]
+    if not base_models:
+        raise ValueError("Temporal stacking requires at least one base model")
 
-    # StackingClassifier requires a partition CV (cross_val_predict needs every
-    # sample in exactly one validation fold). Expanding-window CV has a
-    # training-only first segment → not a partition. Use StratifiedKFold here;
-    # temporal leakage is acceptable for the meta-learner (simple LR on
-    # probability outputs from already temporally-tuned base learners).
-    stack_n_splits = safe_stratified_n_splits(y_train, max_splits=cv.n_splits)
-    stack_cv = StratifiedKFold(n_splits=stack_n_splits, shuffle=True, random_state=RANDOM_STATE)
-    stack_model = StackingClassifier(
-        estimators=stack_estimators,
-        final_estimator=LogisticRegression(max_iter=20_000, random_state=RANDOM_STATE),
-        cv=stack_cv, stack_method="predict_proba",
-        n_jobs=-1, passthrough=False,
+    if not isinstance(y_train, pd.Series):
+        y_train = pd.Series(y_train, index=X_train.index)
+    else:
+        y_train = y_train.copy()
+
+    if len(X_train) != len(y_train):
+        raise ValueError("X_train and y_train must have the same length")
+
+    if sample_weight is not None:
+        sample_weight = np.asarray(sample_weight)
+        if len(sample_weight) != len(X_train):
+            raise ValueError("sample_weight must have the same length as X_train")
+
+    base_model_names = list(base_models)
+    meta_feature_names = [f"stack__{sanitize_output_name(name)}" for name in base_model_names]
+    oof_meta_features = np.full((len(X_train), len(base_model_names)), np.nan, dtype=float)
+    fold_training_positions: list[np.ndarray] = []
+    fold_validation_positions: list[np.ndarray] = []
+
+    logger.info(
+        "{} base learners -> LR meta-learner, {} temporal folds",
+        len(base_model_names),
+        cv.n_splits,
     )
-    # StackingClassifier cannot route sample_weight to Pipeline base estimators
-    # (no stepname__param support). Class imbalance is already handled via
-    # scale_pos_weight / class_weight in the individual estimators.
-    stack_model.fit(X_train, y_train)
-    return stack_model
 
+    for fold_number, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train), start=1):
+        y_fold_train = y_train.iloc[train_idx]
+        class_counts = pd.Series(y_fold_train).value_counts()
+        if len(class_counts) < 2 or class_counts.min() < 2:
+            logger.warning(
+                "Stacking fold {} skipped: fit window has insufficient class support ({})",
+                fold_number,
+                class_counts.to_dict(),
+            )
+            continue
 
-# ── Evaluation ─────────────────────────────────────────────────────────────────
+        X_fold_train = X_train.iloc[train_idx].copy()
+        X_fold_validation = X_train.iloc[val_idx].copy()
+        w_fold_train = sample_weight[train_idx] if sample_weight is not None else None
 
-def evaluate(name: str, y_true: np.ndarray, y_score: np.ndarray, is_probability: bool = True) -> dict:
-    mask = ~np.isnan(y_score)
-    y_true, y_score = y_true[mask], y_score[mask]
-    roc_auc = roc_auc_score(y_true, y_score)
-    result = {
-        "Model": name,
-        "ROC AUC": roc_auc,
-        "Gini": 2 * roc_auc - 1,
-        "KS": _ks_statistic(y_true, y_score),
-        "PR AUC": average_precision_score(y_true, y_score),
-        "N": mask.sum(),
-    }
-    result["Brier"] = brier_score_loss(y_true, np.clip(y_score, 0, 1)) if is_probability else np.nan
-    return result
+        for model_idx, model_name in enumerate(base_model_names):
+            fold_model = fit_pipeline_from_template(
+                base_models[model_name],
+                X_fold_train,
+                y_fold_train,
+                sample_weight=w_fold_train,
+            )
+            oof_meta_features[val_idx, model_idx] = fold_model.predict_proba(X_fold_validation)[:, 1]
 
+        fold_training_positions.append(np.asarray(train_idx, dtype=int))
+        fold_validation_positions.append(np.asarray(val_idx, dtype=int))
 
-def evaluate_safely(name: str, y_true: np.ndarray, y_score: np.ndarray, is_probability: bool = True) -> dict:
-    y_score = np.asarray(y_score, dtype=float)
-    mask = np.isfinite(y_score)
-    y_true = np.asarray(y_true)[mask]
-    y_score = y_score[mask]
+    meta_training_mask = np.isfinite(oof_meta_features).all(axis=1)
+    if not meta_training_mask.any():
+        raise ValueError("Temporal stacking produced no out-of-fold predictions")
 
-    result = {
-        "Model": name,
-        "ROC AUC": np.nan,
-        "Gini": np.nan,
-        "KS": np.nan,
-        "PR AUC": np.nan,
-        "N": int(mask.sum()),
-        "Brier": np.nan,
-    }
-    if len(y_true) == 0 or np.unique(y_true).size < 2:
-        return result
+    y_meta = y_train.iloc[meta_training_mask]
+    meta_class_counts = pd.Series(y_meta).value_counts()
+    if len(meta_class_counts) < 2:
+        raise ValueError("Temporal stacking meta-learner requires at least 2 classes in OOF predictions")
 
-    roc_auc = roc_auc_score(y_true, y_score)
-    result["ROC AUC"] = roc_auc
-    result["Gini"] = 2 * roc_auc - 1
-    result["KS"] = _ks_statistic(y_true, y_score)
-    result["PR AUC"] = average_precision_score(y_true, y_score)
-    if is_probability:
-        result["Brier"] = brier_score_loss(y_true, np.clip(y_score, 0, 1))
-    return result
+    meta_training_frame = pd.DataFrame(
+        oof_meta_features[meta_training_mask],
+        columns=meta_feature_names,
+        index=X_train.index[meta_training_mask],
+    )
+    meta_model = LogisticRegression(max_iter=20_000, random_state=RANDOM_STATE)
+    meta_fit_kwargs = {}
+    if sample_weight is not None:
+        meta_fit_kwargs["sample_weight"] = sample_weight[meta_training_mask]
+    meta_model.fit(meta_training_frame, y_meta, **meta_fit_kwargs)
+
+    logger.info(
+        "Temporal stacking meta-learner fit on {:,} OOF rows across {} folds ({} rows excluded)",
+        len(meta_training_frame),
+        len(fold_validation_positions),
+        len(X_train) - len(meta_training_frame),
+    )
+
+    return TemporalStackingClassifier(
+        named_estimators_=dict(base_models),
+        final_estimator_=meta_model,
+        base_model_names_=base_model_names,
+        meta_feature_names_=meta_feature_names,
+        meta_training_positions_=np.flatnonzero(meta_training_mask),
+        fold_training_positions_=fold_training_positions,
+        fold_validation_positions_=fold_validation_positions,
+    )
 
 
 def safe_stratified_n_splits(y, max_splits: int = 5) -> int:
@@ -1652,10 +1656,6 @@ def normalize_estimator_count(value, fallback: int = 1) -> int:
     if value is None or pd.isna(value):
         return fallback
     return max(int(value), fallback)
-
-
-def sanitize_output_name(name: str) -> str:
-    return name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
 
 
 def build_fresh_pipeline_from_fitted(model: Pipeline) -> Pipeline:
@@ -1778,395 +1778,6 @@ def build_applicant_score_frame(
     for name, model in models.items():
         score_frame[f"score__{sanitize_output_name(name)}"] = model.predict_proba(X_applicant)[:, 1]
     return score_frame.sort_values(["mis_Date", "authorization_id"]).reset_index(drop=True)
-
-
-def build_holdout_score_frame(
-    y_true: pd.Series | np.ndarray,
-    score_arrays: dict[str, np.ndarray],
-    population_mode: str | None = None,
-    evaluation_population: str | None = None,
-) -> pd.DataFrame:
-    score_frame = pd.DataFrame({TARGET: np.asarray(y_true, dtype=float)})
-    for name, scores in score_arrays.items():
-        score_frame[f"score__{sanitize_output_name(name)}"] = np.asarray(scores, dtype=float)
-    if population_mode is not None:
-        score_frame["population_mode"] = population_mode
-    if evaluation_population is not None:
-        score_frame["evaluation_population"] = evaluation_population
-    return score_frame
-
-
-def evaluate_all(
-    X_test, y_test, models: dict,
-    bench_risk_score_rf, bench_score_RF,
-) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
-    logger.info("Test set: {:,} rows ({:.2%} positive rate)", len(y_test), y_test.mean())
-    results = []
-    score_arrays: dict[str, np.ndarray] = {}
-
-    for name, mdl in models.items():
-        y_proba = mdl.predict_proba(X_test)[:, 1]
-        score_arrays[name] = y_proba
-        results.append(evaluate(name, y_test.values, y_proba))
-
-    # Benchmark scores: higher = safer, negate for ranking
-    for name, scores in zip(BENCHMARK_MODEL_NAMES, [bench_risk_score_rf, bench_score_RF], strict=True):
-        score_arrays[name] = -scores.values
-        results.append(evaluate(name, y_test.values, -scores.values, is_probability=False))
-
-    results_df = pd.DataFrame(results).set_index("Model")
-    results_df = results_df.sort_values("PR AUC", ascending=False)
-
-    logger.info("")
-    logger.info("{:<35s} {:>8s} {:>6s} {:>6s} {:>8s} {:>8s}", "Model", "ROC AUC", "Gini", "KS", "PR AUC", "Brier")
-    logger.info("{}", "─" * 77)
-    for model_name, row in results_df.iterrows():
-        brier_str = f"{row['Brier']:.4f}" if not np.isnan(row["Brier"]) else "   —"
-        logger.info("{:<35s} {:>8.4f} {:>6.4f} {:>6.4f} {:>8.4f} {:>8s}",
-                    model_name, row["ROC AUC"], row["Gini"], row["KS"], row["PR AUC"], brier_str)
-    logger.info("")
-
-    return results_df, score_arrays
-
-
-def _score_is_probability(scores: np.ndarray) -> bool:
-    finite_scores = np.asarray(scores, dtype=float)
-    finite_scores = finite_scores[np.isfinite(finite_scores)]
-    return len(finite_scores) > 0 and float(finite_scores.min()) >= 0 and float(finite_scores.max()) <= 1.0 + 1e-9
-
-
-def _score_metric(y_true: np.ndarray, scores: np.ndarray, metric_name: str, is_probability: bool) -> float:
-    try:
-        if metric_name == "AUC":
-            return roc_auc_score(y_true, scores)
-        if metric_name == "PR_AUC":
-            return average_precision_score(y_true, scores)
-        if metric_name == "Brier":
-            if not is_probability:
-                return np.nan
-            return brier_score_loss(y_true, np.clip(scores, 0, 1))
-    except ValueError:
-        return np.nan
-    raise ValueError(f"Unsupported metric: {metric_name}")
-
-
-def _metric_improvement(metric_name: str, candidate_value: float, reference_value: float) -> float:
-    if np.isnan(candidate_value) or np.isnan(reference_value):
-        return np.nan
-    if metric_name == "Brier":
-        return reference_value - candidate_value
-    return candidate_value - reference_value
-
-
-def _compute_midrank(x: np.ndarray) -> np.ndarray:
-    sort_order = np.argsort(x)
-    sorted_x = x[sort_order]
-    sorted_midranks = np.zeros(len(x), dtype=float)
-
-    i = 0
-    while i < len(sorted_x):
-        j = i
-        while j < len(sorted_x) and sorted_x[j] == sorted_x[i]:
-            j += 1
-        sorted_midranks[i:j] = 0.5 * (i + j - 1) + 1.0
-        i = j
-
-    midranks = np.empty(len(x), dtype=float)
-    midranks[sort_order] = sorted_midranks
-    return midranks
-
-
-def _fast_delong(predictions_sorted_transposed: np.ndarray, label_1_count: int) -> tuple[np.ndarray, np.ndarray]:
-    n_classifiers, n_examples = predictions_sorted_transposed.shape
-    m = label_1_count
-    n = n_examples - m
-
-    positive_examples = predictions_sorted_transposed[:, :m]
-    negative_examples = predictions_sorted_transposed[:, m:]
-
-    tx = np.empty((n_classifiers, m), dtype=float)
-    ty = np.empty((n_classifiers, n), dtype=float)
-    tz = np.empty((n_classifiers, n_examples), dtype=float)
-
-    for classifier_idx in range(n_classifiers):
-        tx[classifier_idx] = _compute_midrank(positive_examples[classifier_idx])
-        ty[classifier_idx] = _compute_midrank(negative_examples[classifier_idx])
-        tz[classifier_idx] = _compute_midrank(predictions_sorted_transposed[classifier_idx])
-
-    aucs = tz[:, :m].sum(axis=1) / (m * n) - (m + 1.0) / (2.0 * n)
-    v01 = (tz[:, :m] - tx) / n
-    v10 = 1.0 - (tz[:, m:] - ty) / m
-    sx = np.atleast_2d(np.cov(v01, bias=False))
-    sy = np.atleast_2d(np.cov(v10, bias=False))
-    return aucs, sx / m + sy / n
-
-
-def delong_auc_test(
-    y_true: np.ndarray,
-    candidate_scores: np.ndarray,
-    reference_scores: np.ndarray,
-) -> dict:
-    candidate_scores = np.asarray(candidate_scores, dtype=float)
-    reference_scores = np.asarray(reference_scores, dtype=float)
-    y_true = np.asarray(y_true)
-    mask = np.isfinite(y_true) & np.isfinite(candidate_scores) & np.isfinite(reference_scores)
-    y = y_true[mask].astype(int)
-    candidate = candidate_scores[mask]
-    reference = reference_scores[mask]
-
-    if len(y) == 0 or np.unique(y).size < 2:
-        return {
-            "n": len(y),
-            "n_pos": int((y == 1).sum()),
-            "n_neg": int((y == 0).sum()),
-            "candidate_auc": np.nan,
-            "reference_auc": np.nan,
-            "auc_improvement": np.nan,
-            "auc_se": np.nan,
-            "z_score": np.nan,
-            "p_value": np.nan,
-        }
-
-    candidate_auc = roc_auc_score(y, candidate)
-    reference_auc = roc_auc_score(y, reference)
-    auc_improvement = candidate_auc - reference_auc
-    n_pos = int((y == 1).sum())
-    n_neg = int((y == 0).sum())
-
-    if n_pos < 2 or n_neg < 2:
-        return {
-            "n": len(y),
-            "n_pos": n_pos,
-            "n_neg": n_neg,
-            "candidate_auc": candidate_auc,
-            "reference_auc": reference_auc,
-            "auc_improvement": auc_improvement,
-            "auc_se": np.nan,
-            "z_score": np.nan,
-            "p_value": np.nan,
-        }
-
-    order = np.argsort(-y)
-    predictions_sorted = np.vstack([candidate, reference])[:, order]
-    aucs, delong_cov = _fast_delong(predictions_sorted, n_pos)
-    auc_improvement = float(aucs[0] - aucs[1])
-    contrast = np.array([1.0, -1.0])
-    variance = float(contrast @ delong_cov @ contrast.T)
-    variance = max(variance, 0.0)
-    auc_se = np.sqrt(variance)
-
-    if auc_se == 0:
-        z_score = 0.0 if auc_improvement == 0 else np.sign(auc_improvement) * np.inf
-        p_value = 1.0 if auc_improvement == 0 else 0.0
-    else:
-        z_score = auc_improvement / auc_se
-        p_value = 2 * (1 - NormalDist().cdf(abs(z_score)))
-
-    return {
-        "n": len(y),
-        "n_pos": n_pos,
-        "n_neg": n_neg,
-        "candidate_auc": float(aucs[0]),
-        "reference_auc": float(aucs[1]),
-        "auc_improvement": auc_improvement,
-        "auc_se": auc_se,
-        "z_score": float(z_score),
-        "p_value": float(p_value),
-    }
-
-
-def paired_bootstrap_metric_delta(
-    y_true: np.ndarray,
-    candidate_scores: np.ndarray,
-    reference_scores: np.ndarray,
-    metric_name: str,
-    candidate_is_probability: bool | None = None,
-    reference_is_probability: bool | None = None,
-    n_bootstrap: int = N_BOOTSTRAP,
-    ci: float = 0.95,
-) -> dict:
-    candidate_scores = np.asarray(candidate_scores, dtype=float)
-    reference_scores = np.asarray(reference_scores, dtype=float)
-    y_true = np.asarray(y_true)
-    mask = np.isfinite(y_true) & np.isfinite(candidate_scores) & np.isfinite(reference_scores)
-    y = y_true[mask].astype(int)
-    candidate = candidate_scores[mask]
-    reference = reference_scores[mask]
-
-    if candidate_is_probability is None:
-        candidate_is_probability = _score_is_probability(candidate)
-    if reference_is_probability is None:
-        reference_is_probability = _score_is_probability(reference)
-
-    candidate_value = _score_metric(y, candidate, metric_name, candidate_is_probability)
-    reference_value = _score_metric(y, reference, metric_name, reference_is_probability)
-    observed_improvement = _metric_improvement(metric_name, candidate_value, reference_value)
-
-    idx_pos = np.where(y == 1)[0]
-    idx_neg = np.where(y == 0)[0]
-    if len(y) == 0 or len(idx_pos) == 0 or len(idx_neg) == 0:
-        return {
-            "n": len(y),
-            "candidate_value": candidate_value,
-            "reference_value": reference_value,
-            "improvement": observed_improvement,
-            "improvement_lo": np.nan,
-            "improvement_hi": np.nan,
-            "p_value": np.nan,
-            "n_bootstrap": 0,
-        }
-
-    alpha = (1 - ci) / 2
-    rng = np.random.RandomState(RANDOM_STATE)
-    improvements = []
-    for _ in range(n_bootstrap):
-        sampled_pos = rng.choice(idx_pos, size=len(idx_pos), replace=True)
-        sampled_neg = rng.choice(idx_neg, size=len(idx_neg), replace=True)
-        sampled_idx = np.concatenate([sampled_pos, sampled_neg])
-        y_sample = y[sampled_idx]
-        candidate_sample = candidate[sampled_idx]
-        reference_sample = reference[sampled_idx]
-        candidate_metric = _score_metric(y_sample, candidate_sample, metric_name, candidate_is_probability)
-        reference_metric = _score_metric(y_sample, reference_sample, metric_name, reference_is_probability)
-        improvement = _metric_improvement(metric_name, candidate_metric, reference_metric)
-        if not np.isnan(improvement):
-            improvements.append(improvement)
-
-    if not improvements:
-        return {
-            "n": len(y),
-            "candidate_value": candidate_value,
-            "reference_value": reference_value,
-            "improvement": observed_improvement,
-            "improvement_lo": np.nan,
-            "improvement_hi": np.nan,
-            "p_value": np.nan,
-            "n_bootstrap": 0,
-        }
-
-    improvements_array = np.asarray(improvements, dtype=float)
-    lower_tail = (np.sum(improvements_array <= 0) + 1) / (len(improvements_array) + 1)
-    upper_tail = (np.sum(improvements_array >= 0) + 1) / (len(improvements_array) + 1)
-    p_value = min(1.0, 2 * min(lower_tail, upper_tail))
-
-    return {
-        "n": len(y),
-        "candidate_value": candidate_value,
-        "reference_value": reference_value,
-        "improvement": observed_improvement,
-        "improvement_lo": np.percentile(improvements_array, 100 * alpha),
-        "improvement_hi": np.percentile(improvements_array, 100 * (1 - alpha)),
-        "p_value": p_value,
-        "n_bootstrap": len(improvements_array),
-    }
-
-
-def paired_bootstrap_benchmark_comparisons(
-    y_true: np.ndarray,
-    score_arrays: dict[str, np.ndarray],
-    candidate_model_names: list[str],
-    reference_model_names: list[str] | None = None,
-    n_bootstrap: int = N_BOOTSTRAP,
-    ci: float = 0.95,
-) -> pd.DataFrame:
-    if reference_model_names is None:
-        reference_model_names = BENCHMARK_MODEL_NAMES
-
-    records = []
-    for candidate_name in candidate_model_names:
-        if candidate_name not in score_arrays:
-            continue
-        candidate_scores = score_arrays[candidate_name]
-        candidate_is_probability = _score_is_probability(candidate_scores)
-        for reference_name in reference_model_names:
-            if reference_name not in score_arrays:
-                continue
-            reference_scores = score_arrays[reference_name]
-            reference_is_probability = _score_is_probability(reference_scores)
-            delong_stats = delong_auc_test(y_true, candidate_scores, reference_scores)
-
-            auc_stats = paired_bootstrap_metric_delta(
-                y_true, candidate_scores, reference_scores, "AUC",
-                candidate_is_probability=candidate_is_probability,
-                reference_is_probability=reference_is_probability,
-                n_bootstrap=n_bootstrap, ci=ci,
-            )
-            pr_stats = paired_bootstrap_metric_delta(
-                y_true, candidate_scores, reference_scores, "PR_AUC",
-                candidate_is_probability=candidate_is_probability,
-                reference_is_probability=reference_is_probability,
-                n_bootstrap=n_bootstrap, ci=ci,
-            )
-            brier_stats = paired_bootstrap_metric_delta(
-                y_true, candidate_scores, reference_scores, "Brier",
-                candidate_is_probability=candidate_is_probability,
-                reference_is_probability=reference_is_probability,
-                n_bootstrap=n_bootstrap, ci=ci,
-            )
-
-            records.append(
-                {
-                    "candidate_model": candidate_name,
-                    "reference_model": reference_name,
-                    "n": auc_stats["n"],
-                    "n_pos": delong_stats["n_pos"],
-                    "n_neg": delong_stats["n_neg"],
-                    "candidate_auc": auc_stats["candidate_value"],
-                    "reference_auc": auc_stats["reference_value"],
-                    "auc_improvement": auc_stats["improvement"],
-                    "auc_improvement_lo": auc_stats["improvement_lo"],
-                    "auc_improvement_hi": auc_stats["improvement_hi"],
-                    "auc_p_value": auc_stats["p_value"],
-                    "auc_delong_se": delong_stats["auc_se"],
-                    "auc_delong_z": delong_stats["z_score"],
-                    "auc_delong_p_value": delong_stats["p_value"],
-                    "candidate_pr_auc": pr_stats["candidate_value"],
-                    "reference_pr_auc": pr_stats["reference_value"],
-                    "pr_auc_improvement": pr_stats["improvement"],
-                    "pr_auc_improvement_lo": pr_stats["improvement_lo"],
-                    "pr_auc_improvement_hi": pr_stats["improvement_hi"],
-                    "pr_auc_p_value": pr_stats["p_value"],
-                    "candidate_brier": brier_stats["candidate_value"],
-                    "reference_brier": brier_stats["reference_value"],
-                    "brier_improvement": brier_stats["improvement"],
-                    "brier_improvement_lo": brier_stats["improvement_lo"],
-                    "brier_improvement_hi": brier_stats["improvement_hi"],
-                    "brier_p_value": brier_stats["p_value"],
-                }
-            )
-
-    if not records:
-        return pd.DataFrame(
-            columns=[
-                "candidate_model", "reference_model", "n", "n_pos", "n_neg",
-                "candidate_auc", "reference_auc", "auc_improvement", "auc_improvement_lo", "auc_improvement_hi", "auc_p_value",
-                "auc_delong_se", "auc_delong_z", "auc_delong_p_value",
-                "candidate_pr_auc", "reference_pr_auc", "pr_auc_improvement", "pr_auc_improvement_lo", "pr_auc_improvement_hi", "pr_auc_p_value",
-                "candidate_brier", "reference_brier", "brier_improvement", "brier_improvement_lo", "brier_improvement_hi", "brier_p_value",
-            ]
-        )
-
-    return (
-        pd.DataFrame(records)
-        .sort_values(["reference_model", "auc_improvement"], ascending=[True, False])
-        .reset_index(drop=True)
-    )
-
-
-def split_leaderboard_results(
-    results_df: pd.DataFrame,
-    reject_inference: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    official_rows = []
-    experimental_rows = []
-    for model_name in results_df.index:
-        if reject_inference and model_name not in BENCHMARK_MODEL_NAMES:
-            experimental_rows.append(model_name)
-        elif "(experimental)" in model_name:
-            experimental_rows.append(model_name)
-        else:
-            official_rows.append(model_name)
-    return results_df.loc[official_rows].copy(), results_df.loc[experimental_rows].copy()
 
 
 def run_rolling_out_of_time_validation(
@@ -2399,42 +2010,6 @@ def run_rolling_out_of_time_validation(
         .reset_index(drop=True)
     )
     return rolling_results_df, rolling_summary_df
-
-
-# ── Artifacts ──────────────────────────────────────────────────────────────────
-
-def extract_feature_importance(
-    models: dict, num_cols: list[str], cat_cols: list[str],
-) -> pd.DataFrame:
-    """Extract feature importance / coefficients from fitted pipeline models."""
-    feature_names = num_cols + cat_cols
-    records = []
-
-    for name, model in models.items():
-        if "(calibrated)" in name or name.startswith("Stacking"):
-            continue
-        if not hasattr(model, "named_steps"):
-            continue
-
-        clf = model.named_steps["classifier"]
-
-        if hasattr(clf, "feature_importances_"):
-            importances = clf.feature_importances_
-            imp_type = "split_importance"
-        elif hasattr(clf, "coef_"):
-            importances = clf.coef_[0]
-            imp_type = "coefficient"
-        else:
-            continue
-
-        for feat, imp in zip(feature_names, importances):
-            records.append({"model": name, "feature": feat, "importance": imp, "type": imp_type})
-
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df["abs_importance"] = df["importance"].abs()
-        df = df.sort_values(["model", "abs_importance"], ascending=[True, False])
-    return df
 
 
 def build_ablation_preprocessor(num_cols: list[str], cat_cols: list[str]) -> ColumnTransformer:
@@ -2702,142 +2277,6 @@ def run_phase3_ablations(
         )
 
     return pd.DataFrame(records)
-
-
-def plot_score_distributions(
-    y_true: np.ndarray,
-    score_arrays: dict[str, np.ndarray],
-    output_path: Path,
-    title_prefix: str = "Test",
-) -> None:
-    """Score distribution histograms by target class for each model."""
-    main_models = SUMMARY_MODEL_NAMES
-    to_plot = [(n, score_arrays[n]) for n in main_models if n in score_arrays]
-
-    if not to_plot:
-        return
-
-    n = len(to_plot)
-    ncols = min(n, 2)
-    nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows))
-    if n == 1:
-        axes = np.array([axes])
-    axes = axes.flatten()
-
-    for ax, (name, scores) in zip(axes, to_plot):
-        mask = ~np.isnan(scores)
-        s, y = scores[mask], y_true[mask]
-
-        ax.hist(s[y == 0], bins=50, alpha=0.5, density=True, color="steelblue",
-                label=f"Good (n={int((y == 0).sum()):,})")
-        ax.hist(s[y == 1], bins=50, alpha=0.5, density=True, color="tomato",
-                label=f"Bad (n={int((y == 1).sum()):,})")
-        ax.set_title(name, fontsize=12)
-        ax.set_xlabel("Predicted P(default)")
-        ax.set_ylabel("Density")
-        ax.legend(fontsize=9)
-
-    for i in range(len(to_plot), len(axes)):
-        axes[i].set_visible(False)
-
-    fig.suptitle(f"{title_prefix} Set — Score Distributions by Class", fontsize=14)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved plot: {}", output_path)
-
-
-def save_artifacts(
-    models: dict,
-    results_df: pd.DataFrame,
-    feat_imp_df: pd.DataFrame,
-    output_dir: Path,
-    experimental_results_df: pd.DataFrame | None = None,
-    benchmark_comparisons_df: pd.DataFrame | None = None,
-    experimental_benchmark_comparisons_df: pd.DataFrame | None = None,
-    feature_provenance_df: pd.DataFrame | None = None,
-    ablation_results_df: pd.DataFrame | None = None,
-    rolling_oot_results_df: pd.DataFrame | None = None,
-    rolling_oot_summary_df: pd.DataFrame | None = None,
-    population_summary_df: pd.DataFrame | None = None,
-    applicant_scores_df: pd.DataFrame | None = None,
-    holdout_scores_df: pd.DataFrame | None = None,
-) -> None:
-    """Save models, results CSV, and feature importance CSV to disk."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Results
-    results_path = output_dir / "results.csv"
-    results_df.to_csv(results_path, float_format="%.6f")
-    logger.info("Saved results: {}", results_path)
-
-    if experimental_results_df is not None and not experimental_results_df.empty:
-        experimental_results_path = output_dir / "results_experimental.csv"
-        experimental_results_df.to_csv(experimental_results_path, float_format="%.6f")
-        logger.info("Saved experimental results: {}", experimental_results_path)
-
-    if benchmark_comparisons_df is not None and not benchmark_comparisons_df.empty:
-        benchmark_comparisons_path = output_dir / "benchmark_comparisons.csv"
-        benchmark_comparisons_df.to_csv(benchmark_comparisons_path, index=False, float_format="%.6f")
-        logger.info("Saved benchmark comparisons: {}", benchmark_comparisons_path)
-
-    if experimental_benchmark_comparisons_df is not None and not experimental_benchmark_comparisons_df.empty:
-        experimental_benchmark_comparisons_path = output_dir / "benchmark_comparisons_experimental.csv"
-        experimental_benchmark_comparisons_df.to_csv(
-            experimental_benchmark_comparisons_path, index=False, float_format="%.6f",
-        )
-        logger.info("Saved experimental benchmark comparisons: {}", experimental_benchmark_comparisons_path)
-
-    # Feature importance
-    if not feat_imp_df.empty:
-        imp_path = output_dir / "feature_importance.csv"
-        feat_imp_df.to_csv(imp_path, index=False, float_format="%.6f")
-        logger.info("Saved feature importance: {} ({} rows)", imp_path, len(feat_imp_df))
-
-    if feature_provenance_df is not None and not feature_provenance_df.empty:
-        feature_provenance_path = output_dir / "feature_provenance.csv"
-        feature_provenance_df.to_csv(feature_provenance_path, index=False)
-        logger.info("Saved feature provenance: {} ({} rows)", feature_provenance_path, len(feature_provenance_df))
-
-    if ablation_results_df is not None and not ablation_results_df.empty:
-        ablation_results_path = output_dir / "ablation_results.csv"
-        ablation_results_df.to_csv(ablation_results_path, index=False, float_format="%.6f")
-        logger.info("Saved ablation results: {} ({} rows)", ablation_results_path, len(ablation_results_df))
-
-    if rolling_oot_results_df is not None and not rolling_oot_results_df.empty:
-        rolling_oot_results_path = output_dir / "rolling_oot_results.csv"
-        rolling_oot_results_df.to_csv(rolling_oot_results_path, index=False, float_format="%.6f")
-        logger.info("Saved rolling OOT results: {} ({} rows)", rolling_oot_results_path, len(rolling_oot_results_df))
-
-    if rolling_oot_summary_df is not None and not rolling_oot_summary_df.empty:
-        rolling_oot_summary_path = output_dir / "rolling_oot_summary.csv"
-        rolling_oot_summary_df.to_csv(rolling_oot_summary_path, index=False, float_format="%.6f")
-        logger.info("Saved rolling OOT summary: {} ({} rows)", rolling_oot_summary_path, len(rolling_oot_summary_df))
-
-    if population_summary_df is not None and not population_summary_df.empty:
-        population_summary_path = output_dir / "population_summary.csv"
-        population_summary_df.to_csv(population_summary_path, index=False)
-        logger.info("Saved population summary: {} ({} rows)", population_summary_path, len(population_summary_df))
-
-    if applicant_scores_df is not None and not applicant_scores_df.empty:
-        applicant_scores_path = output_dir / "applicant_scores_post_split.csv"
-        applicant_scores_df.to_csv(applicant_scores_path, index=False, float_format="%.6f")
-        logger.info("Saved applicant scores: {} ({} rows)", applicant_scores_path, len(applicant_scores_df))
-
-    if holdout_scores_df is not None and not holdout_scores_df.empty:
-        holdout_scores_path = output_dir / "holdout_test_scores.csv"
-        holdout_scores_df.to_csv(holdout_scores_path, index=False, float_format="%.6f")
-        logger.info("Saved hold-out test scores: {} ({} rows)", holdout_scores_path, len(holdout_scores_df))
-
-    # Models
-    models_dir = output_dir / "models"
-    models_dir.mkdir(exist_ok=True)
-    for name, model in models.items():
-        safe_name = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
-        path = models_dir / f"{safe_name}.joblib"
-        joblib.dump(model, path)
-    logger.info("Saved {} models to {}", len(models), models_dir)
 
 
 # ── SHAP Explainability ───────────────────────────────────────────────────────
@@ -3114,60 +2553,6 @@ def compute_woe_iv(
     else:
         iv_df = pd.DataFrame(columns=["feature", "iv"])
     return woe_df, iv_df
-
-
-# ── Bootstrap Confidence Intervals ────────────────────────────────────────────
-
-def bootstrap_confidence_intervals(
-    y_true: np.ndarray,
-    score_arrays: dict[str, np.ndarray],
-    n_bootstrap: int = N_BOOTSTRAP,
-    ci: float = 0.95,
-) -> pd.DataFrame:
-    """Stratified bootstrap CIs for AUC, PR AUC, and Brier score."""
-    alpha = (1 - ci) / 2
-    rng = np.random.RandomState(RANDOM_STATE)
-    records = []
-
-    for name, scores in score_arrays.items():
-        mask = ~np.isnan(scores)
-        y, s = y_true[mask], scores[mask]
-        idx_p = np.where(y == 1)[0]
-        idx_n = np.where(y == 0)[0]
-        is_prob = float(s.min()) >= 0 and float(s.max()) <= 1.01
-
-        boot_auc, boot_pr, boot_brier = [], [], []
-        for _ in range(n_bootstrap):
-            bp = rng.choice(idx_p, size=len(idx_p), replace=True)
-            bn = rng.choice(idx_n, size=len(idx_n), replace=True)
-            bi = np.concatenate([bp, bn])
-            y_b, s_b = y[bi], s[bi]
-            try:
-                boot_auc.append(roc_auc_score(y_b, s_b))
-                boot_pr.append(average_precision_score(y_b, s_b))
-                if is_prob:
-                    boot_brier.append(brier_score_loss(y_b, np.clip(s_b, 0, 1)))
-            except ValueError:
-                continue
-
-        def _ci(arr):
-            if not arr:
-                return np.nan, np.nan, np.nan
-            a = np.array(arr)
-            return np.median(a), np.percentile(a, 100 * alpha), np.percentile(a, 100 * (1 - alpha))
-
-        auc_med, auc_lo, auc_hi = _ci(boot_auc)
-        pr_med, pr_lo, pr_hi = _ci(boot_pr)
-        brier_med, brier_lo, brier_hi = _ci(boot_brier)
-
-        records.append({
-            "Model": name,
-            "AUC": auc_med, "AUC_lo": auc_lo, "AUC_hi": auc_hi,
-            "PR_AUC": pr_med, "PR_AUC_lo": pr_lo, "PR_AUC_hi": pr_hi,
-            "Brier": brier_med, "Brier_lo": brier_lo, "Brier_hi": brier_hi,
-        })
-
-    return pd.DataFrame(records).set_index("Model")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -3510,10 +2895,16 @@ def main(
     if enable_experimental_stacking:
         with _log_step(11, "Stacking ensemble (experimental)"):
             stack_model = train_stacking(
-                X_development_fit, y_development_fit, preprocessor, lr_study,
-                lgbm_best_n, lgbm_study, xgb_best_n, xgb_study,
-                catboost_best_n, catboost_study,
-                pos_weight, cv, monotone_constraints=monotone_constraints,
+                X_development_fit,
+                y_development_fit,
+                {
+                    "Logistic Regression": lr_model,
+                    "LightGBM": lgbm_model,
+                    "XGBoost": xgb_model,
+                    "CatBoost": catboost_model,
+                },
+                cv,
+                sample_weight=w_development_fit,
             )
 
     # 12. Calibration — on booked-only held-out samples

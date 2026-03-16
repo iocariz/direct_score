@@ -43,10 +43,10 @@
 
 ### 4. Stacking
 
-- [ ] **Remove `StratifiedKFold(shuffle=True)` from official stacking**
-- [ ] **Either exclude stacking from official evaluation or rebuild it using temporal out-of-fold predictions**
-- [ ] **If rebuilding, train the meta-learner only on temporally valid out-of-fold base predictions**
-- [ ] **Keep stacking labeled experimental until the temporal implementation is complete**
+- [x] **Remove `StratifiedKFold(shuffle=True)` from official stacking**
+- [x] **Either exclude stacking from official evaluation or rebuild it using temporal out-of-fold predictions**
+- [x] **If rebuilding, train the meta-learner only on temporally valid out-of-fold base predictions**
+- [x] **Keep stacking labeled experimental until the temporal implementation is complete**
 
 ### 5. Feature Discovery and Selection
 
@@ -112,9 +112,9 @@
 
 ### 5. Stacking Tests
 
-- [ ] **If stacking is removed from official runs, add tests that it is excluded by default**
-- [ ] **If temporal stacking is implemented, add tests that each row receives exactly one temporal out-of-fold prediction**
-- [ ] **Add regression tests proving the meta-learner never trains on future-informed predictions**
+- [x] **If stacking is removed from official runs, add tests that it is excluded by default**
+- [x] **If temporal stacking is implemented, add tests that each row receives exactly one temporal out-of-fold prediction**
+- [x] **Add regression tests proving the meta-learner never trains on future-informed predictions**
 
 ### 6. Statistical Comparison Tests
 
@@ -146,7 +146,7 @@
 - [ ] **Edit `compute_score_band_bad_rates()`**
 - [ ] **Edit `create_reject_pseudo_labels()` guardrails**
 - [ ] **Edit calibration split logic in `main()`**
-- [ ] **Edit `train_stacking()` or remove it from the official flow**
+- [x] **Edit `train_stacking()` or remove it from the official flow**
 - [x] **Add paired comparison utilities**
 - [x] **Update artifact writing for paired comparison outputs**
 
@@ -191,4 +191,4 @@
 - [ ] **All validation, calibration, and ensemble construction are temporally defensible**
 - [ ] **The test suite matches the actual current API**
 - [ ] **Benchmark claims are backed by paired model-comparison outputs**
-- [ ] **Experimental modes are clearly separated from official results**
+- [x] **Experimental modes are clearly separated from official results**
