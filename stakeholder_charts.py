@@ -278,7 +278,14 @@ def create_holdout_chart(results_df: pd.DataFrame, output_path: Path) -> Path:
     axes[0].invert_yaxis()
     axes[1].invert_yaxis()
     fig.suptitle("Held-out booked proxy benchmark comparison", fontsize=20, fontweight="bold", color=TEXT_DARK)
-    fig.text(0.5, 0.02, "Logistic Regression is the strongest current in-house candidate on the held-out booked proxy test.", ha="center", fontsize=10, color="#4b5563")
+    # Derive the best candidate model from actual results
+    candidate_df = df.loc[df["Model"].isin(CANDIDATE_ORDER)]
+    if not candidate_df.empty:
+        best_candidate = candidate_df.loc[candidate_df["ROC AUC"].astype(float).idxmax(), "Model"]
+        subtitle = f"{best_candidate} is the strongest current in-house candidate on the held-out booked proxy test."
+    else:
+        subtitle = "Held-out booked proxy test results."
+    fig.text(0.5, 0.02, subtitle, ha="center", fontsize=10, color="#4b5563")
     return _save_figure(fig, output_path)
 
 
@@ -458,12 +465,328 @@ def create_holdout_curves_chart(results_df: pd.DataFrame, holdout_scores_df: pd.
     return _save_figure(fig, output_path)
 
 
+def create_gains_chart(lift_table_df: pd.DataFrame, output_path: Path) -> Path:
+    """Cumulative gains chart from a lift table (one model)."""
+    models = lift_table_df["model"].unique()
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    fig.patch.set_facecolor("white")
+
+    candidate_models = [m for m in CANDIDATE_ORDER if m in models]
+    plot_models = candidate_models if candidate_models else list(models)
+
+    for model_name in plot_models:
+        mdf = lift_table_df.loc[lift_table_df["model"] == model_name].sort_values("decile")
+        color = MODEL_COLORS.get(model_name, "#577590")
+        pct = mdf["decile"].values * 10
+        axes[0].plot(pct, mdf["capture_rate"].values * 100, marker="o", linewidth=2.2, markersize=6, color=color, label=model_name)
+        axes[1].plot(pct, mdf["cum_lift"].values, marker="o", linewidth=2.2, markersize=6, color=color, label=model_name)
+
+    axes[0].plot([0, 100], [0, 100], linestyle="--", linewidth=1.5, color="#9ca3af", label="Random")
+    axes[0].set_title("Cumulative capture rate", fontsize=16, fontweight="bold", color=TEXT_DARK)
+    axes[0].set_xlabel("Population percentage (sorted by score)")
+    axes[0].set_ylabel("% of defaults captured")
+    axes[0].grid(alpha=0.25)
+    axes[0].spines[["top", "right"]].set_visible(False)
+    axes[0].legend(frameon=False, fontsize=9)
+
+    axes[1].axhline(1.0, linestyle="--", linewidth=1.5, color="#9ca3af")
+    axes[1].set_title("Cumulative lift", fontsize=16, fontweight="bold", color=TEXT_DARK)
+    axes[1].set_xlabel("Population percentage (sorted by score)")
+    axes[1].set_ylabel("Lift over random")
+    axes[1].grid(alpha=0.25)
+    axes[1].spines[["top", "right"]].set_visible(False)
+    axes[1].legend(frameon=False, fontsize=9)
+
+    # Derive summary for subtitle
+    if candidate_models:
+        best = candidate_models[0]
+        top2 = lift_table_df.loc[
+            (lift_table_df["model"] == best) & (lift_table_df["decile"] <= 2)
+        ]
+        if not top2.empty:
+            capture = top2["capture_rate"].max()
+            fig.text(0.5, 0.02, f"Top 2 deciles of {best} capture {capture:.0%} of defaults.", ha="center", fontsize=10, color="#4b5563")
+
+    fig.suptitle("Decile gains analysis", fontsize=20, fontweight="bold", color=TEXT_DARK)
+    return _save_figure(fig, output_path)
+
+
+def create_threshold_analysis_chart(threshold_df: pd.DataFrame, output_path: Path) -> Path:
+    """Precision/recall/FPR at business-relevant rejection thresholds."""
+    models = threshold_df["model"].unique()
+    candidate_models = [m for m in CANDIDATE_ORDER if m in models]
+    plot_models = candidate_models if candidate_models else list(models)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    fig.patch.set_facecolor("white")
+
+    for model_name in plot_models:
+        mdf = threshold_df.loc[threshold_df["model"] == model_name].sort_values("reject_pct")
+        color = MODEL_COLORS.get(model_name, "#577590")
+        pcts = mdf["reject_pct"].values
+
+        axes[0].plot(pcts, mdf["recall"].values * 100, marker="o", linewidth=2.2, markersize=6, color=color, label=f"{model_name} (recall)")
+        axes[0].plot(pcts, mdf["precision"].values * 100, marker="s", linewidth=1.5, markersize=5, color=color, alpha=0.6, linestyle="--", label=f"{model_name} (precision)")
+
+        axes[1].plot(pcts, mdf["capture_rate"].values * 100, marker="o", linewidth=2.2, markersize=6, color=color, label=model_name)
+
+    axes[0].set_title("Precision & recall at rejection thresholds", fontsize=16, fontweight="bold", color=TEXT_DARK)
+    axes[0].set_xlabel("% of applicants rejected (highest risk)")
+    axes[0].set_ylabel("Percentage")
+    axes[0].grid(alpha=0.25)
+    axes[0].spines[["top", "right"]].set_visible(False)
+    axes[0].legend(frameon=False, fontsize=8, ncol=2)
+
+    axes[1].set_title("Default capture rate at rejection thresholds", fontsize=16, fontweight="bold", color=TEXT_DARK)
+    axes[1].set_xlabel("% of applicants rejected (highest risk)")
+    axes[1].set_ylabel("% of defaults captured")
+    axes[1].grid(alpha=0.25)
+    axes[1].spines[["top", "right"]].set_visible(False)
+    axes[1].legend(frameon=False, fontsize=9)
+
+    fig.suptitle("Operating point analysis — reject the riskiest X%", fontsize=20, fontweight="bold", color=TEXT_DARK)
+    fig.text(0.5, 0.02, "Trade-off between approval rate and default capture at various rejection thresholds.", ha="center", fontsize=10, color="#4b5563")
+    return _save_figure(fig, output_path)
+
+
+def create_reliability_diagram(holdout_scores_df: pd.DataFrame, output_path: Path, n_bins: int = 10) -> Path:
+    """Calibration reliability diagram — predicted vs observed probability."""
+    y_true = holdout_scores_df[TARGET].astype(int).to_numpy()
+
+    calibrated_models = [m for m in CANDIDATE_ORDER if _score_column_name(f"{m} (calibrated)") in holdout_scores_df.columns]
+    raw_models = [m for m in CANDIDATE_ORDER if _score_column_name(m) in holdout_scores_df.columns]
+    plot_models = calibrated_models if calibrated_models else raw_models
+
+    if not plot_models:
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.text(0.5, 0.5, "No calibrated models available", ha="center", va="center")
+        return _save_figure(fig, output_path)
+
+    ncols = min(len(plot_models), 2)
+    nrows = (len(plot_models) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 6.5 * nrows))
+    fig.patch.set_facecolor("white")
+    if len(plot_models) == 1:
+        axes = np.array([axes])
+    axes = np.atleast_1d(axes).flatten()
+
+    for ax, model_name in zip(axes, plot_models):
+        col = _score_column_name(f"{model_name} (calibrated)") if calibrated_models else _score_column_name(model_name)
+        scores = holdout_scores_df[col].to_numpy(dtype=float)
+        mask = np.isfinite(scores)
+        y, s = y_true[mask], scores[mask]
+
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        bin_centers = []
+        observed_rates = []
+        bin_sizes = []
+        for i in range(n_bins):
+            in_bin = (s >= bin_edges[i]) & (s < bin_edges[i + 1])
+            if i == n_bins - 1:
+                in_bin = (s >= bin_edges[i]) & (s <= bin_edges[i + 1])
+            if in_bin.sum() > 0:
+                bin_centers.append(s[in_bin].mean())
+                observed_rates.append(y[in_bin].mean())
+                bin_sizes.append(int(in_bin.sum()))
+
+        color = MODEL_COLORS.get(model_name, "#577590")
+        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.5, color="#9ca3af", label="Perfect calibration")
+        ax.plot(bin_centers, observed_rates, marker="o", linewidth=2.2, markersize=7, color=color, label=f"{model_name}")
+
+        ax.set_title(model_name, fontsize=14, fontweight="bold", color=TEXT_DARK)
+        ax.set_xlabel("Predicted probability")
+        ax.set_ylabel("Observed default rate")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, max(0.3, max(observed_rates) * 1.2) if observed_rates else 0.3)
+        ax.grid(alpha=0.25)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(frameon=False, fontsize=9)
+
+    for i in range(len(plot_models), len(axes)):
+        axes[i].set_visible(False)
+
+    fig.suptitle("Calibration reliability diagram", fontsize=20, fontweight="bold", color=TEXT_DARK)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.text(0.5, 0.01, "Points above the diagonal indicate underestimation of risk; below means overestimation.", ha="center", fontsize=10, color="#4b5563")
+    return _save_figure(fig, output_path)
+
+
+def create_executive_summary_chart(
+    results_df: pd.DataFrame,
+    benchmark_comparisons_df: pd.DataFrame,
+    holdout_scores_df: pd.DataFrame | None,
+    output_path: Path,
+) -> Path:
+    """Single-page executive summary for credit committee."""
+    fig = plt.figure(figsize=(16, 10))
+    fig.patch.set_facecolor("white")
+
+    # Determine best candidate
+    candidate_results = results_df.loc[results_df["Model"].isin(CANDIDATE_ORDER)].copy()
+    if candidate_results.empty:
+        best_name, best_auc, best_ks = "N/A", 0.0, 0.0
+    else:
+        best_idx = candidate_results["ROC AUC"].astype(float).idxmax()
+        best_row = candidate_results.loc[best_idx]
+        best_name = str(best_row["Model"])
+        best_auc = float(best_row["ROC AUC"])
+        best_ks = float(best_row["KS"])
+
+    # AUC lift vs best benchmark
+    best_lift = 0.0
+    best_lift_ref = ""
+    if not benchmark_comparisons_df.empty:
+        cand_rows = benchmark_comparisons_df.loc[benchmark_comparisons_df["candidate_model"] == best_name]
+        if not cand_rows.empty:
+            best_lift_idx = cand_rows["auc_improvement"].astype(float).idxmax()
+            best_lift = float(cand_rows.loc[best_lift_idx, "auc_improvement"])
+            best_lift_ref = str(cand_rows.loc[best_lift_idx, "reference_model"])
+
+    # Capture rate at 10% rejection (from lift table if available)
+    capture_10 = None
+    if holdout_scores_df is not None and _score_column_name(best_name) in holdout_scores_df.columns:
+        y_true = holdout_scores_df[TARGET].astype(int).to_numpy()
+        scores = holdout_scores_df[_score_column_name(best_name)].to_numpy(dtype=float)
+        mask = np.isfinite(scores)
+        y_m, s_m = y_true[mask], scores[mask]
+        n = len(y_m)
+        cutoff = int(np.ceil(n * 0.10))
+        order = np.argsort(-s_m)
+        capture_10 = float(y_m[order[:cutoff]].sum()) / max(y_m.sum(), 1)
+
+    # Layout: top row = recommendation + KPIs, bottom = caveat
+    ax_main = fig.add_axes([0.05, 0.35, 0.90, 0.55])
+    ax_main.set_axis_off()
+
+    # Recommendation banner
+    rec_patch = FancyBboxPatch(
+        (0.02, 0.72), 0.96, 0.24,
+        boxstyle="round,pad=0.02,rounding_size=0.03",
+        linewidth=0, facecolor="#2a9d8f",
+        transform=ax_main.transAxes,
+    )
+    ax_main.add_patch(rec_patch)
+    ax_main.text(0.50, 0.88, f"Recommended model: {best_name}", transform=ax_main.transAxes,
+                 fontsize=22, fontweight="bold", color="white", ha="center", va="center")
+    ax_main.text(0.50, 0.77, "Strongest discriminative and calibration performance on held-out booked proxy test",
+                 transform=ax_main.transAxes, fontsize=12, color="white", ha="center", va="center")
+
+    # KPI tiles
+    kpis = [
+        ("ROC AUC", f"{best_auc:.4f}"),
+        ("KS statistic", f"{best_ks:.4f}"),
+        ("AUC lift vs benchmark", f"+{best_lift:.4f}" if best_lift > 0 else f"{best_lift:.4f}"),
+    ]
+    if capture_10 is not None:
+        kpis.append(("Defaults caught at 10% reject", f"{capture_10:.0%}"))
+
+    n_kpis = len(kpis)
+    tile_w = 0.90 / n_kpis
+    for i, (label, value) in enumerate(kpis):
+        x_start = 0.05 + i * tile_w
+        tile_patch = FancyBboxPatch(
+            (x_start, 0.18), tile_w - 0.02, 0.45,
+            boxstyle="round,pad=0.02,rounding_size=0.03",
+            linewidth=0, facecolor=KPI_TILE_COLORS[i % len(KPI_TILE_COLORS)],
+            transform=ax_main.transAxes,
+        )
+        ax_main.add_patch(tile_patch)
+        ax_main.text(x_start + (tile_w - 0.02) / 2, 0.52, label, transform=ax_main.transAxes,
+                     fontsize=11, fontweight="bold", color="white", ha="center", va="center")
+        ax_main.text(x_start + (tile_w - 0.02) / 2, 0.36, value, transform=ax_main.transAxes,
+                     fontsize=22, fontweight="bold", color="white", ha="center", va="center")
+
+    # Caveats
+    ax_main.text(0.05, 0.06, "Key caveats:", transform=ax_main.transAxes,
+                 fontsize=11, fontweight="bold", color=TEXT_DARK)
+    caveats = [
+        "Evaluation limited to booked-proxy population — rejected applicants have no observed outcome.",
+        f"AUC lift measured against {best_lift_ref}." if best_lift_ref else "No benchmark comparison available.",
+        "Model probabilities calibrated via Platt scaling on held-out booked accounts.",
+    ]
+    for j, caveat in enumerate(caveats):
+        ax_main.text(0.07, 0.00 - j * 0.06, f"  {j + 1}. {caveat}", transform=ax_main.transAxes,
+                     fontsize=10, color="#4b5563")
+
+    fig.suptitle("Executive summary — credit scoring model recommendation", fontsize=20, fontweight="bold", color=TEXT_DARK, y=0.96)
+    fig.text(0.5, 0.02, "Source: held-out booked proxy test set. See detailed charts for full analysis.", ha="center", fontsize=10, color="#4b5563")
+    return _save_figure(fig, output_path)
+
+
+def create_psi_timeline_chart(rolling_oot_results_df: pd.DataFrame, output_path: Path) -> Path:
+    """PSI per rolling OOT window with traffic-light thresholds."""
+    df = rolling_oot_results_df.copy()
+    if "psi" not in df.columns:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.text(0.5, 0.5, "PSI data not available in rolling OOT results", ha="center", va="center")
+        return _save_figure(fig, output_path)
+
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+    fig.patch.set_facecolor("white")
+
+    models = [m for m in CANDIDATE_ORDER if m in df["Model"].unique()]
+    for model_name in models:
+        mdf = df.loc[df["Model"] == model_name].sort_values("fold")
+        color = MODEL_COLORS.get(model_name, "#577590")
+        ax.plot(mdf["fold"], mdf["psi"], marker="o", linewidth=2.2, markersize=6, color=color, label=model_name)
+
+    ax.axhspan(0, 0.10, alpha=0.08, color="green", label="Stable (< 0.10)")
+    ax.axhspan(0.10, 0.25, alpha=0.08, color="orange", label="Moderate (0.10-0.25)")
+    ax.axhspan(0.25, ax.get_ylim()[1] if ax.get_ylim()[1] > 0.25 else 0.5, alpha=0.08, color="red", label="High drift (> 0.25)")
+    ax.axhline(0.10, linestyle="--", linewidth=1, color="orange", alpha=0.5)
+    ax.axhline(0.25, linestyle="--", linewidth=1, color="red", alpha=0.5)
+
+    ax.set_title("Score distribution stability (PSI) over time", fontsize=18, fontweight="bold", color=TEXT_DARK)
+    ax.set_xlabel("Forward validation window")
+    ax.set_ylabel("PSI")
+    ax.grid(axis="y", alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, bbox_to_anchor=(1.02, 0.5), loc="center left", fontsize=9)
+    fig.text(0.5, 0.02, "PSI < 0.10 = stable; 0.10-0.25 = moderate drift; > 0.25 = significant drift requiring investigation.", ha="center", fontsize=10, color="#4b5563")
+    return _save_figure(fig, output_path)
+
+
+def create_top_drivers_chart(feature_importance_df: pd.DataFrame, output_path: Path, top_n: int = 10) -> Path:
+    """Simplified top feature drivers bar chart for stakeholders."""
+    if feature_importance_df.empty:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.text(0.5, 0.5, "No feature importance data available", ha="center", va="center")
+        return _save_figure(fig, output_path)
+
+    # Pick one model — prefer LightGBM, then XGBoost
+    models = feature_importance_df["model"].unique()
+    preferred = ["LightGBM", "XGBoost", "CatBoost", "Logistic Regression"]
+    chosen = next((m for m in preferred if m in models), models[0])
+
+    mdf = feature_importance_df.loc[feature_importance_df["model"] == chosen].copy()
+    mdf = mdf.nlargest(top_n, "abs_importance")
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+    fig.patch.set_facecolor("white")
+    y_pos = np.arange(len(mdf))
+    colors = [MODEL_COLORS.get(chosen, "#577590")] * len(mdf)
+    ax.barh(y_pos, mdf["abs_importance"].values, color=colors, height=0.62)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(mdf["feature"].values, fontsize=11)
+    ax.invert_yaxis()
+    ax.set_title(f"Top {top_n} risk drivers ({chosen})", fontsize=18, fontweight="bold", color=TEXT_DARK)
+    ax.set_xlabel("Feature importance (absolute)")
+    ax.grid(axis="x", alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.text(0.5, 0.02, f"Feature importance from the {chosen} model. Higher values indicate stronger influence on default prediction.", ha="center", fontsize=10, color="#4b5563")
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+    return _save_figure(fig, output_path)
+
+
 def generate_stakeholder_charts(output_dir: Path) -> list[Path]:
     results_df = _read_csv(output_dir, "results.csv")
     benchmark_comparisons_df = _read_csv(output_dir, "benchmark_comparisons.csv")
     rolling_oot_results_df = _read_csv(output_dir, "rolling_oot_results.csv")
     population_summary_df = _read_csv(output_dir, "population_summary.csv")
     holdout_scores_df = _maybe_read_csv(output_dir, "holdout_test_scores.csv")
+    lift_table_df = _maybe_read_csv(output_dir, "lift_table.csv")
+    threshold_df = _maybe_read_csv(output_dir, "threshold_analysis.csv")
+    feature_importance_df = _maybe_read_csv(output_dir, "feature_importance.csv")
     plots_dir = output_dir / "plots"
 
     generated = [
@@ -479,6 +802,27 @@ def generate_stakeholder_charts(output_dir: Path) -> list[Path]:
     if holdout_scores_df is not None:
         generated.append(
             create_holdout_curves_chart(results_df, holdout_scores_df, plots_dir / "stakeholder_roc_pr_curves.png")
+        )
+        generated.append(
+            create_executive_summary_chart(results_df, benchmark_comparisons_df, holdout_scores_df, plots_dir / "stakeholder_executive_summary.png")
+        )
+        generated.append(
+            create_reliability_diagram(holdout_scores_df, plots_dir / "stakeholder_reliability.png")
+        )
+
+    if lift_table_df is not None and not lift_table_df.empty:
+        generated.append(
+            create_gains_chart(lift_table_df, plots_dir / "stakeholder_gains.png")
+        )
+
+    if threshold_df is not None and not threshold_df.empty:
+        generated.append(
+            create_threshold_analysis_chart(threshold_df, plots_dir / "stakeholder_threshold_analysis.png")
+        )
+
+    if feature_importance_df is not None and not feature_importance_df.empty:
+        generated.append(
+            create_top_drivers_chart(feature_importance_df, plots_dir / "stakeholder_top_drivers.png")
         )
 
     return generated

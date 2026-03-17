@@ -78,6 +78,11 @@ from training_constants import (
     TARGET,
     UNDERWRITING_DECISION_STATUSES,
 )
+from model_governance import (
+    generate_data_quality_report,
+    generate_model_card,
+    generate_variable_dictionary,
+)
 from training_reporting import (
     _compute_midrank,
     _fast_delong,
@@ -87,6 +92,9 @@ from training_reporting import (
     _score_metric,
     bootstrap_confidence_intervals,
     build_holdout_score_frame,
+    compute_overfit_report,
+    create_lift_table,
+    create_threshold_analysis,
     delong_auc_test,
     evaluate,
     evaluate_all,
@@ -97,6 +105,7 @@ from training_reporting import (
     plot_score_distributions,
     sanitize_output_name,
     save_artifacts,
+    select_best_model,
     split_leaderboard_results,
 )
 
@@ -1103,7 +1112,7 @@ def run_rfecv(
     X_train: pd.DataFrame, y_train: pd.Series,
     num_cols: list[str], cat_cols: list[str],
     feature_cols: list[str],
-    cv=None,
+    cv,
 ):
     logger.info("{} candidate features ({} num, {} cat)", len(num_cols) + len(cat_cols), len(num_cols), len(cat_cols))
     pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
@@ -1128,8 +1137,6 @@ def run_rfecv(
     ])
     X_rfe = rfe_preprocessor.fit_transform(X_train)
 
-    if cv is None:
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     rfecv = RFECV(
         estimator=rfe_estimator, step=1,
         cv=cv,
@@ -2443,7 +2450,10 @@ def compute_csi(
         csi = float(_psi_component(tr_pct, te_pct).sum())
         records.append({"feature": col, "type": "categorical", "csi": csi, "n_bins": len(cats)})
 
-    return pd.DataFrame(records).sort_values("csi", ascending=False).reset_index(drop=True)
+    df = pd.DataFrame(records)
+    if df.empty:
+        return pd.DataFrame(columns=["feature", "type", "csi", "n_bins"])
+    return df.sort_values("csi", ascending=False).reset_index(drop=True)
 
 
 def run_stability_analysis(
@@ -3088,12 +3098,12 @@ def main(
     with _log_step(15, "SHAP explainability"):
         compute_shap_analysis(models, X_test, num_cols, cat_cols, output_path)
 
-    # 16. WoE / IV analysis
+    # 16. WoE / IV analysis (fit partition only — excludes calibration holdout)
     with _log_step(16, "WoE / IV analysis"):
-        woe_df, iv_df = compute_woe_iv(X_development, y_development, num_cols, cat_cols)
+        woe_df, iv_df = compute_woe_iv(X_development_fit, y_development_fit, num_cols, cat_cols)
         woe_df.to_csv(output_path / "woe_detail.csv", index=False, float_format="%.6f")
         iv_df.to_csv(output_path / "iv_summary.csv", index=False, float_format="%.6f")
-        logger.info("{} features analyzed ({:,} development rows)", len(iv_df), len(X_development))
+        logger.info("{} features analyzed ({:,} fit rows)", len(iv_df), len(X_development_fit))
         for _, r in iv_df.head(15).iterrows():
             strength = (
                 "Useless" if r["iv"] < 0.02 else "Weak" if r["iv"] < 0.1
@@ -3102,11 +3112,115 @@ def main(
             )
             logger.info("  {:<35s} IV={:.4f}  [{}]", r["feature"], r["iv"], strength)
 
-    # 17. PSI / CSI stability
+    # 17. PSI / CSI stability (fit partition only — excludes calibration holdout)
     with _log_step(17, "PSI / CSI stability"):
         run_stability_analysis(
-            X_development, X_test, train_scores, test_scores,
+            X_development_fit_booked, X_test, train_scores, test_scores,
             num_cols, cat_cols, output_path,
+        )
+
+    # 17b. Lift table and threshold analysis
+    with _log_step("17b", "Lift table and threshold analysis"):
+        lift_tables = []
+        threshold_tables = []
+        for name in OFFICIAL_MODEL_NAMES:
+            if name in test_scores:
+                lift_tables.append(create_lift_table(y_test.values, test_scores[name], name))
+                threshold_tables.append(create_threshold_analysis(y_test.values, test_scores[name], name))
+        lift_table_df = pd.concat(lift_tables, ignore_index=True) if lift_tables else pd.DataFrame()
+        threshold_analysis_df = pd.concat(threshold_tables, ignore_index=True) if threshold_tables else pd.DataFrame()
+        if not lift_table_df.empty:
+            lift_table_df.to_csv(output_path / "lift_table.csv", index=False, float_format="%.6f")
+            logger.info("Lift table: {} rows across {} models", len(lift_table_df), lift_table_df["model"].nunique())
+        if not threshold_analysis_df.empty:
+            threshold_analysis_df.to_csv(output_path / "threshold_analysis.csv", index=False, float_format="%.6f")
+            logger.info("Threshold analysis: {} rows across {} models", len(threshold_analysis_df), threshold_analysis_df["model"].nunique())
+
+    # 17c. Overfitting diagnostics — train vs test performance
+    with _log_step("17c", "Overfitting diagnostics"):
+        overfit_df = compute_overfit_report(
+            y_development_fit_booked.values,
+            y_test.values,
+            train_scores,
+            test_scores,
+            model_names=OFFICIAL_MODEL_NAMES,
+        )
+        if not overfit_df.empty:
+            overfit_df.to_csv(output_path / "overfit_report.csv", index=False, float_format="%.6f")
+            logger.info("Train vs test performance comparison:")
+            logger.info("{:<25s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>6s}",
+                        "Model", "Train AUC", "Test AUC", "AUC Δ", "Train PR", "Test PR", "PR Δ", "Flag")
+            logger.info("{}", "─" * 97)
+            for _, row in overfit_df.iterrows():
+                logger.info(
+                    "{:<25s} {:>10.4f} {:>10.4f} {:>+10.4f} {:>10.4f} {:>10.4f} {:>+10.4f} {:>6s}",
+                    row["model"],
+                    row["train_auc"], row["test_auc"], row["auc_delta"],
+                    row["train_pr_auc"], row["test_pr_auc"], row["pr_auc_delta"],
+                    row["overfit_flag"],
+                )
+            n_flagged = int((overfit_df["overfit_flag"] == "YES").sum())
+            if n_flagged > 0:
+                logger.warning("{} model(s) flagged for potential overfitting (AUC or PR AUC delta > 0.03)", n_flagged)
+            else:
+                logger.info("No models flagged for overfitting")
+
+    # 17d. Model selection — weighted multi-criteria ranking
+    with _log_step("17d", "Model selection"):
+        model_selection_df = select_best_model(
+            official_results_df,
+            overfit_df=overfit_df if not overfit_df.empty else None,
+            rolling_oot_summary_df=rolling_oot_summary_df if not rolling_oot_summary_df.empty else None,
+            candidate_names=OFFICIAL_MODEL_NAMES,
+            benchmark_comparisons_df=benchmark_comparisons_df if not benchmark_comparisons_df.empty else None,
+        )
+        if not model_selection_df.empty:
+            model_selection_df.to_csv(output_path / "model_selection.csv", index=False, float_format="%.1f")
+            logger.info("Model selection scorecard (weights: discrimination=35%, stability=20%, calibration=15%, generalization=15%, lift=15%):")
+            logger.info(
+                "{:<25s} {:>6s} {:>6s} {:>6s} {:>6s} {:>6s} {:>8s} {:>5s}",
+                "Model", "Disc.", "Calib.", "Stab.", "Gen.", "Lift", "Overall", "Rec.",
+            )
+            logger.info("{}", "─" * 87)
+            for _, row in model_selection_df.iterrows():
+                logger.info(
+                    "{:<25s} {:>6.1f} {:>6.1f} {:>6.1f} {:>6.1f} {:>6.1f} {:>8.1f} {:>5s}",
+                    row["model"],
+                    row["discrimination_score"], row["calibration_score"],
+                    row["stability_score"], row["generalization_score"],
+                    row["lift_score"], row["weighted_score"],
+                    "<<<" if row["recommended"] else "",
+                )
+            recommended = model_selection_df.loc[model_selection_df["recommended"]].iloc[0]
+            logger.info("Recommended model: {} (weighted score: {:.1f})", recommended["model"], recommended["weighted_score"])
+
+    # 17e. Model governance artifacts
+    with _log_step("17e", "Model governance artifacts"):
+        iv_df_for_dict = None
+        iv_path = output_path / "iv_summary.csv"
+        if iv_path.exists():
+            iv_df_for_dict = pd.read_csv(iv_path)
+
+        generate_model_card(
+            official_results_df,
+            model_selection_df=model_selection_df if not model_selection_df.empty else None,
+            overfit_df=overfit_df if not overfit_df.empty else None,
+            benchmark_comparisons_df=benchmark_comparisons_df if not benchmark_comparisons_df.empty else None,
+            population_summary_df=population_summary_df if not population_summary_df.empty else None,
+            feature_provenance_df=feature_provenance_df if not feature_provenance_df.empty else None,
+            output_path=output_path,
+        )
+        generate_variable_dictionary(
+            feature_cols, num_cols, cat_cols,
+            feature_provenance_df=feature_provenance_df if not feature_provenance_df.empty else None,
+            iv_df=iv_df_for_dict,
+            output_path=output_path,
+        )
+        generate_data_quality_report(
+            X_development_fit, num_cols, cat_cols, output_path, label="development_fit",
+        )
+        generate_data_quality_report(
+            X_test, num_cols, cat_cols, output_path, label="test",
         )
 
     # 18. Save artifacts
