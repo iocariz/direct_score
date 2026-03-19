@@ -869,6 +869,8 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
             "subsample": trial.suggest_float("subsample", 0.6, 0.85),
             "subsample_freq": lgbm_subsample_freq,
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.85),
+            "colsample_bynode": trial.suggest_float("colsample_bynode", 0.6, 1.0),
+            "max_bin": trial.suggest_int("max_bin", 63, 127),
             "min_split_gain": trial.suggest_float("min_split_gain", 1e-3, 1.0, log=True),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 20.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-2, 50.0, log=True),
@@ -927,8 +929,8 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
     logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
     logger.info("  n_estimators={} (conservative early stop), lr={:.4f}, leaves={}, depth={}, min_child={}",
                 best_n_estimators, bp["learning_rate"], bp["num_leaves"], bp["max_depth"], bp["min_child_samples"])
-    logger.info("  subsample={:.2f} (freq={}), colsample={:.2f}, min_split_gain={:.2e}, alpha={:.2e}, lambda={:.2e}",
-                bp["subsample"], lgbm_subsample_freq, bp["colsample_bytree"], bp["min_split_gain"], bp["reg_alpha"], bp["reg_lambda"])
+    logger.info("  subsample={:.2f} (freq={}), colsample_tree={:.2f}, colsample_node={:.2f}, max_bin={}, min_split_gain={:.2e}, alpha={:.2e}, lambda={:.2e}",
+                bp["subsample"], lgbm_subsample_freq, bp["colsample_bytree"], bp["colsample_bynode"], bp["max_bin"], bp["min_split_gain"], bp["reg_alpha"], bp["reg_lambda"])
 
     lgbm_model = Pipeline([
         ("preprocessor", lgbm_preprocessor),
@@ -960,6 +962,7 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
             "min_child_weight": trial.suggest_int("min_child_weight", 20, 100),
             "subsample": trial.suggest_float("subsample", 0.5, 0.85),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.85),
+            "colsample_bynode": trial.suggest_float("colsample_bynode", 0.6, 1.0),
             "gamma": trial.suggest_float("gamma", 1e-3, 10.0, log=True),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 20.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-2, 50.0, log=True),
@@ -1015,8 +1018,8 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
     logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
     logger.info("  n_estimators={} (conservative early stop), lr={:.4f}, depth={}, min_child_w={}",
                 best_n_estimators, bp["learning_rate"], bp["max_depth"], bp["min_child_weight"])
-    logger.info("  subsample={:.2f}, colsample={:.2f}, gamma={:.2e}, alpha={:.2e}, lambda={:.2e}",
-                bp["subsample"], bp["colsample_bytree"], bp["gamma"], bp["reg_alpha"], bp["reg_lambda"])
+    logger.info("  subsample={:.2f}, colsample_tree={:.2f}, colsample_node={:.2f}, gamma={:.2e}, alpha={:.2e}, lambda={:.2e}",
+                bp["subsample"], bp["colsample_bytree"], bp["colsample_bynode"], bp["gamma"], bp["reg_alpha"], bp["reg_lambda"])
 
     xgb_model = Pipeline([
         ("preprocessor", preprocessor),
@@ -1944,49 +1947,59 @@ def compute_shap_analysis(
     candidate_names = [preferred_model_name] if preferred_model_name is not None else []
     candidate_names.extend(["LightGBM", "XGBoost", "CatBoost", "Logistic Regression"])
     tree_class_names = {"LGBMClassifier", "XGBClassifier", "CatBoostClassifier"}
-    explainer_type = None
+
+    # Build ranked list of (model, explainer_type) — we may need to skip models
+    # that fail due to shap/library version incompatibilities.
+    ranked_candidates = []
     for name in dict.fromkeys(candidate_names):
         if name not in models or not hasattr(models[name], "named_steps"):
             continue
         candidate_model = models[name]
         candidate_clf = candidate_model.named_steps["classifier"]
         if candidate_clf.__class__.__name__ in tree_class_names:
-            model = candidate_model
-            explainer_type = "tree"
-            break
-        if isinstance(candidate_clf, LogisticRegression):
-            model = candidate_model
-            explainer_type = "linear"
-            break
-    else:
+            ranked_candidates.append((name, candidate_model, "tree"))
+        elif isinstance(candidate_clf, LogisticRegression):
+            ranked_candidates.append((name, candidate_model, "linear"))
+
+    if not ranked_candidates:
         logger.warning("No supported model available for SHAP")
         return None
 
     feature_names = num_cols + cat_cols
-    pre = model.named_steps["preprocessor"]
-    clf = model.named_steps["classifier"]
 
-    X_t = pre.transform(X_test)
-    if hasattr(X_t, "toarray"):
-        X_t = X_t.toarray()
+    for name, model, explainer_type in ranked_candidates:
+        pre = model.named_steps["preprocessor"]
+        clf = model.named_steps["classifier"]
 
-    # Subsample for speed on large test sets
-    max_shap = 5000
-    if X_t.shape[0] > max_shap:
-        rng = np.random.RandomState(RANDOM_STATE)
-        idx = rng.choice(X_t.shape[0], max_shap, replace=False)
-        X_t = X_t[idx]
-        logger.info("Subsampled {:,} -> {:,} for SHAP", X_test.shape[0], max_shap)
+        X_t = pre.transform(X_test)
+        if hasattr(X_t, "toarray"):
+            X_t = X_t.toarray()
 
-    if explainer_type == "linear":
-        background = X_t
-        if X_t.shape[0] > 1000:
+        # Subsample for speed on large test sets
+        max_shap = 5000
+        if X_t.shape[0] > max_shap:
             rng = np.random.RandomState(RANDOM_STATE)
-            bg_idx = rng.choice(X_t.shape[0], 1000, replace=False)
-            background = X_t[bg_idx]
-        explainer = shap.LinearExplainer(clf, background)
+            idx = rng.choice(X_t.shape[0], max_shap, replace=False)
+            X_t = X_t[idx]
+            logger.info("Subsampled {:,} -> {:,} for SHAP", X_test.shape[0], max_shap)
+
+        try:
+            if explainer_type == "linear":
+                background = X_t
+                if X_t.shape[0] > 1000:
+                    rng = np.random.RandomState(RANDOM_STATE)
+                    bg_idx = rng.choice(X_t.shape[0], 1000, replace=False)
+                    background = X_t[bg_idx]
+                explainer = shap.LinearExplainer(clf, background)
+            else:
+                explainer = shap.TreeExplainer(clf)
+            break
+        except (ValueError, TypeError, Exception) as exc:
+            logger.warning("SHAP explainer failed for {} ({}), trying next model: {}", name, explainer_type, exc)
+            continue
     else:
-        explainer = shap.TreeExplainer(clf)
+        logger.warning("All SHAP explainer attempts failed — skipping")
+        return None
     shap_values = explainer.shap_values(X_t)
     if isinstance(shap_values, list):
         shap_values = shap_values[1]

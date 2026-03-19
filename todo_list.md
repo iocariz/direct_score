@@ -209,9 +209,9 @@
 
 ### Additional regularization
 
-- [ ] **LGBM: add `max_bin` to search (63–127)** (coarser splits = strong regularizer, cheap in discrimination)
-- [ ] **LGBM: add `feature_fraction_bynode` / XGB: add `colsample_bynode`** (per-node column sampling on top of per-tree)
-- [ ] **Lower `N_ESTIMATORS_CEILING` to 1000 and `EARLY_STOPPING_ROUNDS` to 30** (tighter boosting budget)
+- [x] **LGBM: add `max_bin` to search (63–127)** (coarser splits = strong regularizer, cheap in discrimination)
+- [x] **LGBM: add `colsample_bynode` (0.6–1.0) / XGB: add `colsample_bynode` (0.6–1.0)** (per-node column sampling on top of per-tree)
+- [x] **Lower `N_ESTIMATORS_CEILING` from 2000 to 1000 and `EARLY_STOPPING_ROUNDS` from 50 to 30** (tighter boosting budget)
 
 ### Calibration
 
