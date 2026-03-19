@@ -69,6 +69,47 @@ class TestGenerateModelCard:
         assert "OVERFITTING ASSESSMENT" in content
         assert "No models show significant overfitting" in content
 
+    def test_includes_executive_summary_for_recommended_model(self, tmp_path):
+        results_df = pd.DataFrame(
+            {"ROC AUC": [0.85], "PR AUC": [0.18], "KS": [0.55], "Brier": [0.055], "N": [1000]},
+            index=["LightGBM"],
+        )
+        selection_df = pd.DataFrame({
+            "model": ["LightGBM"],
+            "weighted_score": [78.5],
+            "test_auc": [0.85],
+            "test_pr_auc": [0.18],
+            "test_brier": [0.055],
+            "recommended": [True],
+        })
+
+        path = generate_model_card(results_df, selection_df, None, None, None, None, tmp_path)
+        content = path.read_text()
+
+        assert "EXECUTIVE SUMMARY" in content
+        assert "Recommended production candidate: LightGBM" in content
+        assert "Headline findings:" in content
+
+    def test_feature_inventory_uses_generic_selection_wording(self, tmp_path):
+        results_df = pd.DataFrame(
+            {"ROC AUC": [0.82], "PR AUC": [0.15], "KS": [0.50], "Brier": [0.06], "N": [1000]},
+            index=["Logistic Regression"],
+        )
+        feature_provenance_df = pd.DataFrame(
+            [
+                {"feature": "INCOME_T1", "provenance": "raw", "data_type": "numerical", "rfecv_candidate": True, "rfecv_kept": True, "interaction_type": np.nan},
+                {"feature": "CSP", "provenance": "raw", "data_type": "categorical", "rfecv_candidate": True, "rfecv_kept": False, "interaction_type": np.nan},
+                {"feature": "INCOME_T1_DIV_TOTAL_LOAN_NBR", "provenance": "interaction", "data_type": "numerical", "rfecv_candidate": True, "rfecv_kept": True, "interaction_type": "ratio"},
+            ]
+        )
+
+        path = generate_model_card(results_df, None, None, None, None, feature_provenance_df, tmp_path)
+        content = path.read_text()
+
+        assert "Selected modeling features" in content
+        assert "temporal elastic-net stability selection" in content
+        assert "RFECV-selected features" not in content
+
 
 class TestGenerateVariableDictionary:
     def test_creates_csv(self, tmp_path):

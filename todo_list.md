@@ -192,3 +192,49 @@
 - [ ] **The test suite matches the actual current API**
 - [ ] **Benchmark claims are backed by paired model-comparison outputs**
 - [x] **Experimental modes are clearly separated from official results**
+
+---
+
+## Phase 6 — Overfitting Reduction
+
+### Tree complexity bounds
+
+- [x] **LGBM: tighten `num_leaves` to 8–31** (64 leaves at depth 6 is too flexible for ~5% base rate)
+- [x] **LGBM: tighten `max_depth` to 3–5** (was 3–6)
+- [x] **LGBM: raise `min_child_samples` floor to 50–300** (force larger leaf sizes)
+- [x] **XGB: tighten `max_depth` to 2–4** (depth 5 can overfit rare events)
+- [x] **XGB: raise `min_child_weight` floor to 20–100** (consistent with LGBM reasoning)
+- [x] **CatBoost: tighten `depth` to 3–5**
+- [x] **CatBoost: raise `min_data_in_leaf` floor to 50–300**
+
+### Additional regularization
+
+- [ ] **LGBM: add `max_bin` to search (63–127)** (coarser splits = strong regularizer, cheap in discrimination)
+- [ ] **LGBM: add `feature_fraction_bynode` / XGB: add `colsample_bynode`** (per-node column sampling on top of per-tree)
+- [ ] **Lower `N_ESTIMATORS_CEILING` to 1000 and `EARLY_STOPPING_ROUNDS` to 30** (tighter boosting budget)
+
+### Calibration
+
+- [ ] **Use `method="isotonic"` for tree models, keep `method="sigmoid"` for LR** (tree score distributions are step-functions, not linear log-odds)
+
+## Phase 7 — Bias Reduction
+
+### Statistical bias
+
+- [ ] **Add binned interaction search** (WoE-binned numerical × categorical, to capture threshold effects ratios miss)
+- [ ] **LR: switch to `solver="saga"` with `penalty="elasticnet"` and tune `l1_ratio`** (let the linear model express sparsity)
+- [ ] **Document `scale_pos_weight` × `sample_weight` interaction** (when reject inference is on, both rebalance — risk of over-amplifying minority class)
+- [ ] **Add `TargetEncoder(smooth=...)` to Optuna search** (tune smoothing instead of relying on heuristic)
+- [ ] **`_cv_target_encode_auc` fallback still uses `StratifiedKFold(shuffle=True)`** — document exception or replace with pooled-AUC fallback
+
+### Population bias
+
+- [ ] **Add KS test of score distributions between booked vs rejected populations** (in threshold analysis output)
+- [ ] **Add selection-bias correlation metric** (correlation between model PD and `risk_score_rf` — high correlation = recapitulating the selection mechanism)
+- [ ] **Add adverse impact analysis by age band** (regulatory concern if `AGE_T1` drives predictions)
+
+## Phase 8 — Performance & Governance
+
+- [ ] **Parallelize Optuna trials** (`n_jobs` on study)
+- [ ] **Log Optuna study DataFrames to CSV** (`study.trials_dataframe()` per model for hyperparameter sensitivity)
+- [ ] **Add remaining test coverage** (PSI/CSI edge cases, SHAP smoke test, phase-3 ablation schema)

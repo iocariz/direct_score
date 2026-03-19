@@ -10,7 +10,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from training import (
+from training import temporal_split
+from training_constants import (
     DROP_COLS,
     MATURITY_CUTOFF,
     MISS_CANDIDATES,
@@ -20,6 +21,7 @@ from training import (
     SPLIT_DATE,
     TARGET,
 )
+from training_features import engineer_features, select_features
 
 _RNG = np.random.RandomState(42)
 
@@ -151,14 +153,12 @@ def booked_df(raw_df) -> pd.DataFrame:
 @pytest.fixture()
 def engineered_df(booked_df) -> pd.DataFrame:
     """Booked DataFrame after feature engineering."""
-    from training import engineer_features
     return engineer_features(booked_df)
 
 
 @pytest.fixture()
 def train_test_data(engineered_df):
     """Minimal train/test split arrays for model testing."""
-    from training import select_features, temporal_split
     feature_cols, num_cols, cat_cols = select_features(engineered_df)
     X_train, y_train, X_test, y_test, bench_risk, bench_score, train_dates = temporal_split(
         engineered_df, feature_cols,

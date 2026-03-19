@@ -14,31 +14,37 @@ import pandas as pd
 import pytest
 
 from training import (
-    BENCHMARK_MODEL_NAMES,
-    EXPERIMENTAL_STACKING_NAME,
-    POPULATION_MODE_UNDERWRITING,
-    RANDOM_STATE,
-    SPLIT_DATE,
-    TARGET,
     build_applicant_score_frame,
-    build_holdout_score_frame,
     build_population_summary_df,
-    build_preprocessors,
-    engineer_features,
     run_rolling_out_of_time_validation,
-    evaluate,
-    evaluate_all,
-    extract_feature_importance,
-    plot_score_distributions,
-    reduce_cardinality,
-    save_artifacts,
-    select_features,
     temporal_split,
     train_catboost,
     train_logistic_regression,
     train_lgbm,
     train_stacking,
     train_xgboost,
+)
+from training_constants import (
+    BENCHMARK_MODEL_NAMES,
+    EXPERIMENTAL_STACKING_NAME,
+    POPULATION_MODE_UNDERWRITING,
+    RANDOM_STATE,
+    SPLIT_DATE,
+    TARGET,
+)
+from training_features import (
+    build_preprocessors,
+    engineer_features,
+    reduce_cardinality,
+    select_features,
+)
+from training_reporting import (
+    build_holdout_score_frame,
+    evaluate,
+    evaluate_all,
+    extract_feature_importance,
+    plot_score_distributions,
+    save_artifacts,
 )
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
@@ -643,6 +649,42 @@ class TestArtifacts:
                 }
             ]
         )
+        interaction_leaderboard_df = pd.DataFrame(
+            [
+                {
+                    "name": "A/B",
+                    "type": "ratio",
+                    "auc": 0.61,
+                    "lift": 0.03,
+                    "feat_a": "A",
+                    "feat_b": "B",
+                    "feat_a_power": 0.05,
+                    "feat_b_power": 0.02,
+                    "parent_power": 0.05,
+                    "power": 0.08,
+                    "selected": True,
+                    "scoring_strategy": "temporal_validation",
+                }
+            ]
+        )
+        feature_discovery_boundary_df = pd.DataFrame(
+            [
+                {
+                    "feature_discovery_fraction": 0.5,
+                    "feature_discovery_end": "2024-03-01",
+                    "interaction_search_cutoff": "2024-04-01",
+                    "discovery_seed_rows": 100,
+                    "discovery_seed_positives": 12,
+                    "estimation_seed_rows": 100,
+                    "estimation_seed_positives": 13,
+                    "numeric_scoring_strategy": "temporal_validation",
+                    "categorical_scoring_strategy": "temporal_target_encode",
+                    "screened_num_pairs": 10,
+                    "screened_cat_pairs": 6,
+                    "selected_interactions": 1,
+                }
+            ]
+        )
         ablation_results_df = pd.DataFrame(
             [
                 {
@@ -714,6 +756,8 @@ class TestArtifacts:
             experimental_results_df=experimental_results_df,
             benchmark_comparisons_df=benchmark_comparisons_df,
             feature_provenance_df=feature_provenance_df,
+            interaction_leaderboard_df=interaction_leaderboard_df,
+            feature_discovery_boundary_df=feature_discovery_boundary_df,
             ablation_results_df=ablation_results_df,
             rolling_oot_results_df=rolling_oot_results_df,
             rolling_oot_summary_df=rolling_oot_summary_df,
@@ -722,6 +766,8 @@ class TestArtifacts:
         assert (tmp_path / "results_experimental.csv").exists()
         assert (tmp_path / "benchmark_comparisons.csv").exists()
         assert (tmp_path / "feature_provenance.csv").exists()
+        assert (tmp_path / "interaction_leaderboard.csv").exists()
+        assert (tmp_path / "feature_discovery_boundary.csv").exists()
         assert (tmp_path / "ablation_results.csv").exists()
         assert (tmp_path / "rolling_oot_results.csv").exists()
         assert (tmp_path / "rolling_oot_summary.csv").exists()

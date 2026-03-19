@@ -4,9 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from training import (
+from training_constants import (
     BENCHMARK_MODEL_NAMES,
     EXPERIMENTAL_STACKING_NAME,
+)
+from training_reporting import (
     delong_auc_test,
     paired_bootstrap_benchmark_comparisons,
     paired_bootstrap_metric_delta,

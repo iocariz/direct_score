@@ -6,16 +6,22 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from training import (
+import training_features as training_features_module
+from training_constants import (
     DROP_COLS,
     MISS_CANDIDATES,
     RAW_CAT,
     RAW_NUM,
     TARGET,
+)
+from training_features import (
+    _safe_auc,
+    _temporal_numeric_auc,
     add_interactions,
     build_feature_provenance,
     engineer_features,
     reduce_cardinality,
+    search_interactions,
     select_features,
 )
 
@@ -141,6 +147,113 @@ class TestAddInteractions:
         }])
         result = add_interactions(df, interactions)
         assert result["A_DIV_B"].iloc[0] == 99.0  # unchanged
+
+
+class TestTemporalInteractionScoring:
+    def test_temporal_numeric_auc_penalizes_late_regime_shift(self, monkeypatch):
+        monkeypatch.setattr(training_features_module, "MIN_VALID", 2)
+
+        y = np.array(
+            [0] * 8 + [1] * 8
+            + [0] * 8 + [1] * 8
+            + [0] * 5 + [1] * 5
+            + [0] * 5 + [1] * 5
+        )
+        scores = np.array(
+            [0.10] * 8 + [0.90] * 8
+            + [0.10] * 8 + [0.90] * 8
+            + [0.70] * 5 + [0.30] * 5
+            + [0.70] * 5 + [0.30] * 5
+        )
+        dates = pd.to_datetime(
+            ["2024-01-01"] * 16
+            + ["2024-02-01"] * 16
+            + ["2024-03-01"] * 10
+            + ["2024-04-01"] * 10
+        )
+
+        pooled_auc, pooled_n = _safe_auc(y, scores)
+        temporal_auc, temporal_n = _temporal_numeric_auc(scores, y, dates)
+
+        assert pooled_n == 52
+        assert temporal_n == 20
+        assert pooled_auc > temporal_auc
+        assert pooled_auc > 0.70
+        assert temporal_auc < 0.50
+
+
+class TestSearchInteractions:
+    def test_return_diagnostics_uses_temporal_scoring_and_reports_gating(self, monkeypatch):
+        monkeypatch.setattr(training_features_module, "RAW_NUM", ["num_a", "num_b", "num_c"])
+        monkeypatch.setattr(training_features_module, "RAW_CAT", ["cat_a", "cat_b", "cat_c"])
+        monkeypatch.setattr(training_features_module, "INTERACTION_SEARCH_TOP_K_NUM", 2)
+        monkeypatch.setattr(training_features_module, "INTERACTION_SEARCH_TOP_K_CAT", 2)
+        monkeypatch.setattr(training_features_module, "MIN_VALID", 2)
+        monkeypatch.setattr(training_features_module, "MIN_LIFT", 0.0)
+
+        dates = pd.to_datetime(
+            ["2024-01-01"] * 20
+            + ["2024-02-01"] * 20
+            + ["2024-03-01"] * 20
+            + ["2024-04-01"] * 20
+        )
+        y = np.array(([0] * 10 + [1] * 10) * 4)
+        late_mask = np.repeat([False, False, True, True], 20)
+
+        df = pd.DataFrame({
+            "mis_Date": dates,
+            TARGET: y,
+            "num_a": np.where(late_mask, np.where(y == 1, 1.0, 9.0), np.where(y == 1, 9.0, 1.0)),
+            "num_b": np.where(y == 1, 2.0, 5.0),
+            "num_c": np.tile(np.linspace(1.0, 2.0, 20), 4),
+            "cat_a": np.where(late_mask, np.where(y == 1, "bad", "good"), np.where(y == 1, "good", "bad")),
+            "cat_b": np.where(np.arange(len(y)) % 2 == 0, "x", "y"),
+            "cat_c": np.where(np.arange(len(y)) % 3 == 0, "m", "n"),
+        })
+
+        result = search_interactions(df, end_before_date="2024-05-01", return_diagnostics=True)
+        summary = result.interaction_search_summary_df.iloc[0]
+
+        assert summary["numeric_scoring_strategy"] == "temporal_validation"
+        assert summary["categorical_scoring_strategy"] == "temporal_target_encode"
+        assert int(summary["raw_num_features"]) == 3
+        assert int(summary["raw_cat_features"]) == 3
+        assert int(summary["screened_num_features"]) == 2
+        assert int(summary["screened_cat_features"]) == 2
+        assert int(summary["screened_num_pairs"]) == 1
+        assert int(summary["screened_cat_pairs"]) == 1
+        assert set(result.selected_interactions["name"]) == set(
+            result.interaction_leaderboard_df.loc[result.interaction_leaderboard_df["selected"], "name"]
+        )
+
+    def test_return_diagnostics_falls_back_without_enough_date_blocks(self, monkeypatch):
+        monkeypatch.setattr(training_features_module, "RAW_NUM", ["num_a", "num_b"])
+        monkeypatch.setattr(training_features_module, "RAW_CAT", ["cat_a", "cat_b"])
+        monkeypatch.setattr(training_features_module, "INTERACTION_SEARCH_TOP_K_NUM", 2)
+        monkeypatch.setattr(training_features_module, "INTERACTION_SEARCH_TOP_K_CAT", 2)
+        monkeypatch.setattr(training_features_module, "MIN_VALID", 2)
+        monkeypatch.setattr(training_features_module, "MIN_LIFT", 0.0)
+
+        dates = pd.to_datetime(["2024-01-01"] * 20 + ["2024-02-01"] * 20)
+        y = np.array(([0] * 10 + [1] * 10) * 2)
+
+        df = pd.DataFrame({
+            "mis_Date": dates,
+            TARGET: y,
+            "num_a": np.where(y == 1, 9.0, 1.0),
+            "num_b": np.where(y == 1, 2.0, 5.0),
+            "cat_a": np.where(y == 1, "good", "bad"),
+            "cat_b": np.where(np.arange(len(y)) % 2 == 0, "x", "y"),
+        })
+
+        result = search_interactions(df, end_before_date="2024-03-01", return_diagnostics=True)
+        summary = result.interaction_search_summary_df.iloc[0]
+
+        assert summary["numeric_scoring_strategy"] == "fallback_pooled_auc"
+        assert summary["categorical_scoring_strategy"] == "fallback_cv_target_encode"
+        assert int(summary["screened_num_pairs"]) == 1
+        assert int(summary["screened_cat_pairs"]) == 1
+        assert "selected" in result.interaction_leaderboard_df.columns
 
 
 class TestBuildFeatureProvenance:

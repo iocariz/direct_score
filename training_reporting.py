@@ -608,6 +608,8 @@ def save_artifacts(
     benchmark_comparisons_df: pd.DataFrame | None = None,
     experimental_benchmark_comparisons_df: pd.DataFrame | None = None,
     feature_provenance_df: pd.DataFrame | None = None,
+    interaction_leaderboard_df: pd.DataFrame | None = None,
+    feature_discovery_boundary_df: pd.DataFrame | None = None,
     ablation_results_df: pd.DataFrame | None = None,
     rolling_oot_results_df: pd.DataFrame | None = None,
     rolling_oot_summary_df: pd.DataFrame | None = None,
@@ -649,6 +651,16 @@ def save_artifacts(
         feature_provenance_path = output_dir / "feature_provenance.csv"
         feature_provenance_df.to_csv(feature_provenance_path, index=False)
         logger.info("Saved feature provenance: {} ({} rows)", feature_provenance_path, len(feature_provenance_df))
+
+    if interaction_leaderboard_df is not None and not interaction_leaderboard_df.empty:
+        interaction_leaderboard_path = output_dir / "interaction_leaderboard.csv"
+        interaction_leaderboard_df.to_csv(interaction_leaderboard_path, index=False, float_format="%.6f")
+        logger.info("Saved interaction leaderboard: {} ({} rows)", interaction_leaderboard_path, len(interaction_leaderboard_df))
+
+    if feature_discovery_boundary_df is not None and not feature_discovery_boundary_df.empty:
+        feature_discovery_boundary_path = output_dir / "feature_discovery_boundary.csv"
+        feature_discovery_boundary_df.to_csv(feature_discovery_boundary_path, index=False)
+        logger.info("Saved feature discovery boundary: {} ({} rows)", feature_discovery_boundary_path, len(feature_discovery_boundary_df))
 
     if ablation_results_df is not None and not ablation_results_df.empty:
         ablation_results_path = output_dir / "ablation_results.csv"

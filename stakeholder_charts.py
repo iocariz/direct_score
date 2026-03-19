@@ -115,19 +115,66 @@ def _non_calibrated_comparisons(comparisons_df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(["reference_model", "candidate_model"])
 
 
+def _selected_model_name(results_df: pd.DataFrame, model_selection_df: pd.DataFrame | None) -> str | None:
+    if model_selection_df is not None and not model_selection_df.empty:
+        if {"model", "recommended"}.issubset(model_selection_df.columns):
+            recommended_rows = model_selection_df.loc[model_selection_df["recommended"].fillna(False).astype(bool)]
+            if not recommended_rows.empty:
+                return str(recommended_rows.iloc[0]["model"])
+
+    candidate_results = results_df.loc[results_df["Model"].isin(CANDIDATE_ORDER)].copy()
+    if candidate_results.empty:
+        return None
+    candidate_results = candidate_results.sort_values(["ROC AUC", "PR AUC"], ascending=False)
+    return str(candidate_results.iloc[0]["Model"])
+
+
+def _is_selected_model(model_name: str, selected_model: str | None) -> bool:
+    return selected_model is not None and str(model_name) == selected_model
+
+
+def _label_with_selection(model_name: str, selected_model: str | None) -> str:
+    return f"{model_name} (selected)" if _is_selected_model(model_name, selected_model) else str(model_name)
+
+
+def _line_emphasis(model_name: str, selected_model: str | None) -> tuple[float, float]:
+    if _is_selected_model(model_name, selected_model):
+        return 3.4, 8.0
+    return 2.0, 5.5
+
+
+def _alpha_emphasis(model_name: str, selected_model: str | None) -> float:
+    return 1.0 if _is_selected_model(model_name, selected_model) else 0.45
+
+
 def create_kpi_chart(
     results_df: pd.DataFrame,
     population_summary_df: pd.DataFrame,
     benchmark_comparisons_df: pd.DataFrame,
     output_path: Path,
+    selected_model: str | None = None,
 ) -> Path:
     post_split = population_summary_df.loc[population_summary_df["split"] == "post_split"].copy()
     counts = post_split.set_index("status_name")["n_rows"].to_dict()
-    held_out_row = results_df.loc[results_df["Model"] == "Logistic Regression"].iloc[0]
-    comparison_row = benchmark_comparisons_df.loc[
-        (benchmark_comparisons_df["candidate_model"] == "Logistic Regression")
-        & (benchmark_comparisons_df["reference_model"] == "score_RF (benchmark)")
-    ].iloc[0]
+    held_out_name = selected_model or "Logistic Regression"
+    held_out_candidates = results_df.loc[results_df["Model"] == held_out_name]
+    if held_out_candidates.empty:
+        held_out_candidates = results_df.loc[results_df["Model"].isin(CANDIDATE_ORDER)]
+    if held_out_candidates.empty:
+        held_out_candidates = results_df.copy()
+    held_out_row = held_out_candidates.iloc[0]
+
+    comparison_row = None
+    if not benchmark_comparisons_df.empty:
+        comparison_candidates = benchmark_comparisons_df.loc[
+            benchmark_comparisons_df["candidate_model"] == held_out_name
+        ].copy()
+        if comparison_candidates.empty:
+            comparison_candidates = benchmark_comparisons_df.loc[
+                benchmark_comparisons_df["candidate_model"].isin(CANDIDATE_ORDER)
+            ].copy()
+        if not comparison_candidates.empty:
+            comparison_row = comparison_candidates.sort_values("auc_improvement", ascending=False).iloc[0]
 
     tiles = [
         ("Decisioned applications scored", int(post_split["n_rows"].sum()), "Full post-split\ndecisioned population"),
@@ -135,7 +182,7 @@ def create_kpi_chart(
         ("Rejected applications", int(counts.get("Rejected", 0)), "Scored without\nobserved repayment"),
         ("Canceled applications", int(counts.get("Canceled", 0)), "Scored without\nobserved repayment"),
         ("Held-out booked proxy rows", int(held_out_row["N"]), "Official test sample"),
-        ("Observed defaults in hold-out", int(comparison_row["n_pos"]), "Booked defaults in\nthe test sample"),
+        ("Observed defaults in hold-out", int(comparison_row["n_pos"]) if comparison_row is not None else 0, "Booked defaults in\nthe test sample"),
     ]
 
     fig, axes = plt.subplots(2, 3, figsize=(15.5, 9))
@@ -160,7 +207,7 @@ def create_kpi_chart(
         ax.text(0.08, 0.17, subtitle, transform=ax.transAxes, fontsize=10.5, color="white", linespacing=1.15)
 
     fig.suptitle("Underwriting-stage scoring headline KPIs", fontsize=20, fontweight="bold", color=TEXT_DARK)
-    fig.text(0.5, 0.02, "Source: population_summary.csv and benchmark_comparisons.csv", ha="center", fontsize=10, color="#4b5563")
+    fig.text(0.5, 0.02, f"Source: population_summary.csv and benchmark_comparisons.csv. Selected model: {held_out_row['Model']}.", ha="center", fontsize=10, color="#4b5563")
     return _save_figure(fig, output_path)
 
 
@@ -250,10 +297,9 @@ def create_population_chart(population_summary_df: pd.DataFrame, output_path: Pa
     return _save_figure(fig, output_path)
 
 
-def create_holdout_chart(results_df: pd.DataFrame, output_path: Path) -> Path:
+def create_holdout_chart(results_df: pd.DataFrame, output_path: Path, selected_model: str | None = None) -> Path:
     df = _non_calibrated_results(results_df).copy()
     y = np.arange(len(df))
-    colors = [MODEL_COLORS[str(model)] for model in df["Model"]]
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 7), sharey=False)
     fig.patch.set_facecolor("white")
@@ -261,17 +307,30 @@ def create_holdout_chart(results_df: pd.DataFrame, output_path: Path) -> Path:
 
     for ax, metric, span in zip(axes, ["ROC AUC", "PR AUC"], [0.08, 0.045], strict=False):
         values = df[metric].astype(float).to_numpy()
-        ax.barh(y, values, color=colors, height=0.62)
+        for idx, (model_name, value) in enumerate(zip(df["Model"].astype(str), values, strict=False)):
+            is_selected = _is_selected_model(model_name, selected_model)
+            ax.barh(
+                idx,
+                value,
+                color=MODEL_COLORS[str(model_name)],
+                alpha=_alpha_emphasis(model_name, selected_model),
+                height=0.68 if is_selected else 0.56,
+                edgecolor=TEXT_DARK if is_selected else "none",
+                linewidth=2.0 if is_selected else 0.0,
+                zorder=3 if is_selected else 2,
+            )
         ax.set_title(metric, fontsize=16, fontweight="bold", color=TEXT_DARK)
         ax.set_xlabel(metric)
         ax.grid(axis="x", alpha=0.25)
         ax.spines[["top", "right"]].set_visible(False)
         ax.set_xlim(max(0, values.min() - span * 0.6), values.max() + span * 0.35)
         for idx, value in enumerate(values):
-            ax.text(value + span * 0.02, idx, _metric_label(value), va="center", fontsize=10, color=TEXT_DARK)
+            model_name = str(df.iloc[idx]["Model"])
+            label = f"{_metric_label(value)} ← selected" if _is_selected_model(model_name, selected_model) else _metric_label(value)
+            ax.text(value + span * 0.02, idx, label, va="center", fontsize=10, color=TEXT_DARK)
 
     axes[0].set_yticks(y)
-    axes[0].set_yticklabels(df["Model"].astype(str).tolist(), fontsize=11)
+    axes[0].set_yticklabels([_label_with_selection(model_name, selected_model) for model_name in df["Model"].astype(str)], fontsize=11)
     axes[1].set_yticks(y)
     axes[1].set_yticklabels([])
     axes[1].tick_params(axis="y", length=0)
@@ -280,7 +339,9 @@ def create_holdout_chart(results_df: pd.DataFrame, output_path: Path) -> Path:
     fig.suptitle("Held-out booked proxy benchmark comparison", fontsize=20, fontweight="bold", color=TEXT_DARK)
     # Derive the best candidate model from actual results
     candidate_df = df.loc[df["Model"].isin(CANDIDATE_ORDER)]
-    if not candidate_df.empty:
+    if selected_model is not None and selected_model in candidate_df["Model"].astype(str).tolist():
+        subtitle = f"{selected_model} is the selected production candidate; all models remain visible for comparison."
+    elif not candidate_df.empty:
         best_candidate = candidate_df.loc[candidate_df["ROC AUC"].astype(float).idxmax(), "Model"]
         subtitle = f"{best_candidate} is the strongest current in-house candidate on the held-out booked proxy test."
     else:
@@ -289,7 +350,7 @@ def create_holdout_chart(results_df: pd.DataFrame, output_path: Path) -> Path:
     return _save_figure(fig, output_path)
 
 
-def create_auc_lift_chart(benchmark_comparisons_df: pd.DataFrame, output_path: Path) -> Path:
+def create_auc_lift_chart(benchmark_comparisons_df: pd.DataFrame, output_path: Path, selected_model: str | None = None) -> Path:
     df = _non_calibrated_comparisons(benchmark_comparisons_df)
     references = ["score_RF (benchmark)", "risk_score_rf (benchmark)"]
     titles = ["Lift versus score_RF", "Lift versus risk_score_rf"]
@@ -310,28 +371,39 @@ def create_auc_lift_chart(benchmark_comparisons_df: pd.DataFrame, output_path: P
 
         ax.axvline(0.0, color="#6b7280", linestyle="--", linewidth=1.5)
         ax.errorbar(point, y, xerr=np.vstack([point - lo, hi - point]), fmt="none", ecolor="#9ca3af", elinewidth=2, capsize=4, zorder=1)
-        ax.scatter(point, y, s=90, color=colors, zorder=2)
+        for idx, (model_name, value, p_value) in enumerate(zip(plot_df["candidate_model"].astype(str), point, p_values, strict=False)):
+            is_selected = _is_selected_model(model_name, selected_model)
+            ax.scatter(
+                [value],
+                [idx],
+                s=160 if is_selected else 90,
+                color=MODEL_COLORS[str(model_name)],
+                alpha=_alpha_emphasis(model_name, selected_model),
+                edgecolors=TEXT_DARK if is_selected else "none",
+                linewidths=1.8 if is_selected else 0.0,
+                zorder=3 if is_selected else 2,
+            )
+            p_label = f"p={p_value:.3g} • selected" if is_selected else f"p={p_value:.3g}"
+            ax.text(value + 0.0025, idx + 0.14, p_label, fontsize=9, color="#4b5563")
         ax.set_title(title, fontsize=16, fontweight="bold", color=TEXT_DARK)
         ax.set_xlabel("AUC improvement")
         ax.grid(axis="x", alpha=0.25)
         ax.spines[["top", "right"]].set_visible(False)
         ax.set_xlim(min(lo.min(), -0.04) - 0.005, max(hi.max(), 0.06) + 0.005)
-        for idx, (p_value, value) in enumerate(zip(p_values, point, strict=False)):
-            ax.text(value + 0.0025, idx + 0.14, f"p={p_value:.3g}", fontsize=9, color="#4b5563")
 
         ax.set_yticks(y)
-        ax.set_yticklabels(plot_df["candidate_model"].astype(str).tolist(), fontsize=11)
+        ax.set_yticklabels([_label_with_selection(model_name, selected_model) for model_name in plot_df["candidate_model"].astype(str)], fontsize=11)
         ax.invert_yaxis()
 
     axes[1].set_yticks(axes[0].get_yticks())
     axes[1].set_yticklabels([])
     axes[1].tick_params(axis="y", length=0)
     fig.suptitle("Paired AUC lift with confidence intervals", fontsize=20, fontweight="bold", color=TEXT_DARK)
-    fig.text(0.5, 0.02, "Intervals entirely to the right of zero indicate a positive and stable benchmark lift.", ha="center", fontsize=10, color="#4b5563")
+    fig.text(0.5, 0.02, "Intervals entirely to the right of zero indicate a positive and stable benchmark lift. Calibrated variants are omitted here because monotonic calibration does not change AUC lift.", ha="center", fontsize=10, color="#4b5563")
     return _save_figure(fig, output_path)
 
 
-def create_rolling_oot_chart(rolling_oot_results_df: pd.DataFrame, output_path: Path) -> Path:
+def create_rolling_oot_chart(rolling_oot_results_df: pd.DataFrame, output_path: Path, selected_model: str | None = None) -> Path:
     df = rolling_oot_results_df.loc[rolling_oot_results_df["is_calibrated"] == False].copy()
     df = df.loc[df["Model"].isin(MODEL_ORDER)].copy()
     df["Model"] = pd.Categorical(df["Model"], categories=MODEL_ORDER, ordered=True)
@@ -343,14 +415,17 @@ def create_rolling_oot_chart(rolling_oot_results_df: pd.DataFrame, output_path: 
     for ax, metric in zip(axes, ["ROC AUC", "PR AUC"], strict=False):
         for model in MODEL_ORDER:
             model_df = df.loc[df["Model"] == model]
+            linewidth, markersize = _line_emphasis(model, selected_model)
             ax.plot(
                 model_df["fold"],
                 model_df[metric],
                 marker="o",
-                linewidth=2.2,
-                markersize=6,
+                linewidth=linewidth,
+                markersize=markersize,
                 color=MODEL_COLORS[model],
-                label=model,
+                alpha=_alpha_emphasis(model, selected_model),
+                zorder=4 if _is_selected_model(model, selected_model) else 2,
+                label=_label_with_selection(model, selected_model),
             )
         ax.set_title(metric, fontsize=16, fontweight="bold", color=TEXT_DARK)
         ax.set_xlabel("Forward validation window")
@@ -361,11 +436,11 @@ def create_rolling_oot_chart(rolling_oot_results_df: pd.DataFrame, output_path: 
 
     axes[1].legend(frameon=False, bbox_to_anchor=(1.02, 0.5), loc="center left")
     fig.suptitle("Rolling out-of-time performance by forward window", fontsize=20, fontweight="bold", color=TEXT_DARK)
-    fig.text(0.5, 0.02, "The ranking is directionally stable across the four forward validation windows.", ha="center", fontsize=10, color="#4b5563")
+    fig.text(0.5, 0.02, "The selected model is highlighted. Calibrated variants share the same ranking metrics and are shown separately in the calibration views.", ha="center", fontsize=10, color="#4b5563")
     return _save_figure(fig, output_path)
 
 
-def create_calibration_chart(results_df: pd.DataFrame, output_path: Path) -> Path:
+def create_calibration_chart(results_df: pd.DataFrame, output_path: Path, selected_model: str | None = None) -> Path:
     raw_df = results_df.loc[results_df["Model"].isin(CANDIDATE_ORDER), ["Model", "Brier"]].copy()
     calibrated_df = results_df.loc[results_df["Model"].str.contains("(calibrated)", regex=False, na=False), ["Model", "Brier"]].copy()
     calibrated_df["base_model"] = calibrated_df["Model"].str.replace(" (calibrated)", "", regex=False)
@@ -378,24 +453,49 @@ def create_calibration_chart(results_df: pd.DataFrame, output_path: Path) -> Pat
 
     fig, ax = plt.subplots(figsize=(11, 6.5))
     fig.patch.set_facecolor("white")
-    ax.bar(x - width / 2, merged["Brier_raw"], width=width, color="#8d99ae", label="Raw")
-    ax.bar(x + width / 2, merged["Brier_calibrated"], width=width, color="#2a9d8f", label="Calibrated")
+    for idx, row in enumerate(merged.itertuples(index=False)):
+        is_selected = _is_selected_model(str(row.Model), selected_model)
+        alpha = _alpha_emphasis(str(row.Model), selected_model)
+        ax.bar(
+            idx - width / 2,
+            row.Brier_raw,
+            width=width,
+            color="#8d99ae",
+            alpha=alpha,
+            edgecolor=TEXT_DARK if is_selected else "none",
+            linewidth=2.0 if is_selected else 0.0,
+            label="Raw" if idx == 0 else None,
+            zorder=3 if is_selected else 2,
+        )
+        ax.bar(
+            idx + width / 2,
+            row.Brier_calibrated,
+            width=width,
+            color="#2a9d8f",
+            alpha=alpha,
+            edgecolor=TEXT_DARK if is_selected else "none",
+            linewidth=2.0 if is_selected else 0.0,
+            label="Calibrated" if idx == 0 else None,
+            zorder=3 if is_selected else 2,
+        )
 
     for idx, row in enumerate(merged.itertuples(index=False)):
         ax.text(idx - width / 2, row.Brier_raw + 0.004, _metric_label(row.Brier_raw), ha="center", fontsize=10, color=TEXT_DARK, rotation=90)
         ax.text(idx + width / 2, row.Brier_calibrated + 0.004, _metric_label(row.Brier_calibrated), ha="center", fontsize=10, color=TEXT_DARK, rotation=90)
+        if _is_selected_model(str(row.Model), selected_model):
+            ax.text(idx, max(row.Brier_raw, row.Brier_calibrated) + 0.012, "selected base model", ha="center", fontsize=10, fontweight="bold", color=TEXT_DARK)
 
-    ax.set_xticks(x, merged["Model"].astype(str).tolist())
+    ax.set_xticks(x, [_label_with_selection(model_name, selected_model) for model_name in merged["Model"].astype(str)])
     ax.set_ylabel("Brier score")
     ax.set_title("Calibration improves probability quality", fontsize=19, fontweight="bold", color=TEXT_DARK)
     ax.legend(frameon=False)
     ax.grid(axis="y", alpha=0.25)
     ax.spines[["top", "right"]].set_visible(False)
-    fig.text(0.5, 0.02, "Calibrated model probabilities are more usable for thresholds and expected-loss analysis.", ha="center", fontsize=10, color="#4b5563")
+    fig.text(0.5, 0.02, "Calibrated probabilities are more usable for thresholds and expected-loss analysis, but they are treated as probability-adjusted variants of the same base models rather than separate recommendation candidates.", ha="center", fontsize=10, color="#4b5563")
     return _save_figure(fig, output_path)
 
 
-def create_holdout_curves_chart(results_df: pd.DataFrame, holdout_scores_df: pd.DataFrame, output_path: Path) -> Path:
+def create_holdout_curves_chart(results_df: pd.DataFrame, holdout_scores_df: pd.DataFrame, output_path: Path, selected_model: str | None = None) -> Path:
     results_lookup = _non_calibrated_results(results_df).set_index("Model")
     model_names = [
         model_name
@@ -428,9 +528,24 @@ def create_holdout_curves_chart(results_df: pd.DataFrame, holdout_scores_df: pd.
         fpr, tpr, _ = roc_curve(model_y, model_scores)
         precision, recall, _ = precision_recall_curve(model_y, model_scores)
         color = MODEL_COLORS[model_name]
+        linewidth, _markersize = _line_emphasis(model_name, selected_model)
 
-        roc_ax.plot(fpr, tpr, linewidth=2.3, color=color)
-        pr_ax.plot(recall[::-1], precision[::-1], linewidth=2.3, color=color)
+        roc_ax.plot(
+            fpr,
+            tpr,
+            linewidth=linewidth,
+            color=color,
+            alpha=_alpha_emphasis(model_name, selected_model),
+            zorder=4 if _is_selected_model(model_name, selected_model) else 2,
+        )
+        pr_ax.plot(
+            recall[::-1],
+            precision[::-1],
+            linewidth=linewidth,
+            color=color,
+            alpha=_alpha_emphasis(model_name, selected_model),
+            zorder=4 if _is_selected_model(model_name, selected_model) else 2,
+        )
 
         result_row = results_lookup.loc[model_name]
         legend_handles.append(
@@ -438,8 +553,9 @@ def create_holdout_curves_chart(results_df: pd.DataFrame, holdout_scores_df: pd.
                 [0],
                 [0],
                 color=color,
-                linewidth=2.8,
-                label=f"{model_name} | ROC {result_row['ROC AUC']:.3f} | PR {result_row['PR AUC']:.3f}",
+                linewidth=linewidth,
+                alpha=_alpha_emphasis(model_name, selected_model),
+                label=f"{_label_with_selection(model_name, selected_model)} | ROC {result_row['ROC AUC']:.3f} | PR {result_row['PR AUC']:.3f}",
             )
         )
 
@@ -461,11 +577,11 @@ def create_holdout_curves_chart(results_df: pd.DataFrame, holdout_scores_df: pd.
 
     fig.legend(handles=legend_handles, frameon=False, loc="center left", bbox_to_anchor=(0.81, 0.50), fontsize=10)
     fig.suptitle("Held-out booked proxy ROC and precision-recall curves", fontsize=20, fontweight="bold", color=TEXT_DARK)
-    fig.text(0.5, 0.02, "Curves use the official booked-proxy test sample. The PR baseline reflects the low default rate.", ha="center", fontsize=10, color="#4b5563")
+    fig.text(0.5, 0.02, "Curves use the official booked-proxy test sample. The selected model is highlighted while all benchmark and in-house models remain visible.", ha="center", fontsize=10, color="#4b5563")
     return _save_figure(fig, output_path)
 
 
-def create_gains_chart(lift_table_df: pd.DataFrame, output_path: Path) -> Path:
+def create_gains_chart(lift_table_df: pd.DataFrame, output_path: Path, selected_model: str | None = None) -> Path:
     """Cumulative gains chart from a lift table (one model)."""
     models = lift_table_df["model"].unique()
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
@@ -478,14 +594,15 @@ def create_gains_chart(lift_table_df: pd.DataFrame, output_path: Path) -> Path:
         mdf = lift_table_df.loc[lift_table_df["model"] == model_name].sort_values("decile")
         color = MODEL_COLORS.get(model_name, "#577590")
         pct = mdf["decile"].values * 10
-        axes[0].plot(pct, mdf["capture_rate"].values * 100, marker="o", linewidth=2.2, markersize=6, color=color, label=model_name)
-        axes[1].plot(pct, mdf["cum_lift"].values, marker="o", linewidth=2.2, markersize=6, color=color, label=model_name)
+        linewidth, markersize = _line_emphasis(model_name, selected_model)
+        axes[0].plot(pct, mdf["capture_rate"].values * 100, marker="o", linewidth=linewidth, markersize=markersize, color=color, alpha=_alpha_emphasis(model_name, selected_model), zorder=4 if _is_selected_model(model_name, selected_model) else 2, label=_label_with_selection(model_name, selected_model))
+        axes[1].plot(pct, mdf["cum_lift"].values, marker="o", linewidth=linewidth, markersize=markersize, color=color, alpha=_alpha_emphasis(model_name, selected_model), zorder=4 if _is_selected_model(model_name, selected_model) else 2, label=_label_with_selection(model_name, selected_model))
 
     axes[0].plot([0, 100], [0, 100], linestyle="--", linewidth=1.5, color="#9ca3af", label="Random")
     axes[0].set_title("Cumulative capture rate", fontsize=16, fontweight="bold", color=TEXT_DARK)
     axes[0].set_xlabel("Population percentage (sorted by score)")
     axes[0].set_ylabel("% of defaults captured")
-    axes[0].grid(alpha=0.25)
+    axes[0].grid(axis="y", alpha=0.25)
     axes[0].spines[["top", "right"]].set_visible(False)
     axes[0].legend(frameon=False, fontsize=9)
 
@@ -493,13 +610,18 @@ def create_gains_chart(lift_table_df: pd.DataFrame, output_path: Path) -> Path:
     axes[1].set_title("Cumulative lift", fontsize=16, fontweight="bold", color=TEXT_DARK)
     axes[1].set_xlabel("Population percentage (sorted by score)")
     axes[1].set_ylabel("Lift over random")
-    axes[1].grid(alpha=0.25)
+    axes[1].grid(axis="y", alpha=0.25)
     axes[1].spines[["top", "right"]].set_visible(False)
     axes[1].legend(frameon=False, fontsize=9)
 
     # Derive summary for subtitle
-    if candidate_models:
+    if selected_model is not None and selected_model in plot_models:
+        best = selected_model
+    elif candidate_models:
         best = candidate_models[0]
+    else:
+        best = None
+    if best is not None:
         top2 = lift_table_df.loc[
             (lift_table_df["model"] == best) & (lift_table_df["decile"] <= 2)
         ]
@@ -511,7 +633,7 @@ def create_gains_chart(lift_table_df: pd.DataFrame, output_path: Path) -> Path:
     return _save_figure(fig, output_path)
 
 
-def create_threshold_analysis_chart(threshold_df: pd.DataFrame, output_path: Path) -> Path:
+def create_threshold_analysis_chart(threshold_df: pd.DataFrame, output_path: Path, selected_model: str | None = None) -> Path:
     """Precision/recall/FPR at business-relevant rejection thresholds."""
     models = threshold_df["model"].unique()
     candidate_models = [m for m in CANDIDATE_ORDER if m in models]
@@ -524,38 +646,46 @@ def create_threshold_analysis_chart(threshold_df: pd.DataFrame, output_path: Pat
         mdf = threshold_df.loc[threshold_df["model"] == model_name].sort_values("reject_pct")
         color = MODEL_COLORS.get(model_name, "#577590")
         pcts = mdf["reject_pct"].values
+        linewidth, markersize = _line_emphasis(model_name, selected_model)
 
-        axes[0].plot(pcts, mdf["recall"].values * 100, marker="o", linewidth=2.2, markersize=6, color=color, label=f"{model_name} (recall)")
-        axes[0].plot(pcts, mdf["precision"].values * 100, marker="s", linewidth=1.5, markersize=5, color=color, alpha=0.6, linestyle="--", label=f"{model_name} (precision)")
+        axes[0].plot(pcts, mdf["recall"].values * 100, marker="o", linewidth=linewidth, markersize=markersize, color=color, alpha=_alpha_emphasis(model_name, selected_model), zorder=4 if _is_selected_model(model_name, selected_model) else 2, label=f"{_label_with_selection(model_name, selected_model)} (recall)")
+        axes[0].plot(pcts, mdf["precision"].values * 100, marker="s", linewidth=max(1.2, linewidth - 0.8), markersize=max(4.0, markersize - 1.5), color=color, alpha=max(0.30, _alpha_emphasis(model_name, selected_model) - 0.15), linestyle="--", zorder=4 if _is_selected_model(model_name, selected_model) else 2, label=f"{_label_with_selection(model_name, selected_model)} (precision)")
 
-        axes[1].plot(pcts, mdf["capture_rate"].values * 100, marker="o", linewidth=2.2, markersize=6, color=color, label=model_name)
+        axes[1].plot(pcts, mdf["capture_rate"].values * 100, marker="o", linewidth=linewidth, markersize=markersize, color=color, alpha=_alpha_emphasis(model_name, selected_model), zorder=4 if _is_selected_model(model_name, selected_model) else 2, label=_label_with_selection(model_name, selected_model))
 
     axes[0].set_title("Precision & recall at rejection thresholds", fontsize=16, fontweight="bold", color=TEXT_DARK)
     axes[0].set_xlabel("% of applicants rejected (highest risk)")
     axes[0].set_ylabel("Percentage")
-    axes[0].grid(alpha=0.25)
+    axes[0].grid(axis="y", alpha=0.25)
     axes[0].spines[["top", "right"]].set_visible(False)
     axes[0].legend(frameon=False, fontsize=8, ncol=2)
 
     axes[1].set_title("Default capture rate at rejection thresholds", fontsize=16, fontweight="bold", color=TEXT_DARK)
     axes[1].set_xlabel("% of applicants rejected (highest risk)")
     axes[1].set_ylabel("% of defaults captured")
-    axes[1].grid(alpha=0.25)
+    axes[1].grid(axis="y", alpha=0.25)
     axes[1].spines[["top", "right"]].set_visible(False)
     axes[1].legend(frameon=False, fontsize=9)
 
     fig.suptitle("Operating point analysis — reject the riskiest X%", fontsize=20, fontweight="bold", color=TEXT_DARK)
-    fig.text(0.5, 0.02, "Trade-off between approval rate and default capture at various rejection thresholds.", ha="center", fontsize=10, color="#4b5563")
+    fig.text(0.5, 0.02, "Trade-off between approval rate and default capture at various rejection thresholds. The selected model is highlighted for operating-point decisions.", ha="center", fontsize=10, color="#4b5563")
     return _save_figure(fig, output_path)
 
 
-def create_reliability_diagram(holdout_scores_df: pd.DataFrame, output_path: Path, n_bins: int = 10) -> Path:
+def create_reliability_diagram(
+    holdout_scores_df: pd.DataFrame,
+    output_path: Path,
+    n_bins: int = 10,
+    selected_model: str | None = None,
+) -> Path:
     """Calibration reliability diagram — predicted vs observed probability."""
     y_true = holdout_scores_df[TARGET].astype(int).to_numpy()
 
     calibrated_models = [m for m in CANDIDATE_ORDER if _score_column_name(f"{m} (calibrated)") in holdout_scores_df.columns]
     raw_models = [m for m in CANDIDATE_ORDER if _score_column_name(m) in holdout_scores_df.columns]
     plot_models = calibrated_models if calibrated_models else raw_models
+    if selected_model in plot_models:
+        plot_models = [selected_model] + [model_name for model_name in plot_models if model_name != selected_model]
 
     if not plot_models:
         fig, ax = plt.subplots(figsize=(8, 8))
@@ -590,10 +720,21 @@ def create_reliability_diagram(holdout_scores_df: pd.DataFrame, output_path: Pat
                 bin_sizes.append(int(in_bin.sum()))
 
         color = MODEL_COLORS.get(model_name, "#577590")
+        linewidth, markersize = _line_emphasis(model_name, selected_model)
         ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.5, color="#9ca3af", label="Perfect calibration")
-        ax.plot(bin_centers, observed_rates, marker="o", linewidth=2.2, markersize=7, color=color, label=f"{model_name}")
+        ax.plot(
+            bin_centers,
+            observed_rates,
+            marker="o",
+            linewidth=linewidth,
+            markersize=max(6.0, markersize),
+            color=color,
+            alpha=_alpha_emphasis(model_name, selected_model),
+            zorder=4 if _is_selected_model(model_name, selected_model) else 2,
+            label=_label_with_selection(model_name, selected_model),
+        )
 
-        ax.set_title(model_name, fontsize=14, fontweight="bold", color=TEXT_DARK)
+        ax.set_title(_label_with_selection(model_name, selected_model), fontsize=14, fontweight="bold", color=TEXT_DARK)
         ax.set_xlabel("Predicted probability")
         ax.set_ylabel("Observed default rate")
         ax.set_xlim(0, 1)
@@ -607,7 +748,7 @@ def create_reliability_diagram(holdout_scores_df: pd.DataFrame, output_path: Pat
 
     fig.suptitle("Calibration reliability diagram", fontsize=20, fontweight="bold", color=TEXT_DARK)
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-    fig.text(0.5, 0.01, "Points above the diagonal indicate underestimation of risk; below means overestimation.", ha="center", fontsize=10, color="#4b5563")
+    fig.text(0.5, 0.01, "Points above the diagonal indicate underestimation of risk; below means overestimation. The selected base model is highlighted via its calibrated probability curve.", ha="center", fontsize=10, color="#4b5563")
     return _save_figure(fig, output_path)
 
 
@@ -616,6 +757,7 @@ def create_executive_summary_chart(
     benchmark_comparisons_df: pd.DataFrame,
     holdout_scores_df: pd.DataFrame | None,
     output_path: Path,
+    selected_model: str | None = None,
 ) -> Path:
     """Single-page executive summary for credit committee."""
     fig = plt.figure(figsize=(16, 10))
@@ -626,8 +768,12 @@ def create_executive_summary_chart(
     if candidate_results.empty:
         best_name, best_auc, best_ks = "N/A", 0.0, 0.0
     else:
-        best_idx = candidate_results["ROC AUC"].astype(float).idxmax()
-        best_row = candidate_results.loc[best_idx]
+        preferred_rows = candidate_results.loc[candidate_results["Model"] == selected_model] if selected_model is not None else pd.DataFrame()
+        if not preferred_rows.empty:
+            best_row = preferred_rows.iloc[0]
+        else:
+            best_idx = candidate_results["ROC AUC"].astype(float).idxmax()
+            best_row = candidate_results.loc[best_idx]
         best_name = str(best_row["Model"])
         best_auc = float(best_row["ROC AUC"])
         best_ks = float(best_row["KS"])
@@ -668,7 +814,7 @@ def create_executive_summary_chart(
     ax_main.add_patch(rec_patch)
     ax_main.text(0.50, 0.88, f"Recommended model: {best_name}", transform=ax_main.transAxes,
                  fontsize=22, fontweight="bold", color="white", ha="center", va="center")
-    ax_main.text(0.50, 0.77, "Strongest discriminative and calibration performance on held-out booked proxy test",
+    ax_main.text(0.50, 0.77, "Selected on the weighted scorecard balancing discrimination, calibration, stability, generalization, and benchmark lift",
                  transform=ax_main.transAxes, fontsize=12, color="white", ha="center", va="center")
 
     # KPI tiles
@@ -702,7 +848,7 @@ def create_executive_summary_chart(
     caveats = [
         "Evaluation limited to booked-proxy population — rejected applicants have no observed outcome.",
         f"AUC lift measured against {best_lift_ref}." if best_lift_ref else "No benchmark comparison available.",
-        "Model probabilities calibrated via Platt scaling on held-out booked accounts.",
+        "Calibrated variants improve probability quality but are treated as probability-adjusted versions of the same base models rather than separate recommendation candidates.",
     ]
     for j, caveat in enumerate(caveats):
         ax_main.text(0.07, 0.00 - j * 0.06, f"  {j + 1}. {caveat}", transform=ax_main.transAxes,
@@ -746,18 +892,18 @@ def create_psi_timeline_chart(rolling_oot_results_df: pd.DataFrame, output_path:
     return _save_figure(fig, output_path)
 
 
-def create_top_drivers_chart(feature_importance_df: pd.DataFrame, output_path: Path, top_n: int = 10) -> Path:
+def create_top_drivers_chart(feature_importance_df: pd.DataFrame, output_path: Path, top_n: int = 10, selected_model: str | None = None) -> Path:
     """Simplified top feature drivers bar chart for stakeholders."""
     if feature_importance_df.empty:
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.text(0.5, 0.5, "No feature importance data available", ha="center", va="center")
         return _save_figure(fig, output_path)
-
+ 
     # Pick one model — prefer LightGBM, then XGBoost
     models = feature_importance_df["model"].unique()
     preferred = ["LightGBM", "XGBoost", "CatBoost", "Logistic Regression"]
-    chosen = next((m for m in preferred if m in models), models[0])
-
+    chosen = selected_model if selected_model in models else next((m for m in preferred if m in models), models[0])
+ 
     mdf = feature_importance_df.loc[feature_importance_df["model"] == chosen].copy()
     mdf = mdf.nlargest(top_n, "abs_importance")
 
@@ -769,11 +915,11 @@ def create_top_drivers_chart(feature_importance_df: pd.DataFrame, output_path: P
     ax.set_yticks(y_pos)
     ax.set_yticklabels(mdf["feature"].values, fontsize=11)
     ax.invert_yaxis()
-    ax.set_title(f"Top {top_n} risk drivers ({chosen})", fontsize=18, fontweight="bold", color=TEXT_DARK)
+    ax.set_title(f"Top {top_n} risk drivers ({_label_with_selection(chosen, selected_model)})", fontsize=18, fontweight="bold", color=TEXT_DARK)
     ax.set_xlabel("Feature importance (absolute)")
     ax.grid(axis="x", alpha=0.25)
     ax.spines[["top", "right"]].set_visible(False)
-    fig.text(0.5, 0.02, f"Feature importance from the {chosen} model. Higher values indicate stronger influence on default prediction.", ha="center", fontsize=10, color="#4b5563")
+    fig.text(0.5, 0.02, f"Feature importance from the {_label_with_selection(chosen, selected_model)} model. Higher values indicate stronger influence on default prediction.", ha="center", fontsize=10, color="#4b5563")
     fig.tight_layout(rect=[0, 0.05, 1, 1])
     return _save_figure(fig, output_path)
 
@@ -787,44 +933,46 @@ def generate_stakeholder_charts(output_dir: Path) -> list[Path]:
     lift_table_df = _maybe_read_csv(output_dir, "lift_table.csv")
     threshold_df = _maybe_read_csv(output_dir, "threshold_analysis.csv")
     feature_importance_df = _maybe_read_csv(output_dir, "feature_importance.csv")
+    model_selection_df = _maybe_read_csv(output_dir, "model_selection.csv")
     plots_dir = output_dir / "plots"
-
+    selected_model = _selected_model_name(results_df, model_selection_df)
+ 
     generated = [
-        create_kpi_chart(results_df, population_summary_df, benchmark_comparisons_df, plots_dir / "stakeholder_kpis.png"),
+        create_kpi_chart(results_df, population_summary_df, benchmark_comparisons_df, plots_dir / "stakeholder_kpis.png", selected_model=selected_model),
         create_process_chart(plots_dir / "stakeholder_before_after.png"),
         create_population_chart(population_summary_df, plots_dir / "stakeholder_population_coverage.png"),
-        create_holdout_chart(results_df, plots_dir / "stakeholder_holdout_benchmarks.png"),
-        create_auc_lift_chart(benchmark_comparisons_df, plots_dir / "stakeholder_auc_lift.png"),
-        create_rolling_oot_chart(rolling_oot_results_df, plots_dir / "stakeholder_rolling_oot.png"),
-        create_calibration_chart(results_df, plots_dir / "stakeholder_calibration.png"),
+        create_holdout_chart(results_df, plots_dir / "stakeholder_holdout_benchmarks.png", selected_model=selected_model),
+        create_auc_lift_chart(benchmark_comparisons_df, plots_dir / "stakeholder_auc_lift.png", selected_model=selected_model),
+        create_rolling_oot_chart(rolling_oot_results_df, plots_dir / "stakeholder_rolling_oot.png", selected_model=selected_model),
+        create_calibration_chart(results_df, plots_dir / "stakeholder_calibration.png", selected_model=selected_model),
     ]
-
+ 
     if holdout_scores_df is not None:
         generated.append(
-            create_holdout_curves_chart(results_df, holdout_scores_df, plots_dir / "stakeholder_roc_pr_curves.png")
+            create_holdout_curves_chart(results_df, holdout_scores_df, plots_dir / "stakeholder_roc_pr_curves.png", selected_model=selected_model)
         )
         generated.append(
-            create_executive_summary_chart(results_df, benchmark_comparisons_df, holdout_scores_df, plots_dir / "stakeholder_executive_summary.png")
+            create_executive_summary_chart(results_df, benchmark_comparisons_df, holdout_scores_df, plots_dir / "stakeholder_executive_summary.png", selected_model=selected_model)
         )
         generated.append(
-            create_reliability_diagram(holdout_scores_df, plots_dir / "stakeholder_reliability.png")
+            create_reliability_diagram(holdout_scores_df, plots_dir / "stakeholder_reliability.png", selected_model=selected_model)
         )
-
+ 
     if lift_table_df is not None and not lift_table_df.empty:
         generated.append(
-            create_gains_chart(lift_table_df, plots_dir / "stakeholder_gains.png")
+            create_gains_chart(lift_table_df, plots_dir / "stakeholder_gains.png", selected_model=selected_model)
         )
-
+ 
     if threshold_df is not None and not threshold_df.empty:
         generated.append(
-            create_threshold_analysis_chart(threshold_df, plots_dir / "stakeholder_threshold_analysis.png")
+            create_threshold_analysis_chart(threshold_df, plots_dir / "stakeholder_threshold_analysis.png", selected_model=selected_model)
         )
-
+ 
     if feature_importance_df is not None and not feature_importance_df.empty:
         generated.append(
-            create_top_drivers_chart(feature_importance_df, plots_dir / "stakeholder_top_drivers.png")
+            create_top_drivers_chart(feature_importance_df, plots_dir / "stakeholder_top_drivers.png", selected_model=selected_model)
         )
-
+ 
     return generated
 
 

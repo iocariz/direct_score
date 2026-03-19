@@ -63,17 +63,19 @@ Feature discovery is fully separated from final estimation:
 - Numerical pairs are screened via ratios and products
 - Categorical pairs are screened with cross-validated target encoding to reduce in-sample optimism
 - Additional post-screening enrichments include frequency encoding and group-relative statistics computed from training data only
-- Correlation pruning removes near-duplicate signals before RFECV
-- RFECV uses `TemporalExpandingCV` with average precision scoring
+- Correlation pruning removes near-duplicate signals before the final selector
+- Final feature elimination uses temporal stability selection across expanding folds
+- Numericals are imputed and scaled while categoricals are target-encoded within each fold before elastic-net selection
+- The helper still uses the historical name `run_rfecv(...)`, but the current method is no longer classical sklearn RFECV
 
 ### 4. Preprocessing and models
 
 | Model | Preprocessing | Tuning | Notes |
 |-------|---------------|--------|-------|
-| Logistic Regression | Median imputation + scaling + target encoding | Optuna on `C` | Strongest current candidate on the held-out booked proxy |
-| LightGBM | Median imputation + ordinal encoding | Optuna | Native tree learner used for RFECV and one of the official candidates |
-| XGBoost | Median imputation + scaling + target encoding | Optuna | Strongest candidate on mean rolling OOT ROC AUC |
-| CatBoost | Median imputation + ordinal encoding | Optuna | Strongest candidate on mean rolling OOT PR AUC |
+| Logistic Regression | Median imputation + scaling + target encoding | Optuna on `C` | Recommended model in the current weighted selection |
+| LightGBM | Median imputation + ordinal encoding | Optuna | Strong raw hold-out candidate, but materially weaker generalization than Logistic Regression |
+| XGBoost | Median imputation + scaling + target encoding | Optuna | Competitive discrimination, but unstable in the current generalization checks |
+| CatBoost | Median imputation + ordinal encoding | Optuna | Best raw calibration score in model selection, but weakest held-out generalization in the current run |
 | Stacking | Mixed base learners | None | Experimental only until temporal OOF stacking is implemented |
 
 Cardinality reduction keeps the top categories per feature and groups the tail into `"Other"`.
@@ -115,22 +117,35 @@ Held-out booked proxy test: 16,109 booked rows from 2024-07 to 2025-01, with 611
 
 | Model | ROC AUC | Gini | KS | PR AUC | Brier |
 |-------|---------|------|-----|--------|-------|
-| **risk_score_rf (benchmark)** | **0.6613** | **0.3225** | **0.2428** | **0.0879** | -- |
-| **Logistic Regression** | **0.6552** | **0.3105** | 0.2412 | **0.0641** | 0.2248 |
-| XGBoost | 0.6403 | 0.2806 | 0.2200 | 0.0595 | 0.2233 |
-| CatBoost | 0.6347 | 0.2695 | 0.2123 | 0.0577 | 0.2208 |
-| LightGBM | 0.6319 | 0.2638 | 0.2134 | 0.0569 | 0.0364 |
+| **Logistic Regression** | **0.6668** | **0.3336** | **0.2598** | **0.0645** | 0.2235 |
+| risk_score_rf (benchmark) | 0.6613 | 0.3225 | 0.2428 | 0.0879 | -- |
+| LightGBM | 0.6533 | 0.3066 | 0.2267 | 0.0638 | 0.1090 |
+| XGBoost | 0.6528 | 0.3056 | 0.2310 | 0.0629 | 0.1025 |
+| CatBoost | 0.6310 | 0.2619 | 0.2015 | 0.0586 | 0.0631 |
 | score_RF (benchmark) | 0.6185 | 0.2371 | 0.1842 | 0.0538 | -- |
 
 Sigmoid calibration does not change ranking metrics, and it brings the calibrated model variants into a tight `0.0361` to `0.0363` Brier range in the saved `results.csv`.
+
+### Weighted model selection
+
+`model_selection.csv` ranks only the official candidate models on discrimination, calibration, stability, generalization, and benchmark lift. The current recommendation is **Logistic Regression**.
+
+| Model | Disc. | Calib. | Stab. | Gen. | Lift | Overall | Recommended |
+|-------|------:|-------:|------:|-----:|-----:|--------:|-------------|
+| Logistic Regression | 100.0 | 0.0 | 100.0 | 73.7 | 100.0 | 81.0 | Yes |
+| LightGBM | 89.0 | 71.4 | 80.7 | 0.0 | 82.9 | 70.5 | No |
+| XGBoost | 73.3 | 75.4 | 11.6 | 0.0 | 82.2 | 51.6 | No |
+| CatBoost | 0.0 | 100.0 | 0.0 | 0.0 | 54.4 | 23.2 | No |
+
+The tree models recover stronger raw calibration scores than Logistic Regression, but the recommendation favors Logistic Regression because it combines the best booked-proxy discrimination, the best stability profile, the cleanest generalization, and the strongest lift versus `score_RF`.
 
 ### Paired benchmark comparisons
 
 `benchmark_comparisons.csv` now stores paired model-vs-benchmark deltas rather than relying on overlap of marginal confidence intervals.
 
-- **Logistic Regression vs `score_RF`**: AUC improvement `+0.0367` with 95% bootstrap interval `[+0.0190, +0.0555]`; DeLong p-value `0.000219`. PR AUC improvement is `+0.0104` with interval `[+0.0031, +0.0177]`.
-- **XGBoost vs `score_RF`**: AUC improvement `+0.0218` with interval `[+0.0034, +0.0413]`; DeLong p-value `0.025961`. PR AUC lift is positive but less decisive.
-- **No candidate model beats `risk_score_rf`** on the current booked-proxy evaluation. The closest candidate is Logistic Regression at `-0.0060` AUC relative to `risk_score_rf`, with interval `[-0.0347, +0.0232]`.
+- **Logistic Regression vs `score_RF`**: AUC improvement `+0.0482` with 95% bootstrap interval `[+0.0308, +0.0672]`; DeLong p-value `0.000001`. PR AUC improvement is `+0.0107` with interval `[+0.0034, +0.0181]`.
+- **Logistic Regression vs `risk_score_rf`**: AUC improvement `+0.0054` with interval `[-0.0236, +0.0349]`; DeLong p-value `0.720479`. PR AUC is materially lower at `-0.0234`, so the current candidate does not beat the stronger benchmark on event concentration.
+- **LightGBM and XGBoost** also beat `score_RF` on ROC AUC, but both remain behind Logistic Regression on the weighted recommendation once stability and generalization are included.
 
 ### Rolling out-of-time summary
 
@@ -139,13 +154,26 @@ Rolling OOT validation covers 4 forward windows on the booked proxy population:
 | Model | Windows | Mean ROC AUC | Mean PR AUC |
 |-------|---------|--------------|-------------|
 | **risk_score_rf (benchmark)** | 4 | **0.6587** | **0.0841** |
-| XGBoost | 4 | **0.6380** | 0.0606 |
-| CatBoost | 4 | 0.6344 | **0.0639** |
-| Logistic Regression | 4 | 0.6339 | 0.0576 |
-| LightGBM | 4 | 0.6064 | 0.0508 |
+| Logistic Regression | 4 | 0.6384 | 0.0590 |
+| LightGBM | 4 | 0.6212 | 0.0579 |
+| XGBoost | 4 | 0.6051 | 0.0536 |
+| CatBoost | 4 | 0.5968 | 0.0528 |
 | score_RF (benchmark) | 4 | 0.6264 | 0.0544 |
 
-The ranking is directionally consistent with the held-out test: `risk_score_rf` remains strongest, Logistic Regression is best on the single held-out booked test, and XGBoost / CatBoost remain competitive once the view is widened to rolling OOT windows.
+The rolling view is directionally consistent with the hold-out test: `risk_score_rf` remains the strongest benchmark, while **Logistic Regression** is the most stable in-house candidate across both the single hold-out sample and the rolling OOT windows.
+
+### Overfitting diagnostics
+
+`overfit_report.csv` flags all four official models at the current threshold, but the magnitude differs sharply:
+
+| Model | Train AUC | Test AUC | AUC Δ | Train PR AUC | Test PR AUC | PR Δ |
+|-------|----------:|---------:|------:|-------------:|------------:|-----:|
+| Logistic Regression | 0.7005 | 0.6668 | +0.0337 | 0.0727 | 0.0645 | +0.0082 |
+| LightGBM | 0.9907 | 0.6533 | +0.3374 | 0.7654 | 0.0638 | +0.7015 |
+| XGBoost | 0.9927 | 0.6528 | +0.3399 | 0.8151 | 0.0629 | +0.7522 |
+| CatBoost | 1.0000 | 0.6310 | +0.3690 | 1.0000 | 0.0586 | +0.9414 |
+
+This explains why the multi-criteria selection penalizes the tree models heavily even when some held-out point estimates remain competitive.
 
 ### Bootstrap confidence intervals
 
@@ -153,11 +181,11 @@ The ranking is directionally consistent with the held-out test: `risk_score_rf` 
 
 | Model | AUC [95% CI] | PR AUC [95% CI] |
 |-------|-------------|-----------------|
+| Logistic Regression | 0.667 [0.647, 0.687] | 0.064 [0.059, 0.072] |
 | risk_score_rf (benchmark) | 0.661 [0.636, 0.684] | 0.088 [0.075, 0.103] |
-| Logistic Regression | 0.655 [0.634, 0.676] | 0.065 [0.058, 0.072] |
-| XGBoost | 0.640 [0.619, 0.661] | 0.060 [0.055, 0.066] |
-| CatBoost | 0.634 [0.612, 0.657] | 0.058 [0.052, 0.065] |
-| LightGBM | 0.631 [0.610, 0.653] | 0.057 [0.052, 0.063] |
+| LightGBM | 0.653 [0.632, 0.672] | 0.064 [0.058, 0.072] |
+| XGBoost | 0.653 [0.633, 0.675] | 0.063 [0.058, 0.072] |
+| CatBoost | 0.631 [0.609, 0.653] | 0.059 [0.053, 0.067] |
 | score_RF (benchmark) | 0.619 [0.599, 0.640] | 0.054 [0.050, 0.061] |
 
 ### Underwriting population coverage
@@ -172,77 +200,65 @@ The underwriting-specific artifacts extend the pipeline beyond the booked holdou
 - **Booked-proxy evaluation only:** even in underwriting mode, the measurable target exists only for booked accounts, so the headline metrics do not fully identify applicant-stage grant/decline performance
 - **Selection bias is still unresolved:** reject inference is available only as an experimental option and is excluded from the official benchmark tables
 - **Stacking is still not temporally clean:** the current stacking implementation depends on non-temporal folds and therefore remains experimental
-- **Benchmark ceiling remains external:** `risk_score_rf` still leads on ROC AUC and PR AUC, likely because it reflects bureau or production information not fully reproduced by the current feature set
-- **Feature drift still exists:** overall score PSI is stable, but several interaction features continue to show elevated CSI
+- **Tree ensembles remain overfit in the current setup:** all official candidates breach the overfit threshold, but the tree models do so by a much wider margin than Logistic Regression
+- **Benchmark ceiling remains external:** Logistic Regression slightly edges `risk_score_rf` on held-out ROC AUC, but `risk_score_rf` still leads on PR AUC and on the rolling OOT benchmark view
+- **Feature selection currently favors stable numeric surrogates:** raw categorical variables often give way to frequency-encoded or grouped numeric derivatives, which helps stability but can reduce direct interpretability of the original categories
 
 ## Next Steps
 
 - Implement applicant-stage policy evaluation: approval-rate curves, bad-rate curves, and expected-loss / profit simulations
 - Rebuild or remove stacking from any official path unless temporal out-of-fold predictions are used end to end
 - Explore better selection-bias correction for underwriting evaluation, rather than treating reject inference as the only experimental option
+- Add grouped or quota-based feature selection if retaining more raw categorical variables becomes a business or governance requirement
 - Add richer underwriting outputs such as score deciles, decline-threshold analysis, and benchmark-vs-model routing scenarios
-- Continue closing the gap to `risk_score_rf`, especially where the benchmark benefits from external bureau-style information not present in the current training set
+- Continue closing the gap to `risk_score_rf`, especially on PR AUC and benchmark event concentration where the current feature set still trails
 
 ---
 
 ## SHAP Explainability
 
-SHAP (TreeExplainer) analysis on the LightGBM model.
+SHAP is generated for the recommended model in `model_selection.csv`. In the latest run that selected model is **Logistic Regression**, so the saved SHAP artifacts reflect the recommendation rather than a hard-coded tree fallback.
 
 ### Top Features by Importance
 
-| Rank | Feature | mean |SHAP| | Type |
-|------|---------|--------------|------|
-| 1 | MAX_CREDIT_TJ_AV | 0.0190 | Bureau: max credit available |
-| 2 | HOUSE_TYPE_x_ESTCLI1 | 0.0183 | Interaction: housing x client status |
-| 3 | TOTAL_AMT_X_LEFT_TO_LIVE | 0.0134 | Interaction: loan amount x remaining life |
-| 4 | FAMILY_SITUATION_x_ESTCLI2 | 0.0127 | Interaction: family x client status |
-| 5 | PRODTYPE3_X_HOUSE | 0.0115 | Interaction: product type x housing |
-| 6 | TENOR_DIV_MAX_CREDIT_TJ_AV | 0.0112 | Ratio: loan tenor / bureau capacity |
-| 7 | FREQ_CPRO_x_CMAT | 0.0097 | Frequency: profession x material code (NEW) |
-| 8 | product_type_3_x_ESTCLI1 | 0.0084 | Interaction: product x client status |
-| 9 | LOG_INCOME_T1 | 0.0070 | Log income (NEW) |
-| 10 | TOTAL_AMT_X_AGE_T1 | 0.0061 | Interaction: loan amount x age |
+| Rank | Feature | mean |SHAP| | Family |
+|------|---------|--------------|--------|
+| 1 | TENOR | 0.4203 | Raw numerical |
+| 2 | LOG_TOTAL_AMT | 0.4198 | Log transform |
+| 3 | LOG_MAX_CREDIT | 0.2877 | Log transform |
+| 4 | MAX_CREDIT_TJ_AV | 0.2731 | Raw numerical |
+| 5 | AGE_T1 | 0.2525 | Raw numerical |
+| 6 | FREQ_product_type_3 | 0.2172 | Frequency encoding |
+| 7 | FREQ_PRODTYPE3_X_HOUSE | 0.2043 | Frequency encoding |
+| 8 | FREQ_ESTCLI1 | 0.2036 | Frequency encoding |
+| 9 | INSTALLMENT_TO_HOUSEHOLD | 0.1920 | Ratio |
+| 10 | FREQ_FAMILY_SITUATION_x_product_type_3 | 0.1804 | Frequency encoding |
 
-New features (frequency encoding, log transforms, group stats) contribute meaningfully: `FREQ_CPRO_x_CMAT` ranks #7, `LOG_INCOME_T1` ranks #9, and `AGE_T1_VS_HOUSE_TYPE` (group stat) also appears in the top 20.
+The current ranking is dominated by credit-capacity scale, tenor, age, and several frequency-encoded surrogates for high-cardinality categorical segments. This is consistent with the current feature-selection workflow, which often keeps stable numeric derivatives of categorical information.
 
 ### SHAP Beeswarm Plot
 
 ![SHAP Summary](output/plots/shap_summary.png)
 
-**Reading the beeswarm:** Each dot is one test observation. Horizontal position = SHAP value (positive = pushes toward default, negative = away). Colour = feature value (pink = high, blue = low).
-
-**Key patterns:**
-
-- **MAX_CREDIT_TJ_AV:** Clear negative relationship -- high values (pink) cluster at negative SHAP (lower risk). Higher bureau credit capacity signals established creditworthiness. The steep gradient below ~1,000 shows that borrowers with minimal bureau history are at greatest risk.
-
-- **HOUSE_TYPE_x_ESTCLI1:** Discrete clusters from categorical combinations. Certain housing/client-status pairs carry 2--3x the risk impact of others, showing strong segment-level risk differentiation.
-
-- **TOTAL_AMT_X_LEFT_TO_LIVE:** Higher values (larger loans taken by older borrowers with less remaining working life) push toward higher default risk -- captures overextension in pre-retirement borrowers.
-
-- **TENOR_DIV_MAX_CREDIT_TJ_AV:** High values (long tenors relative to bureau capacity) push toward higher risk. This bureau-utilization proxy captures borrowers whose loan commitment is disproportionate to their credit footprint.
-
-- **LOG_INCOME_T1:** Higher income reduces risk, with a clear monotonic pattern. The log transform allows this feature to contribute meaningfully in the LightGBM model by compressing the heavy tail.
-
-- **FREQ_CPRO_x_CMAT:** Applicants in rare profession/material-code combinations (low frequency) face higher risk -- captures niche segments that have less credit data and higher uncertainty.
+The beeswarm and bar plots should now be read as explanations of the **recommended Logistic Regression model**. In this run, the largest absolute contributions come from loan term, transformed amount and bureau-capacity variables, and frequency-encoded segment features.
 
 ### SHAP Dependence Plots
 
 ![SHAP Dependence](output/plots/shap_dependence.png)
 
-The MAX_CREDIT_TJ_AV dependence (top-left) shows a sharp non-linear threshold: risk drops steeply between 0 and ~2,000, then flattens. The TENOR_DIV_MAX_CREDIT_TJ_AV plot (bottom-right) shows a clear positive relationship with an inflection around 1,000 -- borrowers whose tenor exceeds their bureau capacity are penalised.
+The dependence plots are generated for the top-ranked features in the selected model. Use them to inspect how the signed SHAP contribution changes over the feature range for the current recommendation, not for a fixed LightGBM fallback.
 
 ---
 
 ## Feature Assessment (WoE / IV)
 
-Information Value measures univariate predictive power:
+Information Value measures univariate predictive power on the development-fit sample:
 
 | IV Range | Interpretation | Count |
 |----------|---------------|-------|
-| < 0.02 | Useless | 0 |
-| 0.02 -- 0.10 | Weak | 14 |
-| 0.10 -- 0.30 | Medium | 27 |
+| < 0.02 | Useless | 18 |
+| 0.02 -- 0.10 | Weak | 41 |
+| 0.10 -- 0.30 | Medium | 16 |
 | 0.30 -- 0.50 | Strong | 0 |
 | > 0.50 | Suspicious | 0 |
 
@@ -250,18 +266,18 @@ Information Value measures univariate predictive power:
 
 | Feature | IV | Strength |
 |---------|-----|----------|
-| PRODTYPE3_X_HOUSE | 0.191 | Medium |
-| HOUSE_TYPE_x_ESTCLI1 | 0.181 | Medium |
-| FAMILY_SITUATION_x_ESTCLI2 | 0.176 | Medium |
-| product_type_3_x_ESTCLI1 | 0.164 | Medium |
-| TENOR_DIV_MAX_CREDIT_TJ_AV | 0.139 | Medium |
-| CODRAMA_DIV_MAX_CREDIT_TJ_AV | 0.138 | Medium |
-| AGE_T1_DIV_MAX_CREDIT_TJ_AV | 0.138 | Medium |
-| HOUSE_TYPE_x_CMAT | 0.136 | Medium |
-| LEFT_TO_LIVE_DIV_MAX_CREDIT_TJ_AV | 0.132 | Medium |
-| FREQ_product_type_3_x_ESTCLI2 | 0.128 | Medium |
+| AGE_T1_DIV_MAX_CREDIT_TJ_AV | 0.224 | Medium |
+| FREQ_HOUSE_TYPE_x_FAMILY_SITUATION | 0.190 | Medium |
+| LEFT_TO_LIVE_DIV_MAX_CREDIT_TJ_AV | 0.162 | Medium |
+| MAX_CREDIT_TJ_AV | 0.154 | Medium |
+| FREQ_ESTCLI2_x_FAMILY_SITUATION | 0.140 | Medium |
+| FREQ_HOUSE_TYPE_x_ESTCLI2 | 0.130 | Medium |
+| LOG_MAX_CREDIT | 0.128 | Medium |
+| HOUSEHOLD_INCOME | 0.127 | Medium |
+| INCOME_T1_X_AGE_T1 | 0.125 | Medium |
+| LEFT_TO_LIVE_X_INSTALLMENT_AMT | 0.124 | Medium |
 
-No features reach "Suspicious" IV (>0.50). Categorical interactions dominate the top tier, followed by bureau-normalised ratios. Frequency-encoded features (`FREQ_product_type_3_x_ESTCLI2`, `FREQ_CPRO_x_CMAT`) deliver Medium IV, validating their inclusion.
+The current IV ranking is led by bureau-capacity ratios, affordability interactions, and frequency-encoded categorical surrogates rather than raw categorical crosses. No feature looks suspiciously predictive on its own.
 
 ---
 
@@ -271,30 +287,27 @@ No features reach "Suspicious" IV (>0.50). Categorical interactions dominate the
 
 | Model | PSI | Interpretation |
 |-------|-----|---------------|
-| Logistic Regression | 0.020 | Stable |
-| LightGBM | 0.027 | Stable |
-| CatBoost | 0.039 | Stable |
-| XGBoost | 0.041 | Stable |
-| Stacking | 0.038 | Stable |
+| Logistic Regression | 0.0036 | Stable |
+| XGBoost | 0.0088 | Stable |
+| CatBoost | 0.0093 | Stable |
+| LightGBM | 0.0096 | Stable |
 
-All PSI < 0.10. Score distributions are stable between train and test periods.
+All PSI values are far below 0.10. Score distributions are very stable between the development-fit booked sample and the held-out booked proxy test.
 
 ### Feature Stability (CSI)
 
-6 features exceed CSI 0.25 (high drift by the CSI threshold):
+`csi.csv` contains 64 analyzed features in the current frozen set. None exceed CSI 0.10, so there are **0 high-drift** and **0 moderate-drift** features in the current run.
 
 | Feature | CSI | Note |
 |---------|-----|------|
-| PRODTYPE3_X_HOUSE | 0.77 | Product mix shift |
-| FREQ_product_type_3_x_CPRO | 0.60 | Derived from above |
-| product_type_3_x_ESTCLI1 | 0.58 | Product mix shift |
-| HOUSE_TYPE_x_ESTCLI1 | 0.49 | Housing/client shift |
-| FAMILY_SITUATION_x_ESTCLI2 | 0.44 | Family/client shift |
-| HOUSE_TYPE_x_CMAT | 0.42 | Housing/material shift |
+| FREQ_CPRO_x_CMAT | 0.0697 | Highest CSI in the current run, still low |
+| FREQ_CMAT_x_product_type_2 | 0.0656 | Low drift |
+| FREQ_CPRO | 0.0346 | Low drift |
+| FREQ_PRODTYPE3_X_HOUSE | 0.0328 | Low drift |
+| LOG_TOTAL_AMT | 0.0318 | Low drift |
+| TOTAL_AMT | 0.0318 | Low drift |
 
-These are all categorical interactions involving `product_type_3` or `HOUSE_TYPE`. The underlying category distributions shifted between train and test periods, likely reflecting changes in the product portfolio or applicant mix. Despite this, overall model PSI remains low -- the models are robust to these shifts because multiple redundant features compensate.
-
-Dropping INCOME_T2 (and all derivatives) eliminated the 5 most extreme drifters from the previous run (CSI 1.0--1.6), substantially improving the stability profile.
+The current stability picture is much cleaner than earlier iterations: score PSI is low across all official models and the analyzed feature set shows no meaningful CSI alarms.
 
 ---
 
@@ -302,10 +315,7 @@ Dropping INCOME_T2 (and all derivatives) eliminated the 5 most extreme drifters 
 
 ![Test Score Distributions](output/plots/score_dist_test.png)
 
-- **CatBoost:** Widest score spread (0.05--0.70) with the clearest class separation. The "Bad" distribution has a distinct rightward tail.
-- **XGBoost:** Narrow range (0.38--0.50) with limited class overlap differentiation.
-- **LightGBM:** Very narrow range (0.06--0.08), still underfitting despite widened search space.
-- **Logistic Regression:** Widest single-model range but heavy class overlap.
+The saved score-distribution plots remain useful as a qualitative diagnostic, but they should be interpreted together with `overfit_report.csv` and `model_selection.csv`. In the current run, the tree models show far larger train-to-test performance drops than Logistic Regression, which is one of the main reasons Logistic Regression remains the recommended model despite competitive raw hold-out AUC from LightGBM and XGBoost.
 
 ---
 
@@ -316,19 +326,22 @@ Dropping INCOME_T2 (and all derivatives) eliminated the 5 most extreme drifters 
 uv sync
 
 # Run the default underwriting-mode pipeline
-uv run python training.py
+uv run main.py
 
 # Explicit booked-only monitoring mode
-uv run python training.py --population-mode booked_monitoring
+uv run main.py --population-mode booked_monitoring
 
 # Explicit underwriting mode with a custom output directory
-uv run python training.py --population-mode underwriting --optuna-trials 100 --output-dir output_v2
+uv run main.py --population-mode underwriting --optuna-trials 100 --output-dir output_v2
 
 # Experimental: enable reject inference
-uv run python training.py --population-mode underwriting --reject-inference
+uv run main.py --population-mode underwriting --reject-inference
 
 # Experimental: enable stacking
-uv run python training.py --population-mode underwriting --enable-experimental-stacking
+uv run main.py --population-mode underwriting --enable-experimental-stacking
+
+# Regenerate stakeholder charts from the latest output directory
+uv run stakeholder_charts.py --output-dir output
 ```
 
 ### Output Artifacts
@@ -336,23 +349,32 @@ uv run python training.py --population-mode underwriting --enable-experimental-s
 ```
 output/
   results.csv                          # Leaderboard for the current run
-  results_experimental.csv             # Experimental-only leaderboard (optional)
   confidence_intervals.csv             # Bootstrap 95% CIs
   benchmark_comparisons.csv            # Paired candidate vs benchmark deltas
-  benchmark_comparisons_experimental.csv  # Experimental paired comparisons (optional)
+  model_selection.csv                  # Weighted model recommendation scorecard
+  overfit_report.csv                   # Train-vs-test generalization diagnostics
+  lift_table.csv                       # Decile-style lift summary by model
+  threshold_analysis.csv               # Precision / recall / capture at operating cutoffs
   feature_importance.csv               # Split importance (trees) / coefficients (LR)
-  feature_provenance.csv               # Feature lineage + RFECV status
+  feature_provenance.csv               # Feature lineage + stability-selection status
+  interaction_leaderboard.csv          # Interaction search diagnostics
+  feature_discovery_boundary.csv       # Discovery / estimation temporal cutoff
   ablation_results.csv                 # Phase 3 ablation summary
   rolling_oot_results.csv              # Fold-level rolling OOT metrics
   rolling_oot_summary.csv              # Model-level rolling OOT summary
   population_summary.csv               # Pre/post split underwriting population counts
   applicant_scores_post_split.csv      # Scores for post-split decisioned applications
+  holdout_test_scores.csv              # Per-row scores on the booked proxy holdout
   shap_values.csv                      # Per-observation SHAP values
   shap_importance.csv                  # Feature ranking by mean |SHAP|
   iv_summary.csv                       # Information Value per feature
   woe_detail.csv                       # Weight of Evidence per bin
   psi.csv                              # Population Stability Index per model
   csi.csv                              # Characteristic Stability Index per feature
+  model_card.txt                       # Governance summary for the current run
+  variable_dictionary.csv              # Feature dictionary with provenance and IV
+  data_quality_development_fit.csv     # Missingness / uniqueness checks on fit sample
+  data_quality_test.csv                # Missingness / uniqueness checks on test sample
   models/                              # Serialized model pipelines (joblib)
   plots/
     score_dist_test.png                # Test set score distributions by class
@@ -360,39 +382,37 @@ output/
     shap_summary.png                   # SHAP beeswarm plot
     shap_importance.png                # SHAP bar importance
     shap_dependence.png                # Top-6 SHAP dependence plots
+    stakeholder_*.png                  # Stakeholder chart pack outputs
 ```
 
-## Pipeline Steps
+## Pipeline Phases
 
-| Step | Description |
+| Phase | Description |
 |------|-------------|
-| 1 | Load booked-only or full decisioned population depending on `population_mode` |
-| 2 | Build `population_summary.csv` and log the sample definition |
-| 3 | Feature engineering (ratios, portfolio, log transforms, interactions, missing flags) |
-| 4 | Split the booked development sample into feature-discovery and estimation windows |
-| 5 | Interaction screening on the earlier discovery window only |
-| 6 | Cardinality reduction, enhanced features, and correlation pruning |
-| 7 | RFECV feature elimination with temporal CV |
-| 8 | Logistic Regression (Optuna, temporal CV) |
-| 9 | LightGBM (Optuna, temporal CV) |
-| 10 | XGBoost (Optuna, temporal CV) |
-| 11 | CatBoost (Optuna, temporal CV) |
-| 12 | Stacking ensemble (experimental; disabled by default) |
-| 13 | Temporal calibration on the latest pre-split booked block |
-| 14 | Hold-out evaluation + paired benchmark comparisons |
-| 15 | Rolling out-of-time validation |
-| 16 | Underwriting applicant score-frame generation |
-| 17 | SHAP, WoE / IV, and PSI / CSI diagnostics |
-| 18 | Save official, experimental, and underwriting-specific artifacts |
+| 1 | Load the chosen population mode and build `population_summary.csv` |
+| 2 | Engineer raw, ratio, log, interaction, and missingness features |
+| 3 | Split the booked pre-test sample into feature-discovery and estimation windows |
+| 4 | Run interaction search, enrichment, correlation pruning, and temporal stability selection |
+| 5 | Freeze the feature set, split development vs calibration, and train the official candidate models |
+| 6 | Calibrate official models on the latest booked pre-split holdout |
+| 7 | Run rolling OOT validation, booked-proxy hold-out evaluation, and applicant-population scoring |
+| 8 | Produce bootstrap comparisons, ablations, SHAP, WoE / IV, PSI / CSI, lift, threshold, and overfit diagnostics |
+| 9 | Select the recommended model with the weighted multi-criteria scorecard |
+| 10 | Save governance artifacts, stakeholder inputs, plots, and serialized models |
 
 ## Project Structure
 
 ```
 direct_score/
-  training.py          # Reproducible training pipeline (source of truth)
-  pyproject.toml       # Dependencies (uv)
-  CLAUDE.md            # Development instructions
-  todo_list.md         # Known issues and improvement backlog
+  main.py               # Thin CLI entrypoint used by `uv run main.py`
+  training.py           # Pipeline orchestration
+  training_features.py  # Feature discovery, interaction search, and selection
+  training_reporting.py # Evaluation, model selection, and artifact helpers
+  stakeholder_charts.py # Stakeholder-facing chart pack generator
+  model_governance.py   # Model card and variable dictionary generation
+  pyproject.toml        # Dependencies (uv)
+  CLAUDE.md             # Development instructions
+  todo_list.md          # Known issues and improvement backlog
   data/
     demand_direct.parquet
   notebooks/

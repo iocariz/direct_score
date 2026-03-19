@@ -6,9 +6,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from training import (
+import training_features as training_features_module
+from training_constants import MONOTONE_MAP
+from training_features import (
     GROUP_STAT_PAIRS,
-    MONOTONE_MAP,
     add_frequency_encoding,
     add_group_stats,
     add_modeling_features,
@@ -16,10 +17,32 @@ from training import (
     build_preprocessors,
     prune_correlated,
     reduce_cardinality,
+    run_rfecv,
 )
 
 
 _RNG = np.random.RandomState(99)
+
+
+class _FixedTemporalCV:
+    def __init__(self, folds):
+        self._folds = [(np.asarray(train_idx), np.asarray(val_idx)) for train_idx, val_idx in folds]
+
+    def split(self, X=None, y=None, groups=None):
+        for train_idx, val_idx in self._folds:
+            yield train_idx, val_idx
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return len(self._folds)
+
+
+def _make_fixed_temporal_cv(block_size=20, n_blocks=6):
+    folds = []
+    for boundary in range(2, n_blocks):
+        train_end = boundary * block_size
+        val_end = (boundary + 1) * block_size
+        folds.append((np.arange(train_end), np.arange(train_end, val_end)))
+    return _FixedTemporalCV(folds)
 
 
 def _make_train_test(n_train=200, n_test=80):
@@ -188,6 +211,100 @@ class TestBuildMonotoneConstraints:
     def test_unknown_features_unconstrained(self):
         constraints = build_monotone_constraints(["UNKNOWN_FEATURE"], [])
         assert constraints == [0]
+
+
+class TestRunRfecv:
+    def test_keeps_stable_numeric_signal(self, monkeypatch):
+        rng = np.random.RandomState(7)
+        monkeypatch.setattr(training_features_module, "STABILITY_SELECTION_THRESHOLD", 0.75)
+        monkeypatch.setattr(training_features_module, "STABILITY_SELECTION_MIN_FEATURES", 1)
+        monkeypatch.setattr(training_features_module, "STABILITY_SELECTION_C_VALUES", (0.1, 0.3, 1.0))
+
+        n_blocks = 6
+        block_size = 20
+        n_rows = n_blocks * block_size
+        y = np.array(([0] * 10 + [1] * 10) * n_blocks)
+        X = pd.DataFrame({
+            "num_signal": y + rng.normal(0.0, 0.05, n_rows),
+            "num_noise_1": rng.normal(0.0, 1.0, n_rows),
+            "num_noise_2": rng.normal(0.0, 1.0, n_rows),
+        })
+
+        feature_cols = ["num_signal", "num_noise_1", "num_noise_2"]
+        selected_features, selected_num_cols, selected_cat_cols = run_rfecv(
+            X,
+            pd.Series(y),
+            num_cols=feature_cols.copy(),
+            cat_cols=[],
+            feature_cols=feature_cols.copy(),
+            cv=_make_fixed_temporal_cv(block_size=block_size, n_blocks=n_blocks),
+        )
+
+        assert "num_signal" in selected_features
+        assert "num_signal" in selected_num_cols
+        assert selected_cat_cols == []
+
+    def test_keeps_stable_categorical_signal(self, monkeypatch):
+        rng = np.random.RandomState(11)
+        monkeypatch.setattr(training_features_module, "STABILITY_SELECTION_THRESHOLD", 0.75)
+        monkeypatch.setattr(training_features_module, "STABILITY_SELECTION_MIN_FEATURES", 1)
+        monkeypatch.setattr(training_features_module, "STABILITY_SELECTION_C_VALUES", (0.1, 0.3, 1.0))
+
+        n_blocks = 6
+        block_size = 20
+        n_rows = n_blocks * block_size
+        y = np.array(([0] * 10 + [1] * 10) * n_blocks)
+        X = pd.DataFrame({
+            "num_noise": rng.normal(0.0, 1.0, n_rows),
+            "cat_signal": np.where(y == 1, "good", "bad"),
+            "cat_noise": rng.choice(["A", "B", "C"], size=n_rows),
+        })
+
+        feature_cols = ["num_noise", "cat_signal", "cat_noise"]
+        selected_features, selected_num_cols, selected_cat_cols = run_rfecv(
+            X,
+            pd.Series(y),
+            num_cols=["num_noise"],
+            cat_cols=["cat_signal", "cat_noise"],
+            feature_cols=feature_cols.copy(),
+            cv=_make_fixed_temporal_cv(block_size=block_size, n_blocks=n_blocks),
+        )
+
+        assert "cat_signal" in selected_features
+        assert "cat_signal" in selected_cat_cols
+        assert set(selected_num_cols) | set(selected_cat_cols) == set(selected_features)
+
+    def test_backfills_minimum_feature_count_when_threshold_is_too_strict(self, monkeypatch):
+        rng = np.random.RandomState(19)
+        monkeypatch.setattr(training_features_module, "STABILITY_SELECTION_THRESHOLD", 1.1)
+        monkeypatch.setattr(training_features_module, "STABILITY_SELECTION_MIN_FEATURES", 3)
+        monkeypatch.setattr(training_features_module, "STABILITY_SELECTION_C_VALUES", (0.1, 0.3))
+
+        n_blocks = 6
+        block_size = 20
+        n_rows = n_blocks * block_size
+        y = np.array(([0] * 10 + [1] * 10) * n_blocks)
+        X = pd.DataFrame({
+            "num_a": y + rng.normal(0.0, 0.20, n_rows),
+            "num_b": rng.normal(0.0, 1.0, n_rows),
+            "num_c": rng.normal(0.0, 1.0, n_rows),
+            "num_d": rng.normal(0.0, 1.0, n_rows),
+        })
+
+        feature_cols = ["num_a", "num_b", "num_c", "num_d"]
+        selected_features, selected_num_cols, selected_cat_cols = run_rfecv(
+            X,
+            pd.Series(y),
+            num_cols=feature_cols.copy(),
+            cat_cols=[],
+            feature_cols=feature_cols.copy(),
+            cv=_make_fixed_temporal_cv(block_size=block_size, n_blocks=n_blocks),
+        )
+
+        assert len(selected_features) == 3
+        assert len(selected_num_cols) == 3
+        assert selected_cat_cols == []
+        assert set(selected_features).issubset(feature_cols)
 
 
 class TestAddModelingFeatures:

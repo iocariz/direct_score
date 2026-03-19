@@ -10,6 +10,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 import warnings
@@ -30,15 +31,11 @@ from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.compose import ColumnTransformer
-from sklearn.feature_selection import RFECV
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
     roc_auc_score,
-)
-from sklearn.model_selection import (
-    StratifiedKFold,
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler, TargetEncoder
@@ -108,6 +105,26 @@ from training_reporting import (
     select_best_model,
     split_leaderboard_results,
 )
+import training_features as _training_features
+from training_features import (
+    GROUP_STAT_PAIRS,
+    _loo_target_encode,
+    _safe_auc,
+    add_frequency_encoding,
+    add_group_stats,
+    add_interactions,
+    add_modeling_features,
+    build_feature_provenance,
+    build_monotone_constraints,
+    build_preprocessors,
+    engineer_features,
+    normalize_interaction_name,
+    prune_correlated,
+    reduce_cardinality,
+    run_rfecv,
+    search_interactions,
+    select_features,
+)
 
 
 # ── Logging & warnings setup ──────────────────────────────────────────────────
@@ -160,6 +177,7 @@ def _log_step(step_num: int | str, description: str):
         logger.info("  done ({:.0f}m {:.0f}s)", elapsed // 60, elapsed % 60)
     else:
         logger.info("  done ({:.1f}s)", elapsed)
+
 
 # ── Temporal CV ────────────────────────────────────────────────────────────────
 
@@ -284,17 +302,13 @@ def temporal_calibration_split(
     return X_fit, X_calib, y_fit, y_calib, w_fit, w_calib, dates_fit, dates_calib
 
 
-def temporal_feature_discovery_split(
-    X: pd.DataFrame,
-    y: pd.Series,
+def resolve_temporal_feature_discovery_cutoff(
     dates,
     discovery_fraction: float = FEATURE_DISCOVERY_FRACTION,
-):
-    dates = pd.Series(pd.to_datetime(np.asarray(dates), errors="raise"), index=X.index)
+) -> pd.Timestamp:
+    dates = pd.Series(pd.to_datetime(np.asarray(dates), errors="raise"))
     if dates.isna().any():
         raise ValueError("Feature discovery dates must not contain missing values")
-    if len(X) != len(y) or len(X) != len(dates):
-        raise ValueError("X, y, and dates must have the same length")
     if not 0 < discovery_fraction < 1:
         raise ValueError("discovery_fraction must be strictly between 0 and 1")
 
@@ -310,6 +324,33 @@ def temporal_feature_discovery_split(
         discovery_end = date_value
         if cumulative_rows >= target_rows:
             break
+
+    discovery_mask = dates <= discovery_end
+    estimation_mask = ~discovery_mask
+    if not discovery_mask.any() or not estimation_mask.any():
+        raise ValueError("Feature discovery split must produce non-empty discovery and estimation sets")
+    return pd.Timestamp(discovery_end)
+
+
+def temporal_feature_discovery_split(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates,
+    discovery_fraction: float = FEATURE_DISCOVERY_FRACTION,
+    discovery_end: str | pd.Timestamp | None = None,
+):
+    dates = pd.Series(pd.to_datetime(np.asarray(dates), errors="raise"), index=X.index)
+    if dates.isna().any():
+        raise ValueError("Feature discovery dates must not contain missing values")
+    if len(X) != len(y) or len(X) != len(dates):
+        raise ValueError("X, y, and dates must have the same length")
+    if discovery_end is None:
+        discovery_end = resolve_temporal_feature_discovery_cutoff(
+            dates,
+            discovery_fraction=discovery_fraction,
+        )
+    else:
+        discovery_end = pd.Timestamp(discovery_end)
 
     discovery_mask = dates <= discovery_end
     estimation_mask = ~discovery_mask
@@ -383,230 +424,31 @@ def load_data_with_rejects(data_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 # ── Feature engineering ────────────────────────────────────────────────────────
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    n_before = len(df.columns)
-
-    # Tier 1: Strong signal
-    df["TOTAL_PRODUCTS"] = df["TOTAL_CARD_NBR"] + df["TOTAL_LOAN_NBR"]
-
-    # Tier 2: Co-debtor & household features (INCOME_T2 = co-debtor income)
-    df["HAS_CODEBTOR"] = df["INCOME_T2"].notna().astype(int)
-    df["HOUSEHOLD_INCOME"] = df["INCOME_T1"] + df["INCOME_T2"].fillna(0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        df["CODEBTOR_INCOME_SHARE"] = df["INCOME_T2"] / df["HOUSEHOLD_INCOME"].replace(0, np.nan)
-
-    # Tier 2b: Affordability ratios (debtor-only)
-    df["INSTALLMENT_TO_INCOME"] = df["INSTALLMENT_AMT"] / df["INCOME_T1"].replace(0, np.nan)
-    df["TOTAL_AMT_TO_INCOME"] = df["TOTAL_AMT"] / df["INCOME_T1"].replace(0, np.nan)
-    df["AMT_PER_MONTH"] = df["TOTAL_AMT"] / df["TENOR"].replace(0, np.nan)
-
-    # Tier 2c: Household affordability ratios
-    df["INSTALLMENT_TO_HOUSEHOLD"] = df["INSTALLMENT_AMT"] / df["HOUSEHOLD_INCOME"].replace(0, np.nan)
-    df["TOTAL_AMT_TO_HOUSEHOLD"] = df["TOTAL_AMT"] / df["HOUSEHOLD_INCOME"].replace(0, np.nan)
-
-    # Tier 2d: Codebtor x affordability interactions (single vs joint risk profiles)
-    df["CODEBTOR_X_INST_TO_INC"] = df["HAS_CODEBTOR"] * df["INSTALLMENT_TO_INCOME"].fillna(0)
-    df["CODEBTOR_X_AMT_TO_INC"] = df["HAS_CODEBTOR"] * df["TOTAL_AMT_TO_INCOME"].fillna(0)
-    df["CODEBTOR_X_AMT_PER_MONTH"] = df["HAS_CODEBTOR"] * df["AMT_PER_MONTH"].fillna(0)
-
-    # Tier 2e: Portfolio ratios (approval rate proxies)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        df["BOOK_RATIO_LOAN"] = df["BOOK_LOAN_NBR"] / df["TOTAL_LOAN_NBR"].replace(0, np.nan)
-        df["BOOK_RATIO_CARD"] = df["BOOK_CARD_NBR"] / df["TOTAL_CARD_NBR"].replace(0, np.nan)
-    df["HAS_CARDS"] = (df["TOTAL_CARD_NBR"] > 0).astype(int)
-    df["HAS_LOANS"] = (df["TOTAL_LOAN_NBR"] > 0).astype(int)
-
-    # Tier 2c: Log transforms (helps LR capture diminishing returns)
-    df["LOG_INCOME_T1"] = np.log1p(df["INCOME_T1"].clip(lower=0))
-    df["LOG_TOTAL_AMT"] = np.log1p(df["TOTAL_AMT"].clip(lower=0))
-    df["LOG_MAX_CREDIT"] = np.log1p(df["MAX_CREDIT_TJ_AV"].clip(lower=0))
-
-    # Tier 3: Categorical interactions
-    df["PRODTYPE3_X_HOUSE"] = df["product_type_3"] + "_" + df["HOUSE_TYPE"]
-    df["PRODTYPE3_X_CUSTTYPE"] = df["product_type_3"] + "_" + df["CUSTOMER_TYPE"]
-    df["CUSTTYPE_X_HOUSE"] = df["CUSTOMER_TYPE"] + "_" + df["HOUSE_TYPE"]
-
-    # Missing value indicators
-    miss_flags = []
-    for col in MISS_CANDIDATES:
-        miss_rate = df[col].isna().mean()
-        if miss_rate > 0.01:
-            flag_name = f"MISS_{col}"
-            df[flag_name] = df[col].isna().astype(int)
-            miss_flags.append(f"{col} ({miss_rate:.1%})")
-
-    n_added = len(df.columns) - n_before
-    logger.info("{} features added  (3 codebtor, 3 afford, 2 household, 3 codebtor_x_afford, "
-                "4 portfolio, 3 log, 1 count, 3 cat interact, {} miss flags)", n_added, len(miss_flags))
-    if miss_flags:
-        logger.info("Missing flags: {}", ", ".join(miss_flags))
-    return df
+    return _training_features.engineer_features(df)
 
 
 # ── Interaction search ─────────────────────────────────────────────────────────
 
-def _loo_target_encode(groups: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Leave-one-out target encoding to avoid in-sample leakage."""
-    df_temp = pd.DataFrame({"group": groups, "y": y})
-    group_sum = df_temp.groupby("group")["y"].transform("sum")
-    group_count = df_temp.groupby("group")["y"].transform("count")
-    loo_mean = (group_sum - df_temp["y"]) / (group_count - 1)
-    loo_mean = loo_mean.fillna(y.mean())
-    return loo_mean.values
-
-
-def _safe_auc(y: np.ndarray, s: np.ndarray) -> tuple[float, int]:
-    valid = np.isfinite(s)
-    n = valid.sum()
-    if n < MIN_VALID or y[valid].sum() < 10:
-        return np.nan, n
-    return roc_auc_score(y[valid], s[valid]), n
-
-
-def _cv_target_encode_auc(
-    groups: np.ndarray, y: np.ndarray, n_splits: int = 5,
-) -> tuple[float, int]:
-    """K-fold cross-validated target-encoded AUC (eliminates in-sample bias)."""
-    kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
-    encoded = np.full(len(y), np.nan)
-    for train_idx, val_idx in kf.split(groups, y):
-        df_fold = pd.DataFrame({"group": groups[train_idx], "y": y[train_idx]})
-        means = df_fold.groupby("group")["y"].mean()
-        global_mean = y[train_idx].mean()
-        encoded[val_idx] = pd.Series(groups[val_idx]).map(means).fillna(global_mean).values
-    return _safe_auc(y, encoded)
-
-
-def normalize_interaction_name(name: str) -> str:
-    return name.replace("/", "_DIV_").replace("*", "_X_")
-
-
 def search_interactions(
     df: pd.DataFrame,
     end_before_date: str | pd.Timestamp = SPLIT_DATE,
-) -> pd.DataFrame:
-    cutoff = pd.Timestamp(end_before_date)
-    df_search = df[df["mis_Date"] < cutoff].dropna(subset=[TARGET]).copy()
-    df_search[TARGET] = df_search[TARGET].astype(int)
-    y_search = df_search[TARGET].values
-
-    logger.info(
-        "Search set: {:,} rows ({:,} pos) — screening {} num + {} cat pairs",
-        len(df_search), y_search.sum(),
-        len(list(combinations(RAW_NUM, 2))),
-        len(list(combinations(RAW_CAT, 2))),
+    return_diagnostics: bool = False,
+) -> pd.DataFrame | _training_features.InteractionSearchResult:
+    return _training_features.search_interactions(
+        df,
+        end_before_date=end_before_date,
+        return_diagnostics=return_diagnostics,
     )
 
-    # Precompute base AUCs
-    base_auc = {}
-    for col in RAW_NUM:
-        auc, _ = _safe_auc(y_search, df_search[col].values)
-        if not np.isnan(auc):
-            base_auc[col] = abs(auc - 0.5)
-    for col in RAW_CAT:
-        auc, _ = _cv_target_encode_auc(df_search[col].astype(str).values, y_search)
-        if not np.isnan(auc):
-            base_auc[col] = abs(auc - 0.5)
 
-    logger.info("Base AUCs: {} features ({} num, {} cat)", len(base_auc),
-                 sum(1 for c in RAW_NUM if c in base_auc),
-                 sum(1 for c in RAW_CAT if c in base_auc))
-
-    # Screen numerical pairs (ratio + product)
-    results = []
-    num_pairs = list(combinations(RAW_NUM, 2))
-    for a, b in tqdm(num_pairs, desc="Num pairs (ratio+product)", leave=False):
-        va = df_search[a].values.astype(float)
-        vb = df_search[b].values.astype(float)
-        parent_power = max(base_auc.get(a, 0), base_auc.get(b, 0))
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = va / vb
-        auc_r, n_r = _safe_auc(y_search, ratio)
-        if not np.isnan(auc_r):
-            power = abs(auc_r - 0.5)
-            if power - parent_power >= MIN_LIFT:
-                results.append({
-                    "name": f"{a}/{b}", "type": "ratio",
-                    "auc": auc_r, "lift": power - parent_power,
-                    "feat_a": a, "feat_b": b,
-                })
-
-        product = va * vb
-        auc_p, n_p = _safe_auc(y_search, product)
-        if not np.isnan(auc_p):
-            power = abs(auc_p - 0.5)
-            if power - parent_power >= MIN_LIFT:
-                results.append({
-                    "name": f"{a}*{b}", "type": "product",
-                    "auc": auc_p, "lift": power - parent_power,
-                    "feat_a": a, "feat_b": b,
-                })
-
-    # Screen categorical pairs (LOO target encoding to avoid leakage)
-    cat_pairs = list(combinations(RAW_CAT, 2))
-    for a, b in tqdm(cat_pairs, desc="Cat pairs (CV encode)", leave=False):
-        combo = (df_search[a].astype(str) + "_" + df_search[b].astype(str)).values
-        auc_c, n_c = _cv_target_encode_auc(combo, y_search)
-        if not np.isnan(auc_c):
-            parent_power = max(base_auc.get(a, 0), base_auc.get(b, 0))
-            power = abs(auc_c - 0.5)
-            if power - parent_power >= MIN_LIFT:
-                results.append({
-                    "name": f"{a}_x_{b}", "type": "cat_concat",
-                    "auc": auc_c, "lift": power - parent_power,
-                    "feat_a": a, "feat_b": b,
-                })
-
-    all_results = pd.DataFrame(results)
-    if not all_results.empty:
-        all_results = all_results.sort_values("lift", ascending=False)
-        n_ratio = (all_results["type"] == "ratio").sum()
-        n_product = (all_results["type"] == "product").sum()
-        n_cat = (all_results["type"] == "cat_concat").sum()
-        logger.info(
-            "Found {} interactions (>= {:.0%} lift): {} ratio, {} product, {} cat",
-            len(all_results), MIN_LIFT, n_ratio, n_product, n_cat,
-        )
-        top = all_results.head(5)
-        for _, r in top.iterrows():
-            logger.info("  {:<40s}  AUC={:.4f}  lift={:+.4f}", r["name"], r["auc"], r["lift"])
-    else:
-        logger.info("No interactions found with >= {:.0%} lift", MIN_LIFT)
-    return all_results
-
-
-def add_interactions(df: pd.DataFrame, all_results: pd.DataFrame) -> pd.DataFrame:
-    existing = set(df.columns)
-    added = []
-
-    for _, row in all_results.iterrows():
-        col_name = normalize_interaction_name(row["name"])
-        if col_name in existing:
-            continue
-
-        a, b = row["feat_a"], row["feat_b"]
-        if row["type"] == "ratio":
-            with np.errstate(divide="ignore", invalid="ignore"):
-                df[col_name] = df[a] / df[b].replace(0, np.nan)
-        elif row["type"] == "product":
-            df[col_name] = df[a] * df[b]
-        elif row["type"] == "cat_concat":
-            df[col_name] = df[a].astype(str) + "_" + df[b].astype(str)
-        added.append(col_name)
-        existing.add(col_name)
-
-    logger.info("Added {} interaction columns -> {} total cols", len(added), len(df.columns))
-    return df
+def add_interactions(df: pd.DataFrame, interactions: pd.DataFrame) -> pd.DataFrame:
+    return _training_features.add_interactions(df, interactions)
 
 
 # ── Feature selection & split ──────────────────────────────────────────────────
 
 def select_features(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
-    feature_cols = [c for c in df.columns if c not in DROP_COLS]
-    cat_cols = [c for c in feature_cols if df[c].dtype == "object" or df[c].dtype.name == "str"]
-    num_cols = [c for c in feature_cols if c not in cat_cols]
-    logger.info("Features — {} numerical, {} categorical, {} total", len(num_cols), len(cat_cols), len(feature_cols))
-    return feature_cols, num_cols, cat_cols
+    return _training_features.select_features(df)
 
 
 def temporal_split(df: pd.DataFrame, feature_cols: list[str]):
@@ -759,121 +601,38 @@ def build_rolling_oot_windows(
 def reduce_cardinality(
     X_train: pd.DataFrame, X_test: pd.DataFrame, cat_cols: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    X_train = X_train.copy()
-    X_test = X_test.copy()
-    cardinality_maps = {}
-    reduced = []
-
-    for col in cat_cols:
-        top_cats = X_train[col].value_counts().nlargest(MAX_CATEGORIES).index
-        cardinality_maps[col] = set(top_cats)
-        n_before = X_train[col].nunique()
-        X_train[col] = X_train[col].where(X_train[col].isin(top_cats), "Other")
-        X_test[col] = X_test[col].where(X_test[col].isin(top_cats), "Other")
-        n_after = X_train[col].nunique()
-        if n_before != n_after:
-            reduced.append(f"{col} ({n_before}->{n_after})")
-
-    if reduced:
-        logger.info("Capped {} cat features to max {} levels: {}", len(reduced), MAX_CATEGORIES, ", ".join(reduced))
-    else:
-        logger.info("All {} cat features already <= {} levels", len(cat_cols), MAX_CATEGORIES)
-    return X_train, X_test, cardinality_maps
+    return _training_features.reduce_cardinality(X_train, X_test, cat_cols)
 
 
 # ── Enhanced feature engineering (post-split) ─────────────────────────────────
 
-GROUP_STAT_PAIRS = [
-    ("INCOME_T1", "CSP"),
-    ("INCOME_T1", "product_type_3"),
-    ("TOTAL_AMT", "product_type_3"),
-    ("MAX_CREDIT_TJ_AV", "HOUSE_TYPE"),
-    ("INSTALLMENT_AMT", "CSP"),
-    ("AGE_T1", "HOUSE_TYPE"),
-]
-
-
 def add_frequency_encoding(
     X_train: pd.DataFrame, X_test: pd.DataFrame, cat_cols: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """Frequency encoding: training-set category proportions as numerical features."""
-    X_train = X_train.copy()
-    X_test = X_test.copy()
-    added = []
-    for col in cat_cols:
-        freq = X_train[col].value_counts(normalize=True)
-        col_name = f"FREQ_{col}"
-        X_train[col_name] = X_train[col].map(freq).fillna(0).astype(float)
-        X_test[col_name] = X_test[col].map(freq).fillna(0).astype(float)
-        added.append(col_name)
-    logger.info("Added {} frequency-encoded features", len(added))
-    return X_train, X_test, added
+    return _training_features.add_frequency_encoding(X_train, X_test, cat_cols)
 
 
 def add_group_stats(
-    X_train: pd.DataFrame, X_test: pd.DataFrame,
-    num_cols: list[str], cat_cols: list[str],
+    X_train: pd.DataFrame, X_test: pd.DataFrame, num_cols: list[str], cat_cols: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """Group statistics: individual value / group median (train stats only)."""
-    X_train = X_train.copy()
-    X_test = X_test.copy()
-    added = []
-    for num, cat in GROUP_STAT_PAIRS:
-        if num not in num_cols or cat not in cat_cols:
-            continue
-        col_name = f"{num}_VS_{cat}"
-        group_med = X_train.groupby(cat)[num].median()
-        global_med = X_train[num].median()
-        if global_med == 0 or np.isnan(global_med):
-            global_med = 1e-8
-
-        train_med = X_train[cat].map(group_med).fillna(global_med)
-        test_med = X_test[cat].map(group_med).fillna(global_med)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            X_train[col_name] = X_train[num] / train_med.replace(0, np.nan)
-            X_test[col_name] = X_test[num] / test_med.replace(0, np.nan)
-        added.append(col_name)
-    logger.info("Added {} group-statistic features: {}", len(added), ", ".join(added))
-    return X_train, X_test, added
+    return _training_features.add_group_stats(X_train, X_test, num_cols, cat_cols)
 
 
 def prune_correlated(
-    X_train: pd.DataFrame, num_cols: list[str], threshold: float = 0.95,
+    X: pd.DataFrame, num_cols: list[str],
 ) -> list[str]:
-    """Identify near-duplicate numerical features by pairwise correlation."""
-    if len(num_cols) < 2:
-        return []
-    corr = X_train[num_cols].corr().abs()
-    upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
-    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
-    if to_drop:
-        logger.info("Pruning {} correlated features (|r| > {:.2f}): {}",
-                    len(to_drop), threshold, ", ".join(to_drop))
-    else:
-        logger.info("No features exceed correlation threshold {:.2f}", threshold)
-    return to_drop
+    return _training_features.prune_correlated(X, num_cols)
 
 
 def add_modeling_features(
-    X_train: pd.DataFrame,
-    X_other: pd.DataFrame,
-    feature_cols: list[str],
-    num_cols: list[str],
-    cat_cols: list[str],
+    X_train: pd.DataFrame, X_test: pd.DataFrame, base_feature_cols: list[str], base_num_cols: list[str], base_cat_cols: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str], list[str], list[str], list[str]]:
-    X_train_out, X_other_out, _ = reduce_cardinality(X_train, X_other, cat_cols)
-    X_train_out, X_other_out, freq_cols = add_frequency_encoding(X_train_out, X_other_out, cat_cols)
-    X_train_out, X_other_out, group_cols = add_group_stats(X_train_out, X_other_out, num_cols, cat_cols)
-    new_num = freq_cols + group_cols
-    return (
-        X_train_out,
-        X_other_out,
-        feature_cols + new_num,
-        num_cols + new_num,
-        cat_cols,
-        freq_cols,
-        group_cols,
+    return _training_features.add_modeling_features(
+        X_train,
+        X_test,
+        base_feature_cols,
+        base_num_cols,
+        base_cat_cols,
     )
 
 
@@ -888,70 +647,17 @@ def build_feature_provenance(
     rfecv_candidate_cols: list[str],
     rfecv_kept_cols: list[str],
 ) -> pd.DataFrame:
-    raw_set = set(raw_feature_cols)
-    engineered_set = set(engineered_feature_cols)
-    freq_set = set(freq_cols)
-    group_set = set(group_cols)
-    num_set = set(feature_space_num_cols)
-    cat_set = set(feature_space_cat_cols)
-    candidate_set = set(rfecv_candidate_cols)
-    kept_set = set(rfecv_kept_cols)
-    interaction_meta = {
-        normalize_interaction_name(row["name"]): {
-            "interaction_type": row["type"],
-            "feat_a": row["feat_a"],
-            "feat_b": row["feat_b"],
-        }
-        for _, row in interactions.iterrows()
-    }
-
-    ordered_features = list(
-        dict.fromkeys(
-            raw_feature_cols
-            + engineered_feature_cols
-            + list(interaction_meta)
-            + freq_cols
-            + group_cols
-        )
+    return _training_features.build_feature_provenance(
+        raw_feature_cols,
+        engineered_feature_cols,
+        interactions,
+        freq_cols,
+        group_cols,
+        feature_space_num_cols,
+        feature_space_cat_cols,
+        rfecv_candidate_cols,
+        rfecv_kept_cols,
     )
-
-    records = []
-    for feature in ordered_features:
-        interaction_info = interaction_meta.get(feature, {})
-        if feature in interaction_meta:
-            provenance = "interaction"
-        elif feature in group_set:
-            provenance = "group_stat"
-        elif feature in freq_set:
-            provenance = "frequency"
-        elif feature in engineered_set:
-            provenance = "engineered"
-        elif feature in raw_set:
-            provenance = "raw"
-        else:
-            provenance = "unknown"
-
-        if feature in num_set:
-            data_type = "numerical"
-        elif feature in cat_set:
-            data_type = "categorical"
-        else:
-            data_type = pd.NA
-
-        records.append(
-            {
-                "feature": feature,
-                "provenance": provenance,
-                "data_type": data_type,
-                "rfecv_candidate": feature in candidate_set,
-                "rfecv_kept": feature in kept_set,
-                "interaction_type": interaction_info.get("interaction_type", pd.NA),
-                "feat_a": interaction_info.get("feat_a", pd.NA),
-                "feat_b": interaction_info.get("feat_b", pd.NA),
-            }
-        )
-
-    return pd.DataFrame(records).sort_values(["provenance", "feature"]).reset_index(drop=True)
 
 
 # ── Reject inference ──────────────────────────────────────────────────────────
@@ -1066,47 +772,14 @@ def augment_training_data(
 # ── Preprocessors ──────────────────────────────────────────────────────────────
 
 def build_preprocessors(num_cols: list[str], cat_cols: list[str]):
-    num_transformer = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
-    cat_transformer = Pipeline([
-        ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-        ("encoder", TargetEncoder(smooth="auto", cv=5, random_state=RANDOM_STATE)),
-    ])
-    preprocessor = ColumnTransformer([
-        ("num", num_transformer, num_cols),
-        ("cat", cat_transformer, cat_cols),
-    ])
-
-    lgbm_num_transformer = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-    ])
-    lgbm_cat_transformer = Pipeline([
-        ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-        ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),
-    ])
-    lgbm_preprocessor = ColumnTransformer([
-        ("num", lgbm_num_transformer, num_cols),
-        ("cat", lgbm_cat_transformer, cat_cols),
-    ])
-    lgbm_cat_indices = list(range(len(num_cols), len(num_cols) + len(cat_cols)))
-
-    return preprocessor, lgbm_preprocessor, lgbm_cat_indices
+    return _training_features.build_preprocessors(num_cols, cat_cols)
 
 
 def build_monotone_constraints(num_cols: list[str], cat_cols: list[str]) -> list[int]:
-    """Monotonicity constraint vector matching ColumnTransformer output order."""
-    constraints = [MONOTONE_MAP.get(c, 0) for c in num_cols]
-    constraints.extend([0] * len(cat_cols))  # categoricals unconstrained
-    n_neg = sum(1 for c in constraints if c == -1)
-    n_pos = sum(1 for c in constraints if c == 1)
-    logger.info("Monotone constraints: {}/{} features constrained ({} neg, {} pos)",
-                n_neg + n_pos, len(constraints), n_neg, n_pos)
-    return constraints
+    return _training_features.build_monotone_constraints(num_cols, cat_cols)
 
 
-# ── RFECV ──────────────────────────────────────────────────────────────────────
+# ── Feature Selection (temporal stability selection) ──────────────────────────
 
 def run_rfecv(
     X_train: pd.DataFrame, y_train: pd.Series,
@@ -1114,50 +787,7 @@ def run_rfecv(
     feature_cols: list[str],
     cv,
 ):
-    logger.info("{} candidate features ({} num, {} cat)", len(num_cols) + len(cat_cols), len(num_cols), len(cat_cols))
-    pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-    rfe_estimator = LGBMClassifier(
-        n_estimators=100, num_leaves=31,
-        scale_pos_weight=pos_weight,
-        random_state=RANDOM_STATE, n_jobs=-1, verbosity=-1,
-    )
-
-    all_feature_names = num_cols + cat_cols
-
-    # Use OrdinalEncoder-based preprocessing to avoid target leakage.
-    # TargetEncoder would leak validation-fold targets when pre-fitted on all data.
-    rfe_preprocessor = ColumnTransformer([
-        ("num", Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-        ]), num_cols),
-        ("cat", Pipeline([
-            ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-            ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),
-        ]), cat_cols),
-    ])
-    X_rfe = rfe_preprocessor.fit_transform(X_train)
-
-    rfecv = RFECV(
-        estimator=rfe_estimator, step=1,
-        cv=cv,
-        scoring="average_precision", min_features_to_select=5,
-        n_jobs=-1, verbose=0,
-    )
-    rfecv.fit(X_rfe, y_train)
-
-    selected_mask = rfecv.support_
-    selected_set = {f for f, s in zip(all_feature_names, selected_mask) if s}
-    eliminated = [f for f, s in zip(all_feature_names, selected_mask) if not s]
-
-    logger.info("RFECV: {} / {} features selected", rfecv.n_features_, len(all_feature_names))
-    if eliminated:
-        logger.info("Dropped {}: {}", len(eliminated), ", ".join(eliminated))
-
-    num_cols = [c for c in num_cols if c in selected_set]
-    cat_cols = [c for c in cat_cols if c in selected_set]
-    feature_cols = [c for c in feature_cols if c in selected_set]
-
-    return feature_cols, num_cols, cat_cols
+    return _training_features.run_rfecv(X_train, y_train, num_cols, cat_cols, feature_cols, cv)
 
 
 def normalize_xgboost_monotone_constraints(monotone_constraints):
@@ -1228,17 +858,20 @@ def _lgbm_prauc_eval(y_true, y_raw):
 def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight, cv, n_trials: int, sample_weight=None, monotone_constraints=None):
     logger.info("Optuna: {} trials x {} folds, early stopping after {} rounds",
                 n_trials, cv.n_splits, EARLY_STOPPING_ROUNDS)
+    lgbm_subsample_freq = 1
 
     def objective(trial):
         params = {
-            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 15, 255),
-            "max_depth": trial.suggest_int("max_depth", 3, 12),
-            "min_child_samples": trial.suggest_int("min_child_samples", 5, 200),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 8, 31),
+            "max_depth": trial.suggest_int("max_depth", 3, 5),
+            "min_child_samples": trial.suggest_int("min_child_samples", 50, 300),
+            "subsample": trial.suggest_float("subsample", 0.6, 0.85),
+            "subsample_freq": lgbm_subsample_freq,
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.85),
+            "min_split_gain": trial.suggest_float("min_split_gain", 1e-3, 1.0, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 20.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-2, 50.0, log=True),
         }
 
         fold_scores = []
@@ -1279,7 +912,7 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
 
         trial.set_user_attr(
             "best_n_estimators",
-            normalize_estimator_count(np.median(fold_best_iters), fallback=N_ESTIMATORS_CEILING),
+            select_conservative_boosting_rounds(fold_best_iters, fallback=N_ESTIMATORS_CEILING),
         )
         return np.mean(fold_scores)
 
@@ -1292,16 +925,17 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
     )
     bp = study.best_params
     logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
-    logger.info("  n_estimators={} (early stop), lr={:.4f}, leaves={}, depth={}, min_child={}",
+    logger.info("  n_estimators={} (conservative early stop), lr={:.4f}, leaves={}, depth={}, min_child={}",
                 best_n_estimators, bp["learning_rate"], bp["num_leaves"], bp["max_depth"], bp["min_child_samples"])
-    logger.info("  subsample={:.2f}, colsample={:.2f}, alpha={:.2e}, lambda={:.2e}",
-                bp["subsample"], bp["colsample_bytree"], bp["reg_alpha"], bp["reg_lambda"])
+    logger.info("  subsample={:.2f} (freq={}), colsample={:.2f}, min_split_gain={:.2e}, alpha={:.2e}, lambda={:.2e}",
+                bp["subsample"], lgbm_subsample_freq, bp["colsample_bytree"], bp["min_split_gain"], bp["reg_alpha"], bp["reg_lambda"])
 
     lgbm_model = Pipeline([
         ("preprocessor", lgbm_preprocessor),
         ("classifier", LGBMClassifier(
             n_estimators=best_n_estimators,
             scale_pos_weight=pos_weight,
+            subsample_freq=lgbm_subsample_freq,
             monotone_constraints=monotone_constraints,
             random_state=RANDOM_STATE, n_jobs=-1, verbosity=-1,
             **study.best_params,
@@ -1321,14 +955,14 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
 
     def objective(trial):
         params = {
-            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
-            "max_depth": trial.suggest_int("max_depth", 3, 10),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-            "gamma": trial.suggest_float("gamma", 1e-8, 5.0, log=True),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
+            "max_depth": trial.suggest_int("max_depth", 2, 4),
+            "min_child_weight": trial.suggest_int("min_child_weight", 20, 100),
+            "subsample": trial.suggest_float("subsample", 0.5, 0.85),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.85),
+            "gamma": trial.suggest_float("gamma", 1e-3, 10.0, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 20.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-2, 50.0, log=True),
         }
 
         fold_scores = []
@@ -1366,7 +1000,7 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
 
         trial.set_user_attr(
             "best_n_estimators",
-            normalize_estimator_count(np.median(fold_best_iters), fallback=N_ESTIMATORS_CEILING),
+            select_conservative_boosting_rounds(fold_best_iters, fallback=N_ESTIMATORS_CEILING),
         )
         return np.mean(fold_scores)
 
@@ -1379,7 +1013,7 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
     )
     bp = study.best_params
     logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
-    logger.info("  n_estimators={} (early stop), lr={:.4f}, depth={}, min_child_w={}",
+    logger.info("  n_estimators={} (conservative early stop), lr={:.4f}, depth={}, min_child_w={}",
                 best_n_estimators, bp["learning_rate"], bp["max_depth"], bp["min_child_weight"])
     logger.info("  subsample={:.2f}, colsample={:.2f}, gamma={:.2e}, alpha={:.2e}, lambda={:.2e}",
                 bp["subsample"], bp["colsample_bytree"], bp["gamma"], bp["reg_alpha"], bp["reg_lambda"])
@@ -1407,12 +1041,12 @@ def train_catboost(X_train, y_train, lgbm_preprocessor, pos_weight, cv, n_trials
 
     def objective(trial):
         params = {
-            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
-            "depth": trial.suggest_int("depth", 4, 10),
-            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-8, 10.0, log=True),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 5, 100),
-            "random_strength": trial.suggest_float("random_strength", 1e-8, 10.0, log=True),
-            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 10.0),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
+            "depth": trial.suggest_int("depth", 3, 5),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 50.0, log=True),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 300),
+            "random_strength": trial.suggest_float("random_strength", 0.1, 20.0, log=True),
+            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 5.0),
         }
 
         fold_scores = []
@@ -1456,7 +1090,7 @@ def train_catboost(X_train, y_train, lgbm_preprocessor, pos_weight, cv, n_trials
 
         trial.set_user_attr(
             "best_n_estimators",
-            normalize_estimator_count(np.median(fold_best_iters), fallback=N_ESTIMATORS_CEILING),
+            select_conservative_boosting_rounds(fold_best_iters, fallback=N_ESTIMATORS_CEILING),
         )
         return np.mean(fold_scores)
 
@@ -1469,7 +1103,7 @@ def train_catboost(X_train, y_train, lgbm_preprocessor, pos_weight, cv, n_trials
     )
     bp = study.best_params
     logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
-    logger.info("  iterations={} (early stop), lr={:.4f}, depth={}, min_data_in_leaf={}",
+    logger.info("  iterations={} (conservative early stop), lr={:.4f}, depth={}, min_data_in_leaf={}",
                 best_n_estimators, bp["learning_rate"], bp["depth"], bp["min_data_in_leaf"])
     logger.info("  l2_leaf_reg={:.2e}, random_strength={:.2e}, bagging_temp={:.2f}",
                 bp["l2_leaf_reg"], bp["random_strength"], bp["bagging_temperature"])
@@ -1665,6 +1299,21 @@ def normalize_estimator_count(value, fallback: int = 1) -> int:
     return max(int(value), fallback)
 
 
+def select_conservative_boosting_rounds(
+    best_iterations: list[int],
+    fallback: int = N_ESTIMATORS_CEILING,
+    quantile: float = 0.25,
+) -> int:
+    if not best_iterations:
+        return normalize_estimator_count(fallback)
+    normalized = np.asarray(
+        [normalize_estimator_count(value, fallback=fallback) for value in best_iterations],
+        dtype=float,
+    )
+    conservative_value = np.floor(np.quantile(normalized, quantile))
+    return normalize_estimator_count(conservative_value, fallback=int(normalized.min()))
+
+
 def build_fresh_pipeline_from_fitted(model: Pipeline) -> Pipeline:
     preprocessor = clone(model.named_steps["preprocessor"])
     classifier = model.named_steps["classifier"]
@@ -1803,8 +1452,6 @@ def run_rolling_out_of_time_validation(
     max_windows: int = ROLLING_OOT_MAX_WINDOWS,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
 
-
-
     if not base_models:
         empty_results = pd.DataFrame(
             columns=[
@@ -1846,18 +1493,10 @@ def run_rolling_out_of_time_validation(
         )
 
         X_fit, X_validation, _, _, _, _, _ = add_modeling_features(
-            X_fit_base,
-            X_window_validation_base,
-            base_feature_cols,
-            base_num_cols,
-            base_cat_cols,
+            X_fit_base, X_window_validation_base, base_feature_cols, base_num_cols, base_cat_cols,
         )
         _, X_calibration, _, _, _, _, _ = add_modeling_features(
-            X_fit_base,
-            X_calibration_base,
-            base_feature_cols,
-            base_num_cols,
-            base_cat_cols,
+            X_fit_base, X_calibration_base, base_feature_cols, base_num_cols, base_cat_cols,
         )
 
         X_fit = X_fit[frozen_feature_cols].copy()
@@ -2282,7 +1921,6 @@ def run_phase3_ablations(
             True,
             True,
         )
-
     return pd.DataFrame(records)
 
 
@@ -2294,6 +1932,7 @@ def compute_shap_analysis(
     num_cols: list[str],
     cat_cols: list[str],
     output_dir: Path,
+    preferred_model_name: str | None = None,
 ) -> pd.DataFrame | None:
     """SHAP values for the best tree model: summary, importance, dependence plots."""
     try:
@@ -2302,12 +1941,25 @@ def compute_shap_analysis(
         logger.warning("shap not installed — skipping (pip install shap)")
         return None
 
-    for name in ["LightGBM", "XGBoost"]:
-        if name in models and hasattr(models[name], "named_steps"):
-            model = models[name]
+    candidate_names = [preferred_model_name] if preferred_model_name is not None else []
+    candidate_names.extend(["LightGBM", "XGBoost", "CatBoost", "Logistic Regression"])
+    tree_class_names = {"LGBMClassifier", "XGBClassifier", "CatBoostClassifier"}
+    explainer_type = None
+    for name in dict.fromkeys(candidate_names):
+        if name not in models or not hasattr(models[name], "named_steps"):
+            continue
+        candidate_model = models[name]
+        candidate_clf = candidate_model.named_steps["classifier"]
+        if candidate_clf.__class__.__name__ in tree_class_names:
+            model = candidate_model
+            explainer_type = "tree"
+            break
+        if isinstance(candidate_clf, LogisticRegression):
+            model = candidate_model
+            explainer_type = "linear"
             break
     else:
-        logger.warning("No tree model available for SHAP")
+        logger.warning("No supported model available for SHAP")
         return None
 
     feature_names = num_cols + cat_cols
@@ -2326,7 +1978,15 @@ def compute_shap_analysis(
         X_t = X_t[idx]
         logger.info("Subsampled {:,} -> {:,} for SHAP", X_test.shape[0], max_shap)
 
-    explainer = shap.TreeExplainer(clf)
+    if explainer_type == "linear":
+        background = X_t
+        if X_t.shape[0] > 1000:
+            rng = np.random.RandomState(RANDOM_STATE)
+            bg_idx = rng.choice(X_t.shape[0], 1000, replace=False)
+            background = X_t[bg_idx]
+        explainer = shap.LinearExplainer(clf, background)
+    else:
+        explainer = shap.TreeExplainer(clf)
     shap_values = explainer.shap_values(X_t)
     if isinstance(shap_values, list):
         shap_values = shap_values[1]
@@ -2382,10 +2042,7 @@ def compute_shap_analysis(
     return summary
 
 
-# ── PSI / CSI Stability ──────────────────────────────────────────────────────
-
 def _psi_component(expected_pct: np.ndarray, actual_pct: np.ndarray) -> np.ndarray:
-    """Per-bin PSI contribution with epsilon to avoid log(0)."""
     eps = 1e-6
     e = np.clip(expected_pct, eps, None)
     a = np.clip(actual_pct, eps, None)
@@ -2393,29 +2050,28 @@ def _psi_component(expected_pct: np.ndarray, actual_pct: np.ndarray) -> np.ndarr
 
 
 def compute_psi(
-    train_scores: np.ndarray, test_scores: np.ndarray, n_bins: int = 10,
+    train_scores: np.ndarray,
+    test_scores: np.ndarray,
+    n_bins: int = 10,
 ) -> float:
-    """Population Stability Index between train and test score distributions."""
     quantiles = np.linspace(0, 100, n_bins + 1)
     bin_edges = np.percentile(train_scores[np.isfinite(train_scores)], quantiles)
     bin_edges[0], bin_edges[-1] = -np.inf, np.inf
-
     train_pct = np.histogram(train_scores, bins=bin_edges)[0].astype(float)
     test_pct = np.histogram(test_scores, bins=bin_edges)[0].astype(float)
     train_pct /= train_pct.sum()
     test_pct /= test_pct.sum()
-
     return float(_psi_component(train_pct, test_pct).sum())
 
 
 def compute_csi(
-    X_train: pd.DataFrame, X_test: pd.DataFrame,
-    num_cols: list[str], cat_cols: list[str],
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    num_cols: list[str],
+    cat_cols: list[str],
     n_bins: int = 10,
 ) -> pd.DataFrame:
-    """Characteristic Stability Index: PSI applied per-feature."""
     records = []
-
     for col in num_cols:
         tr = X_train[col].dropna().values.astype(float)
         te = X_test[col].dropna().values.astype(float)
@@ -2429,9 +2085,14 @@ def compute_csi(
         te_pct = np.histogram(te, bins=bin_edges)[0].astype(float)
         tr_pct /= tr_pct.sum()
         te_pct /= te_pct.sum()
-        csi = float(_psi_component(tr_pct, te_pct).sum())
-        records.append({"feature": col, "type": "numerical", "csi": csi, "n_bins": len(bin_edges) - 1})
-
+        records.append(
+            {
+                "feature": col,
+                "type": "numerical",
+                "csi": float(_psi_component(tr_pct, te_pct).sum()),
+                "n_bins": len(bin_edges) - 1,
+            }
+        )
     for col in cat_cols:
         cats = sorted(
             set(X_train[col].dropna().unique()) | set(X_test[col].dropna().unique()),
@@ -2447,9 +2108,14 @@ def compute_csi(
             continue
         tr_pct /= tr_pct.sum()
         te_pct /= te_pct.sum()
-        csi = float(_psi_component(tr_pct, te_pct).sum())
-        records.append({"feature": col, "type": "categorical", "csi": csi, "n_bins": len(cats)})
-
+        records.append(
+            {
+                "feature": col,
+                "type": "categorical",
+                "csi": float(_psi_component(tr_pct, te_pct).sum()),
+                "n_bins": len(cats),
+            }
+        )
     df = pd.DataFrame(records)
     if df.empty:
         return pd.DataFrame(columns=["feature", "type", "csi", "n_bins"])
@@ -2457,13 +2123,14 @@ def compute_csi(
 
 
 def run_stability_analysis(
-    X_train: pd.DataFrame, X_test: pd.DataFrame,
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
     train_scores: dict[str, np.ndarray],
     test_scores: dict[str, np.ndarray],
-    num_cols: list[str], cat_cols: list[str],
+    num_cols: list[str],
+    cat_cols: list[str],
     output_dir: Path,
 ) -> None:
-    """Compute and save PSI (score drift) and CSI (feature drift)."""
     psi_records = []
     for name in SUMMARY_MODEL_NAMES:
         if name not in train_scores or name not in test_scores:
@@ -2472,38 +2139,37 @@ def run_stability_analysis(
         psi_records.append({"model": name, "psi": psi})
         flag = "OK" if psi < 0.10 else ("MODERATE" if psi < 0.25 else "HIGH DRIFT")
         logger.info("  PSI {:<25s} = {:.4f}  [{}]", name, psi, flag)
-
     pd.DataFrame(psi_records).to_csv(output_dir / "psi.csv", index=False, float_format="%.6f")
-
     csi_df = compute_csi(X_train, X_test, num_cols, cat_cols)
     csi_df.to_csv(output_dir / "csi.csv", index=False, float_format="%.6f")
-
     n_high = int((csi_df["csi"] >= 0.25).sum())
     n_mod = int(((csi_df["csi"] >= 0.10) & (csi_df["csi"] < 0.25)).sum())
     n_stable = len(csi_df) - n_high - n_mod
-    logger.info("  CSI: {} features — {} high drift, {} moderate, {} stable",
-                len(csi_df), n_high, n_mod, n_stable)
+    logger.info(
+        "  CSI: {} features — {} high drift, {} moderate, {} stable",
+        len(csi_df),
+        n_high,
+        n_mod,
+        n_stable,
+    )
     if n_high > 0:
-        for _, r in csi_df[csi_df["csi"] >= 0.25].iterrows():
-            logger.info("    HIGH: {:<30s} CSI={:.4f}", r["feature"], r["csi"])
+        for _, row in csi_df[csi_df["csi"] >= 0.25].iterrows():
+            logger.info("    HIGH: {:<30s} CSI={:.4f}", row["feature"], row["csi"])
 
-
-# ── WoE / IV Analysis ─────────────────────────────────────────────────────────
 
 def compute_woe_iv(
-    X: pd.DataFrame, y: pd.Series,
-    num_cols: list[str], cat_cols: list[str],
+    X: pd.DataFrame,
+    y: pd.Series,
+    num_cols: list[str],
+    cat_cols: list[str],
     n_bins: int = 10,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Weight of Evidence and Information Value for all features."""
     total_good = int((y == 0).sum())
     total_bad = int((y == 1).sum())
     if total_good == 0 or total_bad == 0:
         return pd.DataFrame(), pd.DataFrame()
-
     eps = 1e-6
     woe_records = []
-
     for col in num_cols:
         valid = X[col].notna()
         x_col = X.loc[valid, col]
@@ -2523,13 +2189,19 @@ def compute_woe_iv(
             dist_good = max(n_good / col_good, eps)
             dist_bad = max(n_bad / col_bad, eps)
             woe = np.log(dist_good / dist_bad)
-            woe_records.append({
-                "feature": col, "bin": str(bin_label), "type": "numerical",
-                "n_total": int(mask.sum()), "n_good": n_good, "n_bad": n_bad,
-                "event_rate": n_bad / max(mask.sum(), 1),
-                "woe": woe, "iv": (dist_good - dist_bad) * woe,
-            })
-
+            woe_records.append(
+                {
+                    "feature": col,
+                    "bin": str(bin_label),
+                    "type": "numerical",
+                    "n_total": int(mask.sum()),
+                    "n_good": n_good,
+                    "n_bad": n_bad,
+                    "event_rate": n_bad / max(int(mask.sum()), 1),
+                    "woe": woe,
+                    "iv": (dist_good - dist_bad) * woe,
+                }
+            )
     for col in cat_cols:
         valid = X[col].notna()
         x_col = X.loc[valid, col]
@@ -2545,32 +2217,37 @@ def compute_woe_iv(
             dist_good = max(n_good / col_good, eps)
             dist_bad = max(n_bad / col_bad, eps)
             woe = np.log(dist_good / dist_bad)
-            woe_records.append({
-                "feature": col, "bin": str(cat_val), "type": "categorical",
-                "n_total": int(mask.sum()), "n_good": n_good, "n_bad": n_bad,
-                "event_rate": n_bad / max(mask.sum(), 1),
-                "woe": woe, "iv": (dist_good - dist_bad) * woe,
-            })
-
+            woe_records.append(
+                {
+                    "feature": col,
+                    "bin": str(cat_val),
+                    "type": "categorical",
+                    "n_total": int(mask.sum()),
+                    "n_good": n_good,
+                    "n_bad": n_bad,
+                    "event_rate": n_bad / max(int(mask.sum()), 1),
+                    "woe": woe,
+                    "iv": (dist_good - dist_bad) * woe,
+                }
+            )
     woe_df = pd.DataFrame(woe_records)
-    if not woe_df.empty:
-        iv_df = (
-            woe_df.groupby("feature")["iv"].sum()
-            .reset_index()
-            .sort_values("iv", ascending=False)
-            .reset_index(drop=True)
-        )
-    else:
-        iv_df = pd.DataFrame(columns=["feature", "iv"])
+    if woe_df.empty:
+        return woe_df, pd.DataFrame(columns=["feature", "iv"])
+    iv_df = (
+        woe_df.groupby("feature")["iv"]
+        .sum()
+        .reset_index()
+        .sort_values("iv", ascending=False)
+        .reset_index(drop=True)
+    )
     return woe_df, iv_df
 
-
-# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main(
     data_path: str = "data/demand_direct.parquet",
     optuna_trials: int = 50,
     output_dir: str = "output",
+    feature_discovery_fraction: float = FEATURE_DISCOVERY_FRACTION,
     reject_inference: bool = False,
     enable_experimental_stacking: bool = False,
     population_mode: str = POPULATION_MODE_UNDERWRITING,
@@ -2584,11 +2261,18 @@ def main(
     output_path.mkdir(parents=True, exist_ok=True)
     pipeline_t0 = time.perf_counter()
     logger.info("╔══════════════════════════════════════════════════════════╗")
-    logger.info("║            basel_bad Training Pipeline                  ║")
+    logger.info("║            basel_bad Training Pipeline                 ║")
     logger.info("╚══════════════════════════════════════════════════════════╝")
     logger.info(
-        "Config: split={}, maturity={}, seed={}, optuna_trials={}, output={}, experimental_stacking={}, population_mode={}",
-        SPLIT_DATE, MATURITY_CUTOFF, RANDOM_STATE, optuna_trials, output_dir, enable_experimental_stacking, population_mode,
+        "Config: split={}, maturity={}, seed={}, optuna_trials={}, output={}, feature_discovery_fraction={}, experimental_stacking={}, population_mode={}",
+        SPLIT_DATE,
+        MATURITY_CUTOFF,
+        RANDOM_STATE,
+        optuna_trials,
+        output_dir,
+        feature_discovery_fraction,
+        enable_experimental_stacking,
+        population_mode,
     )
     if population_mode == POPULATION_MODE_UNDERWRITING:
         logger.info("Target population: underwriting-stage loan applications")
@@ -2613,12 +2297,15 @@ def main(
         logger.warning("Run mode: EXPERIMENTAL")
     if reject_inference:
         logger.warning("Reject inference is experimental and excluded from official benchmark comparisons")
-        logger.warning("Reject inference ENABLED: multiplier={}, max_ratio={}, weight={}",
-                       REJECT_MULTIPLIER, REJECT_MAX_RATIO, REJECT_SAMPLE_WEIGHT)
+        logger.warning(
+            "Reject inference ENABLED: multiplier={}, max_ratio={}, weight={}",
+            REJECT_MULTIPLIER,
+            REJECT_MAX_RATIO,
+            REJECT_SAMPLE_WEIGHT,
+        )
     if enable_experimental_stacking:
         logger.warning("Stacking is experimental and excluded from official baseline comparisons")
 
-    # 1. Load data
     with _log_step(1, "Load data"):
         if population_mode == POPULATION_MODE_UNDERWRITING or reject_inference:
             df, rejected_df = load_data_with_rejects(data_path)
@@ -2631,7 +2318,6 @@ def main(
             population_mode=population_mode,
         )
 
-    # 2. Feature engineering (booked + rejects)
     with _log_step(2, "Feature engineering"):
         raw_feature_cols, _, _ = select_features(df)
         df = engineer_features(df)
@@ -2639,103 +2325,45 @@ def main(
             rejected_df = engineer_features(rejected_df)
         base_feature_cols_no_interactions, _, _ = select_features(df)
         engineered_feature_cols = [
-            feature for feature in base_feature_cols_no_interactions
-            if feature not in raw_feature_cols
+            feature for feature in base_feature_cols_no_interactions if feature not in raw_feature_cols
         ]
 
-    # 3. Dedicated feature discovery workflow
     with _log_step(3, "Feature discovery workflow"):
-        X_discovery_source, y_discovery_source, _, _, _, _, discovery_source_dates = temporal_split(
-            df, base_feature_cols_no_interactions,
+        feature_discovery_result = _training_features.run_feature_discovery_workflow(
+            df=df,
+            rejected_df=rejected_df,
+            raw_feature_cols=raw_feature_cols,
+            engineered_feature_cols=engineered_feature_cols,
+            base_feature_cols_no_interactions=base_feature_cols_no_interactions,
+            feature_discovery_fraction=feature_discovery_fraction,
+            temporal_split_fn=temporal_split,
+            resolve_temporal_feature_discovery_cutoff_fn=resolve_temporal_feature_discovery_cutoff,
+            temporal_feature_discovery_split_fn=temporal_feature_discovery_split,
+            summarize_population_fn=summarize_population,
+            log_population_summary_fn=log_population_summary,
+            make_temporal_cv_fn=make_temporal_cv,
         )
-        X_feature_discovery_seed, X_feature_estimation_seed, y_feature_discovery_seed, y_feature_estimation_seed, feature_discovery_seed_dates, feature_estimation_seed_dates = temporal_feature_discovery_split(
-            X_discovery_source,
-            y_discovery_source,
-            discovery_source_dates,
-            discovery_fraction=FEATURE_DISCOVERY_FRACTION,
-        )
-        log_population_summary(
-            "Feature discovery sample",
-            summarize_population(
-                y_feature_discovery_seed,
-                feature_discovery_seed_dates,
-                "earlier pre-test booked rows reserved for interaction search and RFECV",
-            ),
-        )
-        log_population_summary(
-            "Feature estimation seed sample",
-            summarize_population(
-                y_feature_estimation_seed,
-                feature_estimation_seed_dates,
-                "later pre-test booked rows reserved for final estimation after feature freezing",
-            ),
-        )
+        df = feature_discovery_result.df
+        rejected_df = feature_discovery_result.rejected_df
+        interaction_feature_cols = feature_discovery_result.interaction_feature_cols
+        interaction_leaderboard_df = feature_discovery_result.interaction_leaderboard_df
+        feature_discovery_boundary_df = feature_discovery_result.feature_discovery_boundary_df
+        base_feature_cols = feature_discovery_result.base_feature_cols
+        base_num_cols = feature_discovery_result.base_num_cols
+        base_cat_cols = feature_discovery_result.base_cat_cols
+        X_estimation_base = feature_discovery_result.X_estimation_base
+        y_estimation = feature_discovery_result.y_estimation
+        estimation_dates = feature_discovery_result.estimation_dates
+        X_test_base = feature_discovery_result.X_test_base
+        y_test = feature_discovery_result.y_test
+        benchmark_risk_score_test = feature_discovery_result.benchmark_risk_score_test
+        benchmark_score_test = feature_discovery_result.benchmark_score_test
+        feature_cols = feature_discovery_result.feature_cols
+        num_cols = feature_discovery_result.num_cols
+        cat_cols = feature_discovery_result.cat_cols
+        rfecv_candidate_feature_cols = feature_discovery_result.rfecv_candidate_feature_cols
+        feature_provenance_df = feature_discovery_result.feature_provenance_df
 
-        discovery_cutoff = pd.Timestamp(pd.to_datetime(feature_estimation_seed_dates).min())
-        interactions = search_interactions(df, end_before_date=discovery_cutoff)
-        interaction_feature_cols = (
-            [normalize_interaction_name(name) for name in interactions["name"].tolist()]
-            if not interactions.empty
-            else []
-        )
-        df = add_interactions(df, interactions)
-        if rejected_df is not None:
-            rejected_df = add_interactions(rejected_df, interactions)
-
-        base_feature_cols, base_num_cols, base_cat_cols = select_features(df)
-        X_booked_development_base, y_booked_development, X_test_base, y_test, benchmark_risk_score_test, benchmark_score_test, booked_development_dates = temporal_split(
-            df, base_feature_cols,
-        )
-        test_dates = df.loc[X_test_base.index, "mis_Date"].values
-        log_population_summary(
-            "Development sample",
-            summarize_population(y_booked_development, booked_development_dates, "pre-test booked matured rows"),
-        )
-        log_population_summary(
-            "Test sample",
-            summarize_population(y_test, test_dates, "post-split booked matured rows"),
-        )
-
-        X_feature_discovery_base, X_estimation_base, y_feature_discovery, y_estimation, feature_discovery_dates, estimation_dates = temporal_feature_discovery_split(
-            X_booked_development_base,
-            y_booked_development,
-            booked_development_dates,
-            discovery_fraction=FEATURE_DISCOVERY_FRACTION,
-        )
-        X_feature_discovery_space, _, feature_space_cols, feature_space_num_cols, feature_space_cat_cols, freq_cols, group_cols = add_modeling_features(
-            X_feature_discovery_base,
-            X_estimation_base,
-            base_feature_cols,
-            base_num_cols,
-            base_cat_cols,
-        )
-        corr_drop = prune_correlated(X_feature_discovery_space, feature_space_num_cols)
-        rfecv_candidate_feature_cols = [feature for feature in feature_space_cols if feature not in corr_drop]
-        rfecv_candidate_num_cols = [feature for feature in feature_space_num_cols if feature not in corr_drop]
-        rfecv_candidate_cat_cols = [feature for feature in feature_space_cat_cols if feature in rfecv_candidate_feature_cols]
-        rfe_cv = make_temporal_cv(feature_discovery_dates)
-        feature_cols, num_cols, cat_cols = run_rfecv(
-            X_feature_discovery_space[rfecv_candidate_feature_cols],
-            y_feature_discovery,
-            rfecv_candidate_num_cols,
-            rfecv_candidate_cat_cols,
-            rfecv_candidate_feature_cols,
-            cv=rfe_cv,
-        )
-        feature_provenance_df = build_feature_provenance(
-            raw_feature_cols,
-            engineered_feature_cols,
-            interactions,
-            freq_cols,
-            group_cols,
-            feature_space_num_cols,
-            feature_space_cat_cols,
-            rfecv_candidate_feature_cols,
-            feature_cols,
-        )
-        logger.info("Frozen feature set: {} num + {} cat = {}", len(num_cols), len(cat_cols), len(feature_cols))
-
-    # 4. Apply the frozen feature set to the official estimation/test path
     with _log_step(4, "Freeze feature set & prepare official matrices"):
         X_development_base = X_estimation_base.copy()
         y_development = y_estimation.copy()
@@ -2747,7 +2375,6 @@ def main(
         y_augmented_for_ablation = None
         augmented_dates_for_ablation = None
         augmented_sample_weight_for_ablation = None
-
         log_population_summary(
             "Official estimation sample",
             summarize_population(
@@ -2756,7 +2383,6 @@ def main(
                 "later pre-test booked rows used for final model estimation after feature freezing",
             ),
         )
-
         if reject_inference and rejected_df is not None:
             band_stats, bin_edges = compute_score_band_bad_rates(df)
             estimation_start = pd.Timestamp(pd.to_datetime(estimation_dates).min())
@@ -2787,7 +2413,6 @@ def main(
                     sample_weight=sample_weight,
                 ),
             )
-
         X_development, X_test, _, _, _, _, _ = add_modeling_features(
             X_development_base,
             X_test_base,
@@ -2805,14 +2430,14 @@ def main(
             len(feature_cols),
         )
 
-    # Build preprocessors and monotone constraints with selected features
     preprocessor, lgbm_preprocessor, lgbm_cat_indices = build_preprocessors(num_cols, cat_cols)
     monotone_constraints = build_monotone_constraints(num_cols, cat_cols)
 
-    # Hold out calibration set (15%) — split weights too if present
     if sample_weight is not None:
         X_development_fit, X_calibration_holdout, y_development_fit, y_calibration_holdout, w_development_fit, w_calibration_holdout, development_fit_dates, calibration_holdout_dates = temporal_calibration_split(
-            X_development, y_development, development_dates,
+            X_development,
+            y_development,
+            development_dates,
             calibration_fraction=CALIBRATION_FRACTION,
             sample_weight=sample_weight,
         )
@@ -2831,12 +2456,15 @@ def main(
         )
     else:
         X_development_fit, X_calibration_holdout, y_development_fit, y_calibration_holdout, development_fit_dates, calibration_holdout_dates = temporal_calibration_split(
-            X_development, y_development, development_dates,
+            X_development,
+            y_development,
+            development_dates,
             calibration_fraction=CALIBRATION_FRACTION,
         )
         w_development_fit = None
         w_calibration_holdout = None
-        X_calibration_booked, y_calibration_booked = X_calibration_holdout, y_calibration_holdout
+        X_calibration_booked = X_calibration_holdout
+        y_calibration_booked = y_calibration_holdout
         calibration_booked_dates = calibration_holdout_dates
 
     if len(X_calibration_booked) == 0:
@@ -2867,37 +2495,60 @@ def main(
     calib_start = pd.Timestamp(pd.to_datetime(calibration_holdout_dates).min()).date()
     calib_end = pd.Timestamp(pd.to_datetime(calibration_holdout_dates).max()).date()
     logger.info(
-        "Development/calibration split: {:,} fit [{} to {}] + {:,} holdout [{} to {}] ({:,} booked ground-truth, {:,} pos)  "
-        "(imbalance {:.0f}:1, temporal CV {} folds)",
-        len(X_development_fit), fit_start, fit_end,
-        len(X_calibration_holdout), calib_start, calib_end,
-        len(X_calibration_booked), int(y_calibration_booked.sum()),
+        "Development/calibration split: {:,} fit [{} to {}] + {:,} holdout [{} to {}] ({:,} booked ground-truth, {:,} pos)  (imbalance {:.0f}:1, temporal CV {} folds)",
+        len(X_development_fit),
+        fit_start,
+        fit_end,
+        len(X_calibration_holdout),
+        calib_start,
+        calib_end,
+        len(X_calibration_booked),
+        int(y_calibration_booked.sum()),
         pos_weight,
         cv.n_splits,
     )
 
-    # 7-10. Model training (with sample weights if reject inference)
     with _log_step(7, "Logistic Regression — development fit sample"):
         lr_model, lr_study = train_logistic_regression(
-            X_development_fit, y_development_fit, preprocessor, cv, optuna_trials, sample_weight=w_development_fit,
+            X_development_fit,
+            y_development_fit,
+            preprocessor,
+            cv,
+            optuna_trials,
+            sample_weight=w_development_fit,
         )
-
     with _log_step(8, "LightGBM — development fit sample"):
         lgbm_model, lgbm_study, lgbm_best_n = train_lgbm(
-            X_development_fit, y_development_fit, lgbm_preprocessor, lgbm_cat_indices,
-            pos_weight, cv, optuna_trials, sample_weight=w_development_fit,
+            X_development_fit,
+            y_development_fit,
+            lgbm_preprocessor,
+            lgbm_cat_indices,
+            pos_weight,
+            cv,
+            optuna_trials,
+            sample_weight=w_development_fit,
             monotone_constraints=monotone_constraints,
         )
-
     with _log_step(9, "XGBoost — development fit sample"):
         xgb_model, xgb_study, xgb_best_n = train_xgboost(
-            X_development_fit, y_development_fit, preprocessor, pos_weight, cv, optuna_trials, sample_weight=w_development_fit,
+            X_development_fit,
+            y_development_fit,
+            preprocessor,
+            pos_weight,
+            cv,
+            optuna_trials,
+            sample_weight=w_development_fit,
             monotone_constraints=monotone_constraints,
         )
-
     with _log_step(10, "CatBoost — development fit sample"):
         catboost_model, catboost_study, catboost_best_n = train_catboost(
-            X_development_fit, y_development_fit, lgbm_preprocessor, pos_weight, cv, optuna_trials, sample_weight=w_development_fit,
+            X_development_fit,
+            y_development_fit,
+            lgbm_preprocessor,
+            pos_weight,
+            cv,
+            optuna_trials,
+            sample_weight=w_development_fit,
             monotone_constraints=monotone_constraints,
         )
 
@@ -2917,7 +2568,6 @@ def main(
                 sample_weight=w_development_fit,
             )
 
-    # 12. Calibration — on booked-only held-out samples
     with _log_step(12, "Calibration — booked ground-truth holdout"):
         models = {
             "Logistic Regression": lr_model,
@@ -2931,8 +2581,11 @@ def main(
             cal = CalibratedClassifierCV(FrozenEstimator(models[name]), method="sigmoid")
             cal.fit(X_calibration_booked, y_calibration_booked)
             models[f"{name} (calibrated)"] = cal
-        logger.info("Sigmoid (Platt) calibration on {:,} booked held-out samples ({:,} pos)",
-                     len(y_calibration_booked), y_calibration_booked.sum())
+        logger.info(
+            "Sigmoid (Platt) calibration on {:,} booked held-out samples ({:,} pos)",
+            len(y_calibration_booked),
+            y_calibration_booked.sum(),
+        )
 
     with _log_step("12b", "Rolling OOT validation — pre-test estimation sample"):
         rolling_base_models = {name: models[name] for name in OFFICIAL_MODEL_NAMES}
@@ -2950,7 +2603,6 @@ def main(
             cat_cols,
             rolling_base_models,
         )
-
         if population_mode == POPULATION_MODE_UNDERWRITING:
             if not rolling_oot_results_df.empty:
                 rolling_oot_results_df["population_mode"] = population_mode
@@ -2958,7 +2610,6 @@ def main(
             if not rolling_oot_summary_df.empty:
                 rolling_oot_summary_df["population_mode"] = population_mode
                 rolling_oot_summary_df["evaluation_population"] = "booked_proxy"
-
         if not rolling_oot_summary_df.empty:
             logger.info("Rolling OOT summary:")
             for _, row in rolling_oot_summary_df.iterrows():
@@ -2970,11 +2621,17 @@ def main(
                     row["mean_ROC_AUC"],
                 )
 
-    # 13. Evaluation — always on booked test set (ground truth)
     with _log_step(13, "Evaluation — booked test sample"):
-        results_df, test_scores = evaluate_all(X_test, y_test, models, benchmark_risk_score_test, benchmark_score_test)
+        results_df, test_scores = evaluate_all(
+            X_test,
+            y_test,
+            models,
+            benchmark_risk_score_test,
+            benchmark_score_test,
+        )
         official_results_df, experimental_results_df = split_leaderboard_results(
-            results_df, reject_inference=reject_inference,
+            results_df,
+            reject_inference=reject_inference,
         )
         if population_mode == POPULATION_MODE_UNDERWRITING:
             results_df["population_mode"] = population_mode
@@ -2985,7 +2642,10 @@ def main(
                 experimental_results_df["population_mode"] = population_mode
                 experimental_results_df["evaluation_population"] = "booked_proxy"
         if not experimental_results_df.empty:
-            logger.warning("Experimental rows excluded from primary leaderboard: {}", ", ".join(experimental_results_df.index))
+            logger.warning(
+                "Experimental rows excluded from primary leaderboard: {}",
+                ", ".join(experimental_results_df.index),
+            )
 
     if population_mode == POPULATION_MODE_UNDERWRITING:
         with _log_step("13b", "Score post-split underwriting applications"):
@@ -3015,7 +2675,6 @@ def main(
         evaluation_population="booked_proxy" if population_mode == POPULATION_MODE_UNDERWRITING else None,
     )
 
-    # Precompute train scores (needed by PSI and plots)
     if w_development_fit is not None:
         development_fit_booked_mask = w_development_fit == 1.0
         X_development_fit_booked = X_development_fit.loc[development_fit_booked_mask]
@@ -3028,17 +2687,20 @@ def main(
         if "(calibrated)" not in name:
             train_scores[name] = mdl.predict_proba(X_development_fit_booked)[:, 1]
 
-    # 14. Bootstrap confidence intervals
     with _log_step(14, "Bootstrap confidence intervals — booked test sample"):
         ci_df = bootstrap_confidence_intervals(y_test.values, test_scores)
         ci_df.to_csv(output_path / "confidence_intervals.csv", float_format="%.6f")
         official_candidate_names = [name for name in official_results_df.index if name not in BENCHMARK_MODEL_NAMES]
         experimental_candidate_names = list(experimental_results_df.index)
         benchmark_comparisons_df = paired_bootstrap_benchmark_comparisons(
-            y_test.values, test_scores, official_candidate_names,
+            y_test.values,
+            test_scores,
+            official_candidate_names,
         )
         experimental_benchmark_comparisons_df = paired_bootstrap_benchmark_comparisons(
-            y_test.values, test_scores, experimental_candidate_names,
+            y_test.values,
+            test_scores,
+            experimental_candidate_names,
         )
         if population_mode == POPULATION_MODE_UNDERWRITING:
             if not benchmark_comparisons_df.empty:
@@ -3051,22 +2713,31 @@ def main(
         for model_name, row in ci_df.iterrows():
             brier_str = (
                 f"  Brier={row['Brier']:.4f} [{row['Brier_lo']:.4f}, {row['Brier_hi']:.4f}]"
-                if not np.isnan(row["Brier"]) else ""
+                if not np.isnan(row["Brier"])
+                else ""
             )
             logger.info(
                 "  {:<30s} AUC={:.4f} [{:.4f}, {:.4f}]  PR={:.4f} [{:.4f}, {:.4f}]{}",
-                model_name, row["AUC"], row["AUC_lo"], row["AUC_hi"],
-                row["PR_AUC"], row["PR_AUC_lo"], row["PR_AUC_hi"], brier_str,
+                model_name,
+                row["AUC"],
+                row["AUC_lo"],
+                row["AUC_hi"],
+                row["PR_AUC"],
+                row["PR_AUC_lo"],
+                row["PR_AUC_hi"],
+                brier_str,
             )
         if not benchmark_comparisons_df.empty:
-            logger.info("Paired benchmark comparisons: {} official candidate/reference pairs", len(benchmark_comparisons_df))
+            logger.info(
+                "Paired benchmark comparisons: {} official candidate/reference pairs",
+                len(benchmark_comparisons_df),
+            )
         if not experimental_benchmark_comparisons_df.empty:
             logger.warning(
                 "Experimental benchmark comparisons saved separately: {} candidate/reference pairs",
                 len(experimental_benchmark_comparisons_df),
             )
 
-    # 14b. Phase 3 ablations
     with _log_step("14b", "Phase 3 ablations"):
         ablation_results_df = run_phase3_ablations(
             X_estimation_base,
@@ -3094,32 +2765,39 @@ def main(
         ablation_results_df["population_mode"] = population_mode
         ablation_results_df["evaluation_population"] = "booked_proxy"
 
-    # 15. SHAP explainability
     with _log_step(15, "SHAP explainability"):
         compute_shap_analysis(models, X_test, num_cols, cat_cols, output_path)
 
-    # 16. WoE / IV analysis (fit partition only — excludes calibration holdout)
     with _log_step(16, "WoE / IV analysis"):
         woe_df, iv_df = compute_woe_iv(X_development_fit, y_development_fit, num_cols, cat_cols)
         woe_df.to_csv(output_path / "woe_detail.csv", index=False, float_format="%.6f")
         iv_df.to_csv(output_path / "iv_summary.csv", index=False, float_format="%.6f")
         logger.info("{} features analyzed ({:,} fit rows)", len(iv_df), len(X_development_fit))
-        for _, r in iv_df.head(15).iterrows():
+        for _, row in iv_df.head(15).iterrows():
             strength = (
-                "Useless" if r["iv"] < 0.02 else "Weak" if r["iv"] < 0.1
-                else "Medium" if r["iv"] < 0.3 else "Strong" if r["iv"] < 0.5
+                "Useless"
+                if row["iv"] < 0.02
+                else "Weak"
+                if row["iv"] < 0.1
+                else "Medium"
+                if row["iv"] < 0.3
+                else "Strong"
+                if row["iv"] < 0.5
                 else "Suspicious"
             )
-            logger.info("  {:<35s} IV={:.4f}  [{}]", r["feature"], r["iv"], strength)
+            logger.info("  {:<35s} IV={:.4f}  [{}]", row["feature"], row["iv"], strength)
 
-    # 17. PSI / CSI stability (fit partition only — excludes calibration holdout)
     with _log_step(17, "PSI / CSI stability"):
         run_stability_analysis(
-            X_development_fit_booked, X_test, train_scores, test_scores,
-            num_cols, cat_cols, output_path,
+            X_development_fit_booked,
+            X_test,
+            train_scores,
+            test_scores,
+            num_cols,
+            cat_cols,
+            output_path,
         )
 
-    # 17b. Lift table and threshold analysis
     with _log_step("17b", "Lift table and threshold analysis"):
         lift_tables = []
         threshold_tables = []
@@ -3134,9 +2812,12 @@ def main(
             logger.info("Lift table: {} rows across {} models", len(lift_table_df), lift_table_df["model"].nunique())
         if not threshold_analysis_df.empty:
             threshold_analysis_df.to_csv(output_path / "threshold_analysis.csv", index=False, float_format="%.6f")
-            logger.info("Threshold analysis: {} rows across {} models", len(threshold_analysis_df), threshold_analysis_df["model"].nunique())
+            logger.info(
+                "Threshold analysis: {} rows across {} models",
+                len(threshold_analysis_df),
+                threshold_analysis_df["model"].nunique(),
+            )
 
-    # 17c. Overfitting diagnostics — train vs test performance
     with _log_step("17c", "Overfitting diagnostics"):
         overfit_df = compute_overfit_report(
             y_development_fit_booked.values,
@@ -3148,24 +2829,39 @@ def main(
         if not overfit_df.empty:
             overfit_df.to_csv(output_path / "overfit_report.csv", index=False, float_format="%.6f")
             logger.info("Train vs test performance comparison:")
-            logger.info("{:<25s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>6s}",
-                        "Model", "Train AUC", "Test AUC", "AUC Δ", "Train PR", "Test PR", "PR Δ", "Flag")
+            logger.info(
+                "{:<25s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>6s}",
+                "Model",
+                "Train AUC",
+                "Test AUC",
+                "AUC Δ",
+                "Train PR",
+                "Test PR",
+                "PR Δ",
+                "Flag",
+            )
             logger.info("{}", "─" * 97)
             for _, row in overfit_df.iterrows():
                 logger.info(
                     "{:<25s} {:>10.4f} {:>10.4f} {:>+10.4f} {:>10.4f} {:>10.4f} {:>+10.4f} {:>6s}",
                     row["model"],
-                    row["train_auc"], row["test_auc"], row["auc_delta"],
-                    row["train_pr_auc"], row["test_pr_auc"], row["pr_auc_delta"],
+                    row["train_auc"],
+                    row["test_auc"],
+                    row["auc_delta"],
+                    row["train_pr_auc"],
+                    row["test_pr_auc"],
+                    row["pr_auc_delta"],
                     row["overfit_flag"],
                 )
             n_flagged = int((overfit_df["overfit_flag"] == "YES").sum())
             if n_flagged > 0:
-                logger.warning("{} model(s) flagged for potential overfitting (AUC or PR AUC delta > 0.03)", n_flagged)
+                logger.warning(
+                    "{} model(s) flagged for potential overfitting (AUC or PR AUC delta > 0.03)",
+                    n_flagged,
+                )
             else:
                 logger.info("No models flagged for overfitting")
 
-    # 17d. Model selection — weighted multi-criteria ranking
     with _log_step("17d", "Model selection"):
         model_selection_df = select_best_model(
             official_results_df,
@@ -3179,28 +2875,48 @@ def main(
             logger.info("Model selection scorecard (weights: discrimination=35%, stability=20%, calibration=15%, generalization=15%, lift=15%):")
             logger.info(
                 "{:<25s} {:>6s} {:>6s} {:>6s} {:>6s} {:>6s} {:>8s} {:>5s}",
-                "Model", "Disc.", "Calib.", "Stab.", "Gen.", "Lift", "Overall", "Rec.",
+                "Model",
+                "Disc.",
+                "Calib.",
+                "Stab.",
+                "Gen.",
+                "Lift",
+                "Overall",
+                "Rec.",
             )
             logger.info("{}", "─" * 87)
             for _, row in model_selection_df.iterrows():
                 logger.info(
                     "{:<25s} {:>6.1f} {:>6.1f} {:>6.1f} {:>6.1f} {:>6.1f} {:>8.1f} {:>5s}",
                     row["model"],
-                    row["discrimination_score"], row["calibration_score"],
-                    row["stability_score"], row["generalization_score"],
-                    row["lift_score"], row["weighted_score"],
+                    row["discrimination_score"],
+                    row["calibration_score"],
+                    row["stability_score"],
+                    row["generalization_score"],
+                    row["lift_score"],
+                    row["weighted_score"],
                     "<<<" if row["recommended"] else "",
                 )
             recommended = model_selection_df.loc[model_selection_df["recommended"]].iloc[0]
-            logger.info("Recommended model: {} (weighted score: {:.1f})", recommended["model"], recommended["weighted_score"])
+            logger.info(
+                "Recommended model: {} (weighted score: {:.1f})",
+                recommended["model"],
+                recommended["weighted_score"],
+            )
+            compute_shap_analysis(
+                models,
+                X_test,
+                num_cols,
+                cat_cols,
+                output_path,
+                preferred_model_name=str(recommended["model"]),
+            )
 
-    # 17e. Model governance artifacts
     with _log_step("17e", "Model governance artifacts"):
         iv_df_for_dict = None
         iv_path = output_path / "iv_summary.csv"
         if iv_path.exists():
             iv_df_for_dict = pd.read_csv(iv_path)
-
         generate_model_card(
             official_results_df,
             model_selection_df=model_selection_df if not model_selection_df.empty else None,
@@ -3211,33 +2927,44 @@ def main(
             output_path=output_path,
         )
         generate_variable_dictionary(
-            feature_cols, num_cols, cat_cols,
+            feature_cols,
+            num_cols,
+            cat_cols,
             feature_provenance_df=feature_provenance_df if not feature_provenance_df.empty else None,
             iv_df=iv_df_for_dict,
             output_path=output_path,
         )
         generate_data_quality_report(
-            X_development_fit, num_cols, cat_cols, output_path, label="development_fit",
+            X_development_fit,
+            num_cols,
+            cat_cols,
+            output_path,
+            label="development_fit",
         )
         generate_data_quality_report(
-            X_test, num_cols, cat_cols, output_path, label="test",
+            X_test,
+            num_cols,
+            cat_cols,
+            output_path,
+            label="test",
         )
 
-    # 18. Save artifacts
     with _log_step(18, "Save artifacts"):
         feat_imp = extract_feature_importance(models, num_cols, cat_cols)
-
         plots_dir = output_path / "plots"
         plots_dir.mkdir(parents=True, exist_ok=True)
         plot_score_distributions(
-            y_test.values, test_scores,
-            plots_dir / "score_dist_test.png", title_prefix="Test",
+            y_test.values,
+            test_scores,
+            plots_dir / "score_dist_test.png",
+            title_prefix="Test",
         )
         plot_score_distributions(
-            y_development_fit_booked.values, train_scores,
-            plots_dir / "score_dist_train.png", title_prefix="Train",
+            y_development_fit_booked.values,
+            train_scores,
+            plots_dir / "score_dist_train.png",
+            title_prefix="Train",
         )
-
         save_artifacts(
             models,
             official_results_df,
@@ -3247,6 +2974,8 @@ def main(
             benchmark_comparisons_df=benchmark_comparisons_df,
             experimental_benchmark_comparisons_df=experimental_benchmark_comparisons_df,
             feature_provenance_df=feature_provenance_df,
+            interaction_leaderboard_df=interaction_leaderboard_df,
+            feature_discovery_boundary_df=feature_discovery_boundary_df,
             ablation_results_df=ablation_results_df,
             rolling_oot_results_df=rolling_oot_results_df,
             rolling_oot_summary_df=rolling_oot_summary_df,
@@ -3261,13 +2990,17 @@ def main(
     return models, results_df
 
 
-if __name__ == "__main__":
-    import argparse
-
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train basel_bad classifier")
     parser.add_argument("--data-path", default="data/demand_direct.parquet", help="Path to parquet data file")
     parser.add_argument("--optuna-trials", type=int, default=50, help="Number of Optuna trials per model")
     parser.add_argument("--output-dir", default="output", help="Directory for saved models and artifacts")
+    parser.add_argument(
+        "--feature-discovery-fraction",
+        type=float,
+        default=FEATURE_DISCOVERY_FRACTION,
+        help="Fraction of pre-test booked rows reserved for feature discovery",
+    )
     parser.add_argument("--reject-inference", action="store_true", help="Enable reject inference via score-band parceling")
     parser.add_argument("--enable-experimental-stacking", action="store_true", help="Train and evaluate the experimental stacking ensemble")
     parser.add_argument(
@@ -3276,13 +3009,20 @@ if __name__ == "__main__":
         choices=[POPULATION_MODE_UNDERWRITING, POPULATION_MODE_BOOKED_MONITORING],
         help="Population design: underwriting applicant scoring or booked-only monitoring",
     )
-    args = parser.parse_args()
+    return parser
 
+def cli(argv: list[str] | None = None):
+    args = build_arg_parser().parse_args(argv)
     main(
         data_path=args.data_path,
         optuna_trials=args.optuna_trials,
         output_dir=args.output_dir,
+        feature_discovery_fraction=args.feature_discovery_fraction,
         reject_inference=args.reject_inference,
         enable_experimental_stacking=args.enable_experimental_stacking,
         population_mode=args.population_mode,
     )
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

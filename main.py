@@ -1,6 +1,7 @@
 def main():
-    print("Hello from direct-score!")
+    from training import cli
+    return cli()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

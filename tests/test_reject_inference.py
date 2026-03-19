@@ -7,18 +7,20 @@ import pandas as pd
 import pytest
 
 from training import (
+    augment_training_data,
+    compute_score_band_bad_rates,
+    create_reject_pseudo_labels,
+    load_data_with_rejects,
+)
+from training_constants import (
     REJECT_MAX_RATIO,
     REJECT_MULTIPLIER,
     REJECT_SAMPLE_WEIGHT,
     REJECT_SCORE_COL,
     SPLIT_DATE,
     TARGET,
-    augment_training_data,
-    compute_score_band_bad_rates,
-    create_reject_pseudo_labels,
-    engineer_features,
-    load_data_with_rejects,
 )
+from training_features import engineer_features
 
 
 class TestLoadDataWithRejects:

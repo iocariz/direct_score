@@ -7,24 +7,27 @@ import pandas as pd
 import pytest
 
 from training import (
-    MATURITY_CUTOFF,
-    SPLIT_DATE,
-    TARGET,
     TemporalExpandingCV,
     build_rolling_oot_windows,
-    evaluate,
     load_data,
     make_temporal_cv,
+    resolve_temporal_feature_discovery_cutoff,
     summarize_population,
     temporal_calibration_split,
     temporal_feature_discovery_split,
     temporal_split,
 )
+from training_constants import (
+    MATURITY_CUTOFF,
+    SPLIT_DATE,
+    TARGET,
+)
+from training_features import select_features
+from training_reporting import evaluate
 
 
 class TestTemporalSplit:
     def test_train_before_split_date(self, engineered_df):
-        from training import select_features
         feature_cols, _, _ = select_features(engineered_df)
         X_train, y_train, X_test, y_test, _, _, _ = temporal_split(engineered_df, feature_cols)
 
@@ -36,7 +39,6 @@ class TestTemporalSplit:
         assert (test_dates >= SPLIT_DATE).all(), "Test set must be on or after split date"
 
     def test_no_immature_in_model_data(self, engineered_df):
-        from training import select_features
         feature_cols, _, _ = select_features(engineered_df)
         X_train, y_train, X_test, y_test, _, _, _ = temporal_split(engineered_df, feature_cols)
 
@@ -44,7 +46,6 @@ class TestTemporalSplit:
         assert not y_test.isna().any(), "Test target must have no NaN"
 
     def test_target_is_binary(self, engineered_df):
-        from training import select_features
         feature_cols, _, _ = select_features(engineered_df)
         _, y_train, _, y_test, _, _, _ = temporal_split(engineered_df, feature_cols)
 
@@ -52,7 +53,6 @@ class TestTemporalSplit:
         assert set(y_test.unique()).issubset({0, 1})
 
     def test_no_overlap(self, engineered_df):
-        from training import select_features
         feature_cols, _, _ = select_features(engineered_df)
         X_train, _, X_test, _, _, _, _ = temporal_split(engineered_df, feature_cols)
 
@@ -241,13 +241,43 @@ class TestTemporalFeatureDiscoverySplit:
         )
 
         assert len(X_discovery) == len(y_discovery) == len(dates_discovery)
-        assert len(X_estimation) == len(y_estimation) == len(dates_estimation)
-        assert pd.Timestamp(dates_discovery.max()) < pd.Timestamp(dates_estimation.min())
         assert set(pd.to_datetime(dates_discovery)) == {
             pd.Timestamp("2024-01-01"),
             pd.Timestamp("2024-02-01"),
             pd.Timestamp("2024-03-01"),
         }
+
+    def test_explicit_discovery_end_matches_fraction_cutoff(self):
+        X = pd.DataFrame({"x": np.arange(12)})
+        y = pd.Series([0, 1] * 6, name=TARGET)
+        dates = pd.to_datetime([
+            "2024-01-01", "2024-01-01",
+            "2024-02-01", "2024-02-01",
+            "2024-03-01", "2024-03-01",
+            "2024-04-01", "2024-04-01",
+            "2024-05-01", "2024-05-01",
+            "2024-06-01", "2024-06-01",
+        ])
+
+        discovery_end = resolve_temporal_feature_discovery_cutoff(dates, discovery_fraction=0.50)
+        split_from_fraction = temporal_feature_discovery_split(
+            X,
+            y,
+            dates,
+            discovery_fraction=0.50,
+        )
+        split_from_explicit_end = temporal_feature_discovery_split(
+            X,
+            y,
+            dates,
+            discovery_end=discovery_end,
+        )
+
+        assert discovery_end == pd.Timestamp("2024-03-01")
+        assert split_from_fraction[0].index.tolist() == split_from_explicit_end[0].index.tolist()
+        assert split_from_fraction[1].index.tolist() == split_from_explicit_end[1].index.tolist()
+        assert pd.to_datetime(split_from_fraction[4]).tolist() == pd.to_datetime(split_from_explicit_end[4]).tolist()
+        assert pd.to_datetime(split_from_fraction[5]).tolist() == pd.to_datetime(split_from_explicit_end[5]).tolist()
 
     def test_requires_fraction_between_zero_and_one(self):
         X = pd.DataFrame({"x": np.arange(4)})

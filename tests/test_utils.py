@@ -5,7 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from training import _ks_statistic, _loo_target_encode, _safe_auc, MIN_VALID
+from training_constants import MIN_VALID
+from training_features import _loo_target_encode, _safe_auc
+from training_reporting import _ks_statistic
 
 
 # ── _loo_target_encode ────────────────────────────────────────────────────────
