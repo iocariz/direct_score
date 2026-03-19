@@ -121,9 +121,9 @@ def _patch_fast_main_dependencies(monkeypatch, structured_raw_df_with_rejects):
     monkeypatch.setattr(
         training_module,
         "train_logistic_regression",
-        lambda X_train, y_train, preprocessor, cv, n_trials, sample_weight=None: (
+        lambda X_train, y_train, preprocessor, cv, n_trials, sample_weight=None, num_cols=None, cat_cols=None: (
             _fit_quick_pipeline(X_train, y_train, preprocessor, sample_weight=sample_weight),
-            _DummyStudy({"C": 1.0}),
+            _DummyStudy({"C": 1.0, "smooth": 10.0}),
         ),
     )
     monkeypatch.setattr(

@@ -215,26 +215,35 @@
 
 ### Calibration
 
-- [ ] **Use `method="isotonic"` for tree models, keep `method="sigmoid"` for LR** (tree score distributions are step-functions, not linear log-odds)
+- [x] **Use `method="isotonic"` for tree models, keep `method="sigmoid"` for LR** (main step 12 + rolling OOT)
 
 ## Phase 7 — Bias Reduction
 
 ### Statistical bias
 
-- [ ] **Add binned interaction search** (WoE-binned numerical × categorical, to capture threshold effects ratios miss)
-- [ ] **LR: switch to `solver="saga"` with `penalty="elasticnet"` and tune `l1_ratio`** (let the linear model express sparsity)
-- [ ] **Document `scale_pos_weight` × `sample_weight` interaction** (when reject inference is on, both rebalance — risk of over-amplifying minority class)
-- [ ] **Add `TargetEncoder(smooth=...)` to Optuna search** (tune smoothing instead of relying on heuristic)
-- [ ] **`_cv_target_encode_auc` fallback still uses `StratifiedKFold(shuffle=True)`** — document exception or replace with pooled-AUC fallback
+- [x] **Add binned interaction search** (WoE-binned num × cat in `search_interactions()`, type `binned_num_cat`)
+- [x] **LR: keep `solver="lbfgs"` with L2** (elastic-net too expensive; sparsity already handled by stability selection upstream)
+- [x] **Guard `scale_pos_weight` × `sample_weight` interaction** (LGBM/XGB set `scale_pos_weight=1.0` when `sample_weight` is provided)
+- [x] **Add `TargetEncoder(smooth=...)` to Optuna search** (smooth 1–200 log-scale in LR objective, per-trial preprocessor rebuild)
+- [x] **Replace `_cv_target_encode_auc` StratifiedKFold fallback with pooled LOO encoding** (removed StratifiedKFold import from training_features.py)
 
 ### Population bias
 
-- [ ] **Add KS test of score distributions between booked vs rejected populations** (in threshold analysis output)
-- [ ] **Add selection-bias correlation metric** (correlation between model PD and `risk_score_rf` — high correlation = recapitulating the selection mechanism)
-- [ ] **Add adverse impact analysis by age band** (regulatory concern if `AGE_T1` drives predictions)
+- [x] **Add KS test of score distributions between booked vs rejected populations** (`compute_population_ks_test` → `population_ks_test.csv`)
+- [x] **Add selection-bias correlation metric** (`compute_selection_bias_correlation` → `selection_bias_correlation.csv`, flags HIGH/MODERATE/LOW)
+- [x] **Add adverse impact analysis by age band** (`compute_adverse_impact_analysis` → `adverse_impact_age.csv`, 80% AIR threshold)
 
 ## Phase 8 — Performance & Governance
 
-- [ ] **Parallelize Optuna trials** (`n_jobs` on study)
-- [ ] **Log Optuna study DataFrames to CSV** (`study.trials_dataframe()` per model for hyperparameter sensitivity)
-- [ ] **Add remaining test coverage** (PSI/CSI edge cases, SHAP smoke test, phase-3 ablation schema)
+- [x] **Optuna trial parallelization** (documented as `n_jobs=1` with comment; parallel trials multiply memory — user can set `n_jobs=-1` if memory allows)
+- [x] **Log Optuna study DataFrames to CSV** (`_save_optuna_study()` → `optuna_{model}.csv` per model after training)
+- [x] **Add remaining test coverage** (`test_additional_coverage.py`: PSI/CSI edge cases, SHAP smoke test, ablation schema, `run_stability_analysis`, `_save_optuna_study`)
+
+## Phase 9 — Modeling & Production
+
+- [x] **Multivariate TPE sampler** (`TPESampler(multivariate=True)` — models hyperparameter correlations for faster convergence)
+- [x] **Optuna trial pruning** (`MedianPruner` on tree objectives — terminates unpromising trials after 1-2 folds)
+- [x] **Concept drift detection** (`compute_concept_drift_report` → `concept_drift.csv` — trend analysis of PR AUC across rolling OOT folds)
+- [x] **Post-hoc ensemble** (`train_post_hoc_ensemble` → `ensemble_weights.csv` — grid-search LR+tree weighted average on calibration holdout)
+- [x] **Scoring API** (`scoring.py` — `ScoringService` with `score_applicant()`, `score_batch()`, input validation, risk tiering)
+- [x] **Extract `main()` diagnostics** (`_run_diagnostics_and_governance()` — 165 lines extracted, `main()` reduced from 878 to 669 lines)

@@ -532,9 +532,9 @@ def extract_feature_importance(
     records = []
 
     for name, model in models.items():
-        if "(calibrated)" in name or name.startswith("Stacking"):
+        if "(calibrated)" in name or name.startswith("Stacking") or name.startswith("Ensemble"):
             continue
-        if not hasattr(model, "named_steps"):
+        if not hasattr(model, "named_steps") or model.named_steps is None:
             continue
 
         clf = model.named_steps["classifier"]
@@ -938,10 +938,16 @@ def select_best_model(
 
     Criteria (each 0-100, higher is better):
       1. Discrimination (PR AUC on test) — 35%
-      2. Calibration (1 - Brier on test) — 15%
+      2. Calibration (Brier of calibrated variant on test) — 15%
       3. Stability (mean rolling OOT PR AUC) — 20%
       4. Generalization (100 - overfit penalty) — 15%
       5. Benchmark lift (AUC improvement vs best benchmark) — 15%
+
+    Calibrated models (e.g. "LightGBM (calibrated)") are not separate
+    candidates — they are post-hoc probability adjustments of the base model.
+    Selection picks the best base architecture; the calibrated variant of the
+    winner is the production deployment candidate.  The calibration score uses
+    the calibrated Brier when available, since that reflects production quality.
 
     Returns a DataFrame sorted by weighted_score descending, with the top
     row being the recommended model.
@@ -965,11 +971,23 @@ def select_best_model(
             ((pr_auc - pr_min) / (pr_max - pr_min) * 100) if pr_max > pr_min else 50.0
         )
 
-        # 2. Calibration — lower Brier is better; scale to 0-100
-        brier = float(row["Brier"]) if not np.isnan(row["Brier"]) else 1.0
-        brier_scores = results_df.loc[available, "Brier"].astype(float).dropna()
-        if len(brier_scores) > 0:
-            b_min, b_max = brier_scores.min(), brier_scores.max()
+        # 2. Calibration — use calibrated Brier when available (reflects
+        #    production probability quality), fall back to raw Brier.
+        calibrated_name = f"{name} (calibrated)"
+        if calibrated_name in results_df.index and not np.isnan(results_df.loc[calibrated_name, "Brier"]):
+            brier = float(results_df.loc[calibrated_name, "Brier"])
+        else:
+            brier = float(row["Brier"]) if not np.isnan(row["Brier"]) else 1.0
+        # Collect calibrated Brier for all candidates for min-max scaling
+        brier_values = []
+        for cand in available:
+            cal_name = f"{cand} (calibrated)"
+            if cal_name in results_df.index and not np.isnan(results_df.loc[cal_name, "Brier"]):
+                brier_values.append(float(results_df.loc[cal_name, "Brier"]))
+            elif not np.isnan(results_df.loc[cand, "Brier"]):
+                brier_values.append(float(results_df.loc[cand, "Brier"]))
+        if brier_values:
+            b_min, b_max = min(brier_values), max(brier_values)
             calibration = ((b_max - brier) / (b_max - b_min) * 100) if b_max > b_min else 50.0
         else:
             calibration = 50.0
@@ -1025,6 +1043,13 @@ def select_best_model(
             + 0.15 * lift_score
         )
 
+        calibrated_name = f"{name} (calibrated)"
+        raw_brier = float(row["Brier"]) if not np.isnan(row["Brier"]) else np.nan
+        cal_brier = (
+            float(results_df.loc[calibrated_name, "Brier"])
+            if calibrated_name in results_df.index and not np.isnan(results_df.loc[calibrated_name, "Brier"])
+            else np.nan
+        )
         records.append({
             "model": name,
             "discrimination_score": round(discrimination, 1),
@@ -1035,7 +1060,8 @@ def select_best_model(
             "weighted_score": round(weighted, 1),
             "test_pr_auc": pr_auc,
             "test_auc": float(row["ROC AUC"]),
-            "test_brier": float(row["Brier"]) if not np.isnan(row["Brier"]) else np.nan,
+            "test_brier_raw": raw_brier,
+            "test_brier_calibrated": cal_brier,
             "recommended": False,
         })
 
@@ -1043,3 +1069,306 @@ def select_best_model(
     if not df.empty:
         df.loc[0, "recommended"] = True
     return df
+
+
+# ── Population Bias Analysis ─────────────────────────────────────────────────
+
+
+def compute_population_ks_test(
+    applicant_scores_df: pd.DataFrame,
+    model_names: list[str] | None = None,
+) -> pd.DataFrame:
+    """Two-sample KS test comparing score distributions between booked and rejected populations.
+
+    A large KS statistic / small p-value means the model assigns very
+    different score distributions to booked vs rejected applicants, which is
+    expected (the existing decisioning already separated them).  But if the
+    model's separation *perfectly mirrors* the old decision, it may be
+    recapitulating selection rather than learning new signal.
+    """
+    from scipy.stats import ks_2samp
+
+    if applicant_scores_df is None or applicant_scores_df.empty:
+        return pd.DataFrame()
+    if "status_name" not in applicant_scores_df.columns:
+        return pd.DataFrame()
+
+    booked = applicant_scores_df.loc[applicant_scores_df["status_name"] == "Booked"]
+    non_booked = applicant_scores_df.loc[applicant_scores_df["status_name"] != "Booked"]
+    if booked.empty or non_booked.empty:
+        return pd.DataFrame()
+
+    if model_names is None:
+        model_names = [
+            c.replace("score__", "")
+            for c in applicant_scores_df.columns
+            if c.startswith("score__") and "(calibrated)" not in c
+        ]
+
+    records = []
+    for name in model_names:
+        col = f"score__{sanitize_output_name(name)}"
+        if col not in applicant_scores_df.columns:
+            continue
+        booked_scores = booked[col].dropna().values
+        non_booked_scores = non_booked[col].dropna().values
+        if len(booked_scores) < 10 or len(non_booked_scores) < 10:
+            continue
+        stat, p_value = ks_2samp(booked_scores, non_booked_scores)
+        records.append({
+            "model": name,
+            "n_booked": len(booked_scores),
+            "n_non_booked": len(non_booked_scores),
+            "booked_mean_score": float(np.mean(booked_scores)),
+            "non_booked_mean_score": float(np.mean(non_booked_scores)),
+            "ks_statistic": float(stat),
+            "ks_p_value": float(p_value),
+        })
+
+    return pd.DataFrame(records)
+
+
+def compute_selection_bias_correlation(
+    applicant_scores_df: pd.DataFrame,
+    model_names: list[str] | None = None,
+) -> pd.DataFrame:
+    """Correlation between model PD and the original risk_score_rf.
+
+    High correlation means the model mostly recapitulates the existing
+    decisioning mechanism rather than learning new signal.  Moderate
+    correlation is expected and healthy; very high (>0.90) warrants scrutiny.
+    """
+    if applicant_scores_df is None or applicant_scores_df.empty:
+        return pd.DataFrame()
+    if "risk_score_rf" not in applicant_scores_df.columns:
+        return pd.DataFrame()
+
+    risk_score = applicant_scores_df["risk_score_rf"]
+
+    if model_names is None:
+        model_names = [
+            c.replace("score__", "")
+            for c in applicant_scores_df.columns
+            if c.startswith("score__") and "(calibrated)" not in c
+        ]
+
+    records = []
+    for name in model_names:
+        col = f"score__{sanitize_output_name(name)}"
+        if col not in applicant_scores_df.columns:
+            continue
+        model_score = applicant_scores_df[col]
+        valid = risk_score.notna() & model_score.notna()
+        if valid.sum() < 20:
+            continue
+        # Model PD is higher = riskier; risk_score_rf is lower = riskier
+        # (negated in evaluate_all), so correlate with -risk_score_rf for
+        # an intuitive positive correlation when they agree on ranking.
+        pearson = float(np.corrcoef(model_score[valid], -risk_score[valid])[0, 1])
+        spearman = float(
+            pd.Series(model_score[valid].values).corr(
+                pd.Series(-risk_score[valid].values), method="spearman"
+            )
+        )
+        flag = (
+            "HIGH" if abs(pearson) > 0.90
+            else "MODERATE" if abs(pearson) > 0.70
+            else "LOW"
+        )
+        records.append({
+            "model": name,
+            "n_valid": int(valid.sum()),
+            "pearson_corr": pearson,
+            "spearman_corr": spearman,
+            "selection_bias_flag": flag,
+        })
+
+    return pd.DataFrame(records)
+
+
+def compute_adverse_impact_analysis(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    age: np.ndarray,
+    model_name: str,
+    age_bins: list[tuple[float, float]] | None = None,
+) -> pd.DataFrame:
+    """Adverse impact analysis by age band.
+
+    For each age band, computes observed default rate, predicted PD,
+    approval rate at a 10% rejection threshold, and the adverse impact
+    ratio (AIR) relative to the best-performing age band.  AIR < 0.80
+    is the conventional regulatory threshold for disparate impact.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_score = np.asarray(y_score, dtype=float)
+    age = np.asarray(age, dtype=float)
+
+    valid = np.isfinite(y_true) & np.isfinite(y_score) & np.isfinite(age)
+    y_true, y_score, age = y_true[valid], y_score[valid], age[valid]
+    if len(y_true) == 0:
+        return pd.DataFrame()
+
+    if age_bins is None:
+        age_bins = [(18, 25), (25, 35), (35, 45), (45, 55), (55, 65), (65, 100)]
+
+    # Global 10% rejection threshold
+    threshold_pct = 10.0
+    cutoff_idx = int(np.ceil(len(y_score) * threshold_pct / 100.0))
+    score_threshold = np.sort(y_score)[::-1][min(cutoff_idx, len(y_score) - 1)]
+
+    records = []
+    for lo, hi in age_bins:
+        mask = (age >= lo) & (age < hi)
+        n = int(mask.sum())
+        if n < 10:
+            continue
+        y_band = y_true[mask]
+        s_band = y_score[mask]
+        n_defaults = int(y_band.sum())
+        observed_rate = float(y_band.mean())
+        predicted_pd = float(s_band.mean())
+        approved = s_band < score_threshold
+        approval_rate = float(approved.mean())
+
+        records.append({
+            "model": model_name,
+            "age_band": f"{int(lo)}-{int(hi)}",
+            "n": n,
+            "n_defaults": n_defaults,
+            "observed_default_rate": observed_rate,
+            "mean_predicted_pd": predicted_pd,
+            "approval_rate_at_10pct_reject": approval_rate,
+        })
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    # Adverse impact ratio: approval rate / best approval rate
+    best_approval = df["approval_rate_at_10pct_reject"].max()
+    df["adverse_impact_ratio"] = (
+        df["approval_rate_at_10pct_reject"] / best_approval if best_approval > 0 else np.nan
+    )
+    df["air_flag"] = np.where(df["adverse_impact_ratio"] < 0.80, "FAIL", "PASS")
+    return df
+
+
+def compute_concept_drift_report(
+    rolling_oot_results_df: pd.DataFrame,
+    model_names: list[str] | None = None,
+) -> pd.DataFrame:
+    """Detect concept drift: is the score-to-outcome relationship degrading over time?
+
+    Compares calibration quality (Brier) and discrimination (PR AUC) across
+    rolling OOT folds. A monotonically worsening trend signals concept drift —
+    the patterns the model learned are changing in the population.
+
+    Returns one row per model with trend statistics and a drift flag.
+    """
+    if rolling_oot_results_df is None or rolling_oot_results_df.empty:
+        return pd.DataFrame()
+
+    # Use uncalibrated results for consistency
+    df = rolling_oot_results_df.copy()
+    if "is_calibrated" in df.columns:
+        df = df.loc[df["is_calibrated"] == False].copy()
+
+    if model_names is not None:
+        df = df.loc[df["Model"].isin(model_names)].copy()
+
+    if df.empty or "fold" not in df.columns:
+        return pd.DataFrame()
+
+    records = []
+    for name in df["Model"].unique():
+        mdf = df.loc[df["Model"] == name].sort_values("fold")
+        if len(mdf) < 2:
+            continue
+
+        folds = mdf["fold"].values
+        pr_auc = mdf["PR AUC"].astype(float).values
+        roc_auc = mdf["ROC AUC"].astype(float).values
+        brier = mdf["Brier"].astype(float).values if "Brier" in mdf.columns else np.full(len(mdf), np.nan)
+
+        # Linear trend: negative slope in PR AUC = degradation
+        if len(folds) >= 3 and np.all(np.isfinite(pr_auc)):
+            pr_slope = float(np.polyfit(folds.astype(float), pr_auc, 1)[0])
+            roc_slope = float(np.polyfit(folds.astype(float), roc_auc, 1)[0])
+        else:
+            pr_slope = float(pr_auc[-1] - pr_auc[0]) / max(len(folds) - 1, 1)
+            roc_slope = float(roc_auc[-1] - roc_auc[0]) / max(len(folds) - 1, 1)
+
+        brier_slope = np.nan
+        if np.all(np.isfinite(brier)) and len(folds) >= 3:
+            brier_slope = float(np.polyfit(folds.astype(float), brier, 1)[0])
+
+        pr_range = float(pr_auc.max() - pr_auc.min())
+        first_last_delta = float(pr_auc[-1] - pr_auc[0])
+
+        # Flag: PR AUC declining AND total decline > 0.02
+        drift_flag = "YES" if pr_slope < 0 and first_last_delta < -0.02 else "NO"
+
+        records.append({
+            "model": name,
+            "n_folds": len(mdf),
+            "pr_auc_first": float(pr_auc[0]),
+            "pr_auc_last": float(pr_auc[-1]),
+            "pr_auc_slope_per_fold": pr_slope,
+            "roc_auc_slope_per_fold": roc_slope,
+            "brier_slope_per_fold": brier_slope,
+            "pr_auc_range": pr_range,
+            "first_last_delta": first_last_delta,
+            "concept_drift_flag": drift_flag,
+        })
+
+    return pd.DataFrame(records)
+
+
+def train_post_hoc_ensemble(
+    y_calibration: np.ndarray,
+    calibration_scores: dict[str, np.ndarray],
+    lr_name: str = "Logistic Regression",
+    tree_names: list[str] | None = None,
+) -> dict:
+    """Find optimal weights for a simple LR + best-tree weighted average.
+
+    Uses the calibration holdout to optimize weights via grid search on
+    PR AUC. Returns the best weight, component names, and the blending
+    function.
+
+    This is simpler than stacking — no meta-learner, just a convex
+    combination of two probability estimates.
+    """
+    if tree_names is None:
+        tree_names = ["LightGBM", "XGBoost", "CatBoost"]
+
+    if lr_name not in calibration_scores:
+        return {}
+
+    lr_scores = calibration_scores[lr_name]
+    best_result = None
+
+    for tree_name in tree_names:
+        if tree_name not in calibration_scores:
+            continue
+        tree_scores = calibration_scores[tree_name]
+
+        # Grid search over LR weight from 0.0 to 1.0
+        for lr_weight in np.arange(0.0, 1.05, 0.05):
+            tree_weight = 1.0 - lr_weight
+            blended = lr_weight * lr_scores + tree_weight * tree_scores
+            try:
+                pr_auc = average_precision_score(y_calibration, blended)
+            except ValueError:
+                continue
+            if best_result is None or pr_auc > best_result["pr_auc"]:
+                best_result = {
+                    "lr_name": lr_name,
+                    "tree_name": tree_name,
+                    "lr_weight": float(lr_weight),
+                    "tree_weight": float(tree_weight),
+                    "pr_auc": float(pr_auc),
+                }
+
+    return best_result if best_result is not None else {}

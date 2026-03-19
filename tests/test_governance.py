@@ -46,7 +46,7 @@ class TestGenerateModelCard:
             "weighted_score": [78.5],
             "test_auc": [0.85],
             "test_pr_auc": [0.18],
-            "test_brier": [0.055],
+            "test_brier_raw": [0.055], "test_brier_calibrated": [0.050],
             "recommended": [True],
         })
         path = generate_model_card(results_df, selection_df, None, None, None, None, tmp_path)
@@ -79,7 +79,7 @@ class TestGenerateModelCard:
             "weighted_score": [78.5],
             "test_auc": [0.85],
             "test_pr_auc": [0.18],
-            "test_brier": [0.055],
+            "test_brier_raw": [0.055], "test_brier_calibrated": [0.050],
             "recommended": [True],
         })
 

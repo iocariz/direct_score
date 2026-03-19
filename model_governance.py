@@ -153,7 +153,7 @@ def generate_model_card(
         if recommended_row is not None:
             headline_auc = recommended_results_row.get("ROC AUC") if recommended_results_row is not None else recommended_row.get("test_auc")
             headline_pr_auc = recommended_results_row.get("PR AUC") if recommended_results_row is not None else recommended_row.get("test_pr_auc")
-            headline_brier = recommended_results_row.get("Brier") if recommended_results_row is not None else recommended_row.get("test_brier")
+            headline_brier = recommended_results_row.get("Brier") if recommended_results_row is not None else recommended_row.get("test_brier_calibrated", recommended_row.get("test_brier_raw", recommended_row.get("test_brier")))
             lines.append(
                 "- Held-out performance: "
                 f"ROC AUC {_format_metric(headline_auc)}, "
@@ -215,7 +215,7 @@ def generate_model_card(
     if recommended_row is not None:
         display_auc = recommended_results_row.get("ROC AUC") if recommended_results_row is not None else recommended_row.get("test_auc")
         display_pr_auc = recommended_results_row.get("PR AUC") if recommended_results_row is not None else recommended_row.get("test_pr_auc")
-        display_brier = recommended_results_row.get("Brier") if recommended_results_row is not None else recommended_row.get("test_brier")
+        display_brier = recommended_results_row.get("Brier") if recommended_results_row is not None else recommended_row.get("test_brier_calibrated", recommended_row.get("test_brier_raw", recommended_row.get("test_brier")))
         lines.append(f"Model:                  {recommended_row['model']}")
         lines.append(f"Weighted score:         {_format_metric(recommended_row['weighted_score'], digits=1)} / 100")
         lines.append(f"Test ROC AUC:           {_format_metric(display_auc)}")

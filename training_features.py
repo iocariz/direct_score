@@ -14,7 +14,6 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler, TargetEncoder
 
@@ -110,14 +109,14 @@ def _safe_auc(y: np.ndarray, s: np.ndarray) -> tuple[float, int]:
 def _cv_target_encode_auc(
     groups: np.ndarray, y: np.ndarray, n_splits: int = 5,
 ) -> tuple[float, int]:
-    """K-fold cross-validated target-encoded AUC (eliminates in-sample bias)."""
-    kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
-    encoded = np.full(len(y), np.nan)
-    for train_idx, val_idx in kf.split(groups, y):
-        df_fold = pd.DataFrame({"group": groups[train_idx], "y": y[train_idx]})
-        means = df_fold.groupby("group")["y"].mean()
-        global_mean = y[train_idx].mean()
-        encoded[val_idx] = pd.Series(groups[val_idx]).map(means).fillna(global_mean).values
+    """Pooled leave-one-out target-encoded AUC.
+
+    Used as a fallback when temporal splits are unavailable (too few date
+    blocks).  Earlier versions used StratifiedKFold(shuffle=True) here, but
+    that introduced random splitting inside a temporal pipeline.  The LOO
+    encoder already eliminates in-sample bias without needing CV folds.
+    """
+    encoded = _loo_target_encode(groups, y)
     return _safe_auc(y, encoded)
 
 
@@ -325,6 +324,45 @@ def search_interactions(
                 "scoring_strategy": categorical_scoring_strategy,
             })
 
+    # Binned numerical × categorical interactions (captures threshold effects)
+    binned_pairs = [
+        (num, cat)
+        for num in screened_num_cols
+        for cat in screened_cat_cols
+    ]
+    if binned_pairs:
+        logger.info("Screening {} binned num x cat pairs", len(binned_pairs))
+    for num, cat in tqdm(binned_pairs, desc="Binned num x cat", leave=False):
+        vals = df_search[num].values.astype(float)
+        valid = np.isfinite(vals)
+        if valid.sum() < 50:
+            continue
+        try:
+            binned = pd.qcut(pd.Series(vals[valid]), q=5, duplicates="drop")
+            bin_labels = np.full(len(vals), "missing", dtype=object)
+            bin_labels[valid] = binned.astype(str).values
+        except Exception:
+            continue
+        combo = np.char.add(np.char.add(bin_labels, "_"), df_search[cat].astype(str).values)
+        auc_bc, _ = _temporal_target_encode_auc(combo, y_search, dates_search, temporal_splits=temporal_splits)
+        if not np.isnan(auc_bc):
+            feat_num_power = base_auc.get(num, 0)
+            feat_cat_power = base_auc.get(cat, 0)
+            parent_power = max(feat_num_power, feat_cat_power)
+            power = abs(auc_bc - 0.5)
+            lift = power - parent_power
+            results.append({
+                "name": f"BIN_{num}_x_{cat}", "type": "binned_num_cat",
+                "auc": auc_bc, "lift": lift,
+                "feat_a": num, "feat_b": cat,
+                "feat_a_power": feat_num_power,
+                "feat_b_power": feat_cat_power,
+                "parent_power": parent_power,
+                "power": power,
+                "selected": lift >= MIN_LIFT,
+                "scoring_strategy": categorical_scoring_strategy,
+            })
+
     leaderboard_cols = [
         "name", "type", "auc", "lift", "feat_a", "feat_b",
         "feat_a_power", "feat_b_power", "parent_power", "power",
@@ -338,9 +376,10 @@ def search_interactions(
         n_ratio = int((selected_results["type"] == "ratio").sum())
         n_product = int((selected_results["type"] == "product").sum())
         n_cat = int((selected_results["type"] == "cat_concat").sum())
+        n_binned = int((selected_results["type"] == "binned_num_cat").sum())
         logger.info(
-            "Found {} interactions (>= {:.0%} lift): {} ratio, {} product, {} cat",
-            len(selected_results), MIN_LIFT, n_ratio, n_product, n_cat,
+            "Found {} interactions (>= {:.0%} lift): {} ratio, {} product, {} cat, {} binned",
+            len(selected_results), MIN_LIFT, n_ratio, n_product, n_cat, n_binned,
         )
         top = selected_results.head(5)
         for _, r in top.iterrows():
@@ -392,6 +431,16 @@ def add_interactions(df: pd.DataFrame, all_results: pd.DataFrame) -> pd.DataFram
             df[col_name] = df[a] * df[b]
         elif row["type"] == "cat_concat":
             df[col_name] = df[a].astype(str) + "_" + df[b].astype(str)
+        elif row["type"] == "binned_num_cat":
+            vals = df[a].values.astype(float)
+            valid = np.isfinite(vals)
+            bin_labels = np.full(len(vals), "missing", dtype=object)
+            try:
+                binned = pd.qcut(pd.Series(vals[valid]), q=5, duplicates="drop")
+                bin_labels[valid] = binned.astype(str).values
+            except Exception:
+                bin_labels[valid] = "single_bin"
+            df[col_name] = np.char.add(np.char.add(bin_labels, "_"), df[b].astype(str).values)
         added.append(col_name)
         existing.add(col_name)
 
@@ -603,14 +652,14 @@ def build_feature_provenance(
     return pd.DataFrame(records).sort_values(["provenance", "feature"]).reset_index(drop=True)
 
 
-def build_preprocessors(num_cols: list[str], cat_cols: list[str]):
+def build_preprocessors(num_cols: list[str], cat_cols: list[str], target_encoder_smooth="auto"):
     num_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
     ])
     cat_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-        ("encoder", TargetEncoder(smooth="auto", cv=5, random_state=RANDOM_STATE)),
+        ("encoder", TargetEncoder(smooth=target_encoder_smooth, cv=5, random_state=RANDOM_STATE)),
     ])
     preprocessor = ColumnTransformer([
         ("num", num_transformer, num_cols),

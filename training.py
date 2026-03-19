@@ -89,7 +89,11 @@ from training_reporting import (
     _score_metric,
     bootstrap_confidence_intervals,
     build_holdout_score_frame,
+    compute_adverse_impact_analysis,
+    compute_concept_drift_report,
     compute_overfit_report,
+    compute_population_ks_test,
+    compute_selection_bias_correlation,
     create_lift_table,
     create_threshold_analysis,
     delong_auc_test,
@@ -104,6 +108,7 @@ from training_reporting import (
     save_artifacts,
     select_best_model,
     split_leaderboard_results,
+    train_post_hoc_ensemble,
 )
 import training_features as _training_features
 from training_features import (
@@ -177,6 +182,36 @@ def _log_step(step_num: int | str, description: str):
         logger.info("  done ({:.0f}m {:.0f}s)", elapsed // 60, elapsed % 60)
     else:
         logger.info("  done ({:.1f}s)", elapsed)
+
+
+class EnsembleModel:
+    """Lightweight wrapper that blends two pipelines' predict_proba outputs."""
+
+    def __init__(self, model_a, model_b, weight_a: float, weight_b: float, name: str = "Ensemble"):
+        self._a, self._b = model_a, model_b
+        self._wa, self._wb = weight_a, weight_b
+        self.name = name
+
+    def predict_proba(self, X):
+        pa = self._a.predict_proba(X)
+        pb = self._b.predict_proba(X)
+        return self._wa * pa + self._wb * pb
+
+    @property
+    def named_steps(self):
+        return None  # Not a Pipeline — skip feature importance extraction
+
+
+def _save_optuna_study(study: optuna.Study, output_dir: Path, model_name: str) -> None:
+    """Save Optuna trial history as CSV for hyperparameter sensitivity analysis."""
+    try:
+        trials_df = study.trials_dataframe()
+        safe_name = model_name.lower().replace(" ", "_")
+        path = output_dir / f"optuna_{safe_name}.csv"
+        trials_df.to_csv(path, index=False, float_format="%.6f")
+        logger.info("Saved Optuna study for {}: {} ({} trials)", model_name, path, len(trials_df))
+    except Exception as exc:
+        logger.warning("Could not save Optuna study for {}: {}", model_name, exc)
 
 
 # ── Temporal CV ────────────────────────────────────────────────────────────────
@@ -771,8 +806,16 @@ def augment_training_data(
 
 # ── Preprocessors ──────────────────────────────────────────────────────────────
 
-def build_preprocessors(num_cols: list[str], cat_cols: list[str]):
-    return _training_features.build_preprocessors(num_cols, cat_cols)
+def build_preprocessors(
+    num_cols: list[str],
+    cat_cols: list[str],
+    target_encoder_smooth="auto",
+):
+    return _training_features.build_preprocessors(
+        num_cols,
+        cat_cols,
+        target_encoder_smooth=target_encoder_smooth,
+    )
 
 
 def build_monotone_constraints(num_cols: list[str], cat_cols: list[str]) -> list[int]:
@@ -800,49 +843,57 @@ def normalize_xgboost_monotone_constraints(monotone_constraints):
     return monotone_constraints
 
 
-def train_logistic_regression(X_train, y_train, preprocessor, cv, n_trials: int, sample_weight=None):
-    logger.info("Optuna: {} trials x {} folds", n_trials, cv.n_splits)
-
-    # Precompute preprocessed folds once (TargetEncoder is expensive).
-    logger.info("Precomputing {} CV folds (TargetEncoder fit)...", cv.n_splits)
-    precomputed_folds = []
-    for train_idx, val_idx in cv.split(X_train, y_train):
-        pre = clone(preprocessor)
-        X_tr_t = pre.fit_transform(X_train.iloc[train_idx], y=y_train.iloc[train_idx])
-        X_va_t = pre.transform(X_train.iloc[val_idx])
-        w_fold = sample_weight[train_idx] if sample_weight is not None else None
-        precomputed_folds.append((X_tr_t, y_train.iloc[train_idx], X_va_t, y_train.iloc[val_idx], w_fold))
-    logger.info("Optuna: {} trials x {} folds (preprocessed)", n_trials, cv.n_splits)
+def train_logistic_regression(X_train, y_train, preprocessor, cv, n_trials: int, sample_weight=None,
+                              num_cols: list[str] | None = None, cat_cols: list[str] | None = None):
+    logger.info("Optuna: {} trials x {} folds (LR L2 + TargetEncoder smooth tuning)",
+                n_trials, cv.n_splits)
+    folds = list(cv.split(X_train, y_train))
 
     def objective(trial):
         C = trial.suggest_float("C", 1e-4, 100.0, log=True)
+        smooth = trial.suggest_float("smooth", 1.0, 200.0, log=True)
 
         fold_scores = []
-        for X_tr_t, y_f_tr, X_va_t, y_f_va, w_fold in precomputed_folds:
+        for train_idx, val_idx in folds:
+            if num_cols is not None and cat_cols is not None:
+                pre = build_preprocessors(num_cols, cat_cols, target_encoder_smooth=smooth)[0]
+            else:
+                pre = clone(preprocessor)
+            X_tr_t = pre.fit_transform(X_train.iloc[train_idx], y=y_train.iloc[train_idx])
+            X_va_t = pre.transform(X_train.iloc[val_idx])
+            w_fold = sample_weight[train_idx] if sample_weight is not None else None
             clf = LogisticRegression(
-                C=C,
-                class_weight="balanced", max_iter=5000,
-                random_state=RANDOM_STATE, solver="lbfgs",
+                C=C, class_weight="balanced",
+                max_iter=5000, random_state=RANDOM_STATE, solver="lbfgs",
             )
-            clf.fit(X_tr_t, y_f_tr, sample_weight=w_fold)
+            clf.fit(X_tr_t, y_train.iloc[train_idx], sample_weight=w_fold)
             y_pred = clf.predict_proba(X_va_t)[:, 1]
-            fold_scores.append(average_precision_score(y_f_va, y_pred))
+            fold_scores.append(average_precision_score(y_train.iloc[val_idx], y_pred))
 
         return np.mean(fold_scores)
 
-    study = optuna.create_study(direction="maximize", study_name="lr")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    study = optuna.create_study(
+        direction="maximize", study_name="lr",
+        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
+    )
+    # n_jobs=1: sequential trials. Tree objectives use n_jobs=1 per fold
+    # to avoid contention; parallel trials would multiply memory usage.
+    # Set n_jobs=-1 for parallel trials if memory allows.
+    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
 
     bp = study.best_params
     logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
-    logger.info("  C={:.4f}", bp["C"])
+    logger.info("  C={:.4f}, smooth={:.1f} (penalty=l2, solver=lbfgs)", bp["C"], bp["smooth"])
 
+    if num_cols is not None and cat_cols is not None:
+        best_preprocessor = build_preprocessors(num_cols, cat_cols, target_encoder_smooth=bp["smooth"])[0]
+    else:
+        best_preprocessor = preprocessor
     lr_model = Pipeline([
-        ("preprocessor", preprocessor),
+        ("preprocessor", best_preprocessor),
         ("classifier", LogisticRegression(
-            C=bp["C"],
-            class_weight="balanced", max_iter=5000,
-            random_state=RANDOM_STATE, solver="lbfgs",
+            C=bp["C"], class_weight="balanced",
+            max_iter=5000, random_state=RANDOM_STATE, solver="lbfgs",
         )),
     ])
     lr_model.fit(X_train, y_train, classifier__sample_weight=sample_weight)
@@ -856,6 +907,13 @@ def _lgbm_prauc_eval(y_true, y_raw):
 
 
 def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight, cv, n_trials: int, sample_weight=None, monotone_constraints=None):
+    # When sample_weight is provided (e.g. reject inference), it already
+    # rebalances the class distribution.  Combining it with scale_pos_weight
+    # would over-amplify the minority class, biasing the model toward
+    # predicting more defaults than warranted.
+    effective_pos_weight = 1.0 if sample_weight is not None else pos_weight
+    if sample_weight is not None and pos_weight != 1.0:
+        logger.info("sample_weight provided — disabling scale_pos_weight to avoid double-rebalancing")
     logger.info("Optuna: {} trials x {} folds, early stopping after {} rounds",
                 n_trials, cv.n_splits, EARLY_STOPPING_ROUNDS)
     lgbm_subsample_freq = 1
@@ -879,7 +937,7 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
         fold_scores = []
         fold_best_iters = []
         folds = list(cv.split(X_train, y_train))
-        for train_idx, val_idx in tqdm(folds, desc=f"  Trial {trial.number} folds", leave=False):
+        for fold_i, (train_idx, val_idx) in enumerate(tqdm(folds, desc=f"  Trial {trial.number} folds", leave=False)):
             X_f_tr = X_train.iloc[train_idx]
             y_f_tr = y_train.iloc[train_idx]
             X_f_va = X_train.iloc[val_idx]
@@ -892,7 +950,7 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
 
             clf = LGBMClassifier(
                 n_estimators=N_ESTIMATORS_CEILING,
-                scale_pos_weight=pos_weight,
+                scale_pos_weight=effective_pos_weight,
                 monotone_constraints=monotone_constraints,
                 random_state=RANDOM_STATE, n_jobs=1, verbosity=-1,
                 **params,
@@ -912,14 +970,26 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
             fold_scores.append(average_precision_score(y_f_va, y_pred))
             fold_best_iters.append(normalize_estimator_count(clf.best_iteration_, fallback=N_ESTIMATORS_CEILING))
 
+            # Report intermediate result for pruning
+            trial.report(np.mean(fold_scores), fold_i)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
         trial.set_user_attr(
             "best_n_estimators",
             select_conservative_boosting_rounds(fold_best_iters, fallback=N_ESTIMATORS_CEILING),
         )
         return np.mean(fold_scores)
 
-    study = optuna.create_study(direction="maximize", study_name="lgbm")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    study = optuna.create_study(
+        direction="maximize", study_name="lgbm",
+        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+    )
+    # n_jobs=1: sequential trials. Tree objectives use n_jobs=1 per fold
+    # to avoid contention; parallel trials would multiply memory usage.
+    # Set n_jobs=-1 for parallel trials if memory allows.
+    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
 
     best_n_estimators = normalize_estimator_count(
         study.best_trial.user_attrs["best_n_estimators"],
@@ -936,7 +1006,7 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
         ("preprocessor", lgbm_preprocessor),
         ("classifier", LGBMClassifier(
             n_estimators=best_n_estimators,
-            scale_pos_weight=pos_weight,
+            scale_pos_weight=effective_pos_weight,
             subsample_freq=lgbm_subsample_freq,
             monotone_constraints=monotone_constraints,
             random_state=RANDOM_STATE, n_jobs=-1, verbosity=-1,
@@ -951,6 +1021,10 @@ def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight
 
 
 def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int, sample_weight=None, monotone_constraints=None):
+    # Same guard as LGBM: skip scale_pos_weight when sample_weight handles rebalancing.
+    effective_pos_weight = 1.0 if sample_weight is not None else pos_weight
+    if sample_weight is not None and pos_weight != 1.0:
+        logger.info("sample_weight provided — disabling scale_pos_weight to avoid double-rebalancing")
     logger.info("Optuna: {} trials x {} folds, early stopping after {} rounds",
                 n_trials, cv.n_splits, EARLY_STOPPING_ROUNDS)
     xgb_monotone_constraints = normalize_xgboost_monotone_constraints(monotone_constraints)
@@ -971,7 +1045,7 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
         fold_scores = []
         fold_best_iters = []
         folds = list(cv.split(X_train, y_train))
-        for train_idx, val_idx in tqdm(folds, desc=f"  Trial {trial.number} folds", leave=False):
+        for fold_i, (train_idx, val_idx) in enumerate(tqdm(folds, desc=f"  Trial {trial.number} folds", leave=False)):
             X_f_tr = X_train.iloc[train_idx]
             y_f_tr = y_train.iloc[train_idx]
             X_f_va = X_train.iloc[val_idx]
@@ -985,7 +1059,7 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
             clf = XGBClassifier(
                 n_estimators=N_ESTIMATORS_CEILING,
                 early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-                scale_pos_weight=pos_weight,
+                scale_pos_weight=effective_pos_weight,
                 monotone_constraints=xgb_monotone_constraints,
                 random_state=RANDOM_STATE, n_jobs=1, verbosity=0,
                 eval_metric="aucpr", **params,
@@ -1001,14 +1075,25 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
                 )
             )
 
+            trial.report(np.mean(fold_scores), fold_i)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
         trial.set_user_attr(
             "best_n_estimators",
             select_conservative_boosting_rounds(fold_best_iters, fallback=N_ESTIMATORS_CEILING),
         )
         return np.mean(fold_scores)
 
-    study = optuna.create_study(direction="maximize", study_name="xgb")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    study = optuna.create_study(
+        direction="maximize", study_name="xgb",
+        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+    )
+    # n_jobs=1: sequential trials. Tree objectives use n_jobs=1 per fold
+    # to avoid contention; parallel trials would multiply memory usage.
+    # Set n_jobs=-1 for parallel trials if memory allows.
+    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
 
     best_n_estimators = normalize_estimator_count(
         study.best_trial.user_attrs["best_n_estimators"],
@@ -1025,7 +1110,7 @@ def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int,
         ("preprocessor", preprocessor),
         ("classifier", XGBClassifier(
             n_estimators=best_n_estimators,
-            scale_pos_weight=pos_weight,
+            scale_pos_weight=effective_pos_weight,
             monotone_constraints=xgb_monotone_constraints,
             random_state=RANDOM_STATE, n_jobs=-1, verbosity=0,
             eval_metric="aucpr", **study.best_params,
@@ -1055,7 +1140,7 @@ def train_catboost(X_train, y_train, lgbm_preprocessor, pos_weight, cv, n_trials
         fold_scores = []
         fold_best_iters = []
         folds = list(cv.split(X_train, y_train))
-        for train_idx, val_idx in tqdm(folds, desc=f"  Trial {trial.number} folds", leave=False):
+        for fold_i, (train_idx, val_idx) in enumerate(tqdm(folds, desc=f"  Trial {trial.number} folds", leave=False)):
             X_f_tr = X_train.iloc[train_idx]
             y_f_tr = y_train.iloc[train_idx]
             X_f_va = X_train.iloc[val_idx]
@@ -1091,14 +1176,25 @@ def train_catboost(X_train, y_train, lgbm_preprocessor, pos_weight, cv, n_trials
                 )
             )
 
+            trial.report(np.mean(fold_scores), fold_i)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
         trial.set_user_attr(
             "best_n_estimators",
             select_conservative_boosting_rounds(fold_best_iters, fallback=N_ESTIMATORS_CEILING),
         )
         return np.mean(fold_scores)
 
-    study = optuna.create_study(direction="maximize", study_name="catboost")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    study = optuna.create_study(
+        direction="maximize", study_name="catboost",
+        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+    )
+    # n_jobs=1: sequential trials. Tree objectives use n_jobs=1 per fold
+    # to avoid contention; parallel trials would multiply memory usage.
+    # Set n_jobs=-1 for parallel trials if memory allows.
+    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
 
     best_n_estimators = normalize_estimator_count(
         study.best_trial.user_attrs["best_n_estimators"],
@@ -1572,9 +1668,10 @@ def run_rolling_out_of_time_validation(
 
             if len(np.unique(y_calibration)) >= 2:
                 calibration_cv = safe_stratified_n_splits(y_calibration)
+                cal_method = "sigmoid" if name == "Logistic Regression" else "isotonic"
                 calibrated_model = CalibratedClassifierCV(
                     FrozenEstimator(fold_model),
-                    method="sigmoid",
+                    method=cal_method,
                     cv=calibration_cv,
                 )
                 calibrated_model.fit(X_calibration, y_calibration)
@@ -2256,6 +2353,173 @@ def compute_woe_iv(
     return woe_df, iv_df
 
 
+def _run_diagnostics_and_governance(
+    *,
+    y_test: pd.Series,
+    y_development_fit_booked: pd.Series,
+    test_scores: dict[str, np.ndarray],
+    train_scores: dict[str, np.ndarray],
+    models: dict,
+    X_test: pd.DataFrame,
+    X_development_fit: pd.DataFrame,
+    num_cols: list[str],
+    cat_cols: list[str],
+    feature_cols: list[str],
+    official_results_df: pd.DataFrame,
+    rolling_oot_summary_df: pd.DataFrame,
+    benchmark_comparisons_df: pd.DataFrame,
+    population_summary_df: pd.DataFrame,
+    feature_provenance_df: pd.DataFrame,
+    applicant_scores_df: pd.DataFrame | None,
+    age_values: np.ndarray | None,
+    output_path: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Steps 17b-17f: lift table, overfitting, model selection, governance, population bias.
+
+    Returns (overfit_df, model_selection_df) for use by the save-artifacts step.
+    """
+
+    # 17b. Lift table and threshold analysis
+    with _log_step("17b", "Lift table and threshold analysis"):
+        lift_tables = []
+        threshold_tables = []
+        for name in OFFICIAL_MODEL_NAMES:
+            if name in test_scores:
+                lift_tables.append(create_lift_table(y_test.values, test_scores[name], name))
+                threshold_tables.append(create_threshold_analysis(y_test.values, test_scores[name], name))
+        lift_table_df = pd.concat(lift_tables, ignore_index=True) if lift_tables else pd.DataFrame()
+        threshold_analysis_df = pd.concat(threshold_tables, ignore_index=True) if threshold_tables else pd.DataFrame()
+        if not lift_table_df.empty:
+            lift_table_df.to_csv(output_path / "lift_table.csv", index=False, float_format="%.6f")
+            logger.info("Lift table: {} rows across {} models", len(lift_table_df), lift_table_df["model"].nunique())
+        if not threshold_analysis_df.empty:
+            threshold_analysis_df.to_csv(output_path / "threshold_analysis.csv", index=False, float_format="%.6f")
+            logger.info("Threshold analysis: {} rows across {} models", len(threshold_analysis_df), threshold_analysis_df["model"].nunique())
+
+    # 17c. Overfitting diagnostics
+    with _log_step("17c", "Overfitting diagnostics"):
+        overfit_df = compute_overfit_report(
+            y_development_fit_booked.values, y_test.values, train_scores, test_scores,
+            model_names=OFFICIAL_MODEL_NAMES,
+        )
+        if not overfit_df.empty:
+            overfit_df.to_csv(output_path / "overfit_report.csv", index=False, float_format="%.6f")
+            logger.info("Train vs test performance comparison:")
+            logger.info("{:<25s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>6s}",
+                        "Model", "Train AUC", "Test AUC", "AUC Δ", "Train PR", "Test PR", "PR Δ", "Flag")
+            logger.info("{}", "─" * 97)
+            for _, row in overfit_df.iterrows():
+                logger.info(
+                    "{:<25s} {:>10.4f} {:>10.4f} {:>+10.4f} {:>10.4f} {:>10.4f} {:>+10.4f} {:>6s}",
+                    row["model"], row["train_auc"], row["test_auc"], row["auc_delta"],
+                    row["train_pr_auc"], row["test_pr_auc"], row["pr_auc_delta"], row["overfit_flag"],
+                )
+            n_flagged = int((overfit_df["overfit_flag"] == "YES").sum())
+            if n_flagged > 0:
+                logger.warning("{} model(s) flagged for potential overfitting (AUC or PR AUC delta > 0.03)", n_flagged)
+            else:
+                logger.info("No models flagged for overfitting")
+
+    # 17d. Model selection
+    with _log_step("17d", "Model selection"):
+        model_selection_df = select_best_model(
+            official_results_df,
+            overfit_df=overfit_df if not overfit_df.empty else None,
+            rolling_oot_summary_df=rolling_oot_summary_df if not rolling_oot_summary_df.empty else None,
+            candidate_names=OFFICIAL_MODEL_NAMES,
+            benchmark_comparisons_df=benchmark_comparisons_df if not benchmark_comparisons_df.empty else None,
+        )
+        if not model_selection_df.empty:
+            model_selection_df.to_csv(output_path / "model_selection.csv", index=False, float_format="%.1f")
+            logger.info("Model selection scorecard (weights: discrimination=35%, stability=20%, calibration=15%, generalization=15%, lift=15%):")
+            logger.info("{:<25s} {:>6s} {:>6s} {:>6s} {:>6s} {:>6s} {:>8s} {:>5s}",
+                        "Model", "Disc.", "Calib.", "Stab.", "Gen.", "Lift", "Overall", "Rec.")
+            logger.info("{}", "─" * 87)
+            for _, row in model_selection_df.iterrows():
+                logger.info(
+                    "{:<25s} {:>6.1f} {:>6.1f} {:>6.1f} {:>6.1f} {:>6.1f} {:>8.1f} {:>5s}",
+                    row["model"], row["discrimination_score"], row["calibration_score"],
+                    row["stability_score"], row["generalization_score"],
+                    row["lift_score"], row["weighted_score"],
+                    "<<<" if row["recommended"] else "",
+                )
+            recommended = model_selection_df.loc[model_selection_df["recommended"]].iloc[0]
+            logger.info("Recommended model: {} (weighted score: {:.1f})", recommended["model"], recommended["weighted_score"])
+            compute_shap_analysis(models, X_test, num_cols, cat_cols, output_path, preferred_model_name=str(recommended["model"]))
+
+    # 17e. Model governance artifacts
+    with _log_step("17e", "Model governance artifacts"):
+        iv_df_for_dict = None
+        iv_path = output_path / "iv_summary.csv"
+        if iv_path.exists():
+            iv_df_for_dict = pd.read_csv(iv_path)
+        generate_model_card(
+            official_results_df,
+            model_selection_df=model_selection_df if not model_selection_df.empty else None,
+            overfit_df=overfit_df if not overfit_df.empty else None,
+            benchmark_comparisons_df=benchmark_comparisons_df if not benchmark_comparisons_df.empty else None,
+            population_summary_df=population_summary_df if not population_summary_df.empty else None,
+            feature_provenance_df=feature_provenance_df if not feature_provenance_df.empty else None,
+            output_path=output_path,
+        )
+        generate_variable_dictionary(
+            feature_cols, num_cols, cat_cols,
+            feature_provenance_df=feature_provenance_df if not feature_provenance_df.empty else None,
+            iv_df=iv_df_for_dict, output_path=output_path,
+        )
+        generate_data_quality_report(X_development_fit, num_cols, cat_cols, output_path, label="development_fit")
+        generate_data_quality_report(X_test, num_cols, cat_cols, output_path, label="test")
+
+    # 17f. Population bias analysis
+    with _log_step("17f", "Population bias analysis"):
+        if applicant_scores_df is not None and not applicant_scores_df.empty:
+            pop_ks_df = compute_population_ks_test(applicant_scores_df, model_names=OFFICIAL_MODEL_NAMES)
+            if not pop_ks_df.empty:
+                pop_ks_df.to_csv(output_path / "population_ks_test.csv", index=False, float_format="%.6f")
+                logger.info("Booked vs non-booked score distribution KS test:")
+                for _, row in pop_ks_df.iterrows():
+                    logger.info("  {:<25s} KS={:.4f}  p={:.2e}  booked_mean={:.4f}  non_booked_mean={:.4f}",
+                                row["model"], row["ks_statistic"], row["ks_p_value"],
+                                row["booked_mean_score"], row["non_booked_mean_score"])
+            sel_bias_df = compute_selection_bias_correlation(applicant_scores_df, model_names=OFFICIAL_MODEL_NAMES)
+            if not sel_bias_df.empty:
+                sel_bias_df.to_csv(output_path / "selection_bias_correlation.csv", index=False, float_format="%.6f")
+                logger.info("Selection bias — correlation with risk_score_rf:")
+                for _, row in sel_bias_df.iterrows():
+                    logger.info("  {:<25s} Pearson={:+.4f}  Spearman={:+.4f}  [{}]",
+                                row["model"], row["pearson_corr"], row["spearman_corr"], row["selection_bias_flag"])
+                n_high = int((sel_bias_df["selection_bias_flag"] == "HIGH").sum())
+                if n_high > 0:
+                    logger.warning("{} model(s) show HIGH correlation with existing risk_score_rf — may be recapitulating the selection mechanism", n_high)
+        else:
+            logger.info("Applicant scores not available (booked-monitoring mode) — skipping population KS and selection bias")
+
+        if age_values is not None:
+            ai_tables = []
+            for name in OFFICIAL_MODEL_NAMES:
+                if name in test_scores:
+                    ai_tables.append(compute_adverse_impact_analysis(y_test.values, test_scores[name], age_values, name))
+            ai_df = pd.concat(ai_tables, ignore_index=True) if ai_tables else pd.DataFrame()
+            if not ai_df.empty:
+                ai_df.to_csv(output_path / "adverse_impact_age.csv", index=False, float_format="%.6f")
+                logger.info("Adverse impact analysis by age band (10%% rejection threshold):")
+                for name in OFFICIAL_MODEL_NAMES:
+                    model_ai = ai_df.loc[ai_df["model"] == name]
+                    if model_ai.empty:
+                        continue
+                    n_fail = int((model_ai["air_flag"] == "FAIL").sum())
+                    if n_fail > 0:
+                        failing = model_ai.loc[model_ai["air_flag"] == "FAIL"]
+                        logger.warning("  {}: {} age band(s) below 80%% AIR threshold: {}",
+                                       name, n_fail, ", ".join(f"{r['age_band']} (AIR={r['adverse_impact_ratio']:.2f})" for _, r in failing.iterrows()))
+                    else:
+                        logger.info("  {}: all age bands pass 80%% AIR threshold", name)
+        else:
+            logger.info("AGE_T1 not available — skipping adverse impact analysis")
+
+    return overfit_df, model_selection_df
+
+
 def main(
     data_path: str = "data/demand_direct.parquet",
     optuna_trials: int = 50,
@@ -2529,6 +2793,8 @@ def main(
             cv,
             optuna_trials,
             sample_weight=w_development_fit,
+            num_cols=num_cols,
+            cat_cols=cat_cols,
         )
     with _log_step(8, "LightGBM — development fit sample"):
         lgbm_model, lgbm_study, lgbm_best_n = train_lgbm(
@@ -2565,6 +2831,15 @@ def main(
             monotone_constraints=monotone_constraints,
         )
 
+    # Save Optuna trial histories for hyperparameter sensitivity analysis
+    for study_name, study_obj in [
+        ("Logistic Regression", lr_study),
+        ("LightGBM", lgbm_study),
+        ("XGBoost", xgb_study),
+        ("CatBoost", catboost_study),
+    ]:
+        _save_optuna_study(study_obj, output_path, study_name)
+
     stack_model = None
     if enable_experimental_stacking:
         with _log_step(11, "Stacking ensemble (experimental)"):
@@ -2591,11 +2866,13 @@ def main(
         if stack_model is not None:
             models[EXPERIMENTAL_STACKING_NAME] = stack_model
         for name in OFFICIAL_MODEL_NAMES:
-            cal = CalibratedClassifierCV(FrozenEstimator(models[name]), method="sigmoid")
+            # Isotonic for tree models (step-function scores); sigmoid for LR (already log-odds)
+            method = "sigmoid" if name == "Logistic Regression" else "isotonic"
+            cal = CalibratedClassifierCV(FrozenEstimator(models[name]), method=method)
             cal.fit(X_calibration_booked, y_calibration_booked)
             models[f"{name} (calibrated)"] = cal
         logger.info(
-            "Sigmoid (Platt) calibration on {:,} booked held-out samples ({:,} pos)",
+            "Calibration on {:,} booked held-out samples ({:,} pos) — sigmoid for LR, isotonic for tree models",
             len(y_calibration_booked),
             y_calibration_booked.sum(),
         )
@@ -2633,6 +2910,47 @@ def main(
                     row["mean_PR_AUC"],
                     row["mean_ROC_AUC"],
                 )
+
+    # 12c. Concept drift detection
+    with _log_step("12c", "Concept drift detection"):
+        concept_drift_df = compute_concept_drift_report(rolling_oot_results_df, model_names=OFFICIAL_MODEL_NAMES)
+        if not concept_drift_df.empty:
+            concept_drift_df.to_csv(output_path / "concept_drift.csv", index=False, float_format="%.6f")
+            logger.info("Concept drift analysis (PR AUC trend across OOT folds):")
+            for _, row in concept_drift_df.iterrows():
+                logger.info(
+                    "  {:<25s} first={:.4f} last={:.4f} slope={:+.4f}/fold  [{}]",
+                    row["model"], row["pr_auc_first"], row["pr_auc_last"],
+                    row["pr_auc_slope_per_fold"], row["concept_drift_flag"],
+                )
+            n_drift = int((concept_drift_df["concept_drift_flag"] == "YES").sum())
+            if n_drift > 0:
+                logger.warning("{} model(s) show concept drift (PR AUC declining > 0.02 across OOT folds)", n_drift)
+
+    # 12d. Post-hoc ensemble (LR + best tree weighted average)
+    with _log_step("12d", "Post-hoc ensemble"):
+        # Score calibration holdout with each base model
+        calib_scores_for_ensemble = {}
+        for name in OFFICIAL_MODEL_NAMES:
+            calib_scores_for_ensemble[name] = models[name].predict_proba(X_calibration_booked)[:, 1]
+        ensemble_result = train_post_hoc_ensemble(y_calibration_booked.values, calib_scores_for_ensemble)
+        if ensemble_result:
+            lr_w = ensemble_result["lr_weight"]
+            tree_w = ensemble_result["tree_weight"]
+            tree_name = ensemble_result["tree_name"]
+            logger.info(
+                "Best ensemble: {:.0%} {} + {:.0%} {} → calibration PR AUC {:.4f}",
+                lr_w, ensemble_result["lr_name"], tree_w, tree_name, ensemble_result["pr_auc"],
+            )
+            # Create a blending wrapper and add to models dict
+            ensemble_name = f"Ensemble ({ensemble_result['lr_name']} + {tree_name})"
+            models[ensemble_name] = EnsembleModel(
+                models[ensemble_result["lr_name"]], models[tree_name], lr_w, tree_w,
+                name=ensemble_name,
+            )
+            pd.DataFrame([ensemble_result]).to_csv(output_path / "ensemble_weights.csv", index=False, float_format="%.4f")
+        else:
+            logger.info("Post-hoc ensemble: no valid combination found")
 
     with _log_step(13, "Evaluation — booked test sample"):
         results_df, test_scores = evaluate_all(
@@ -2811,156 +3129,26 @@ def main(
             output_path,
         )
 
-    with _log_step("17b", "Lift table and threshold analysis"):
-        lift_tables = []
-        threshold_tables = []
-        for name in OFFICIAL_MODEL_NAMES:
-            if name in test_scores:
-                lift_tables.append(create_lift_table(y_test.values, test_scores[name], name))
-                threshold_tables.append(create_threshold_analysis(y_test.values, test_scores[name], name))
-        lift_table_df = pd.concat(lift_tables, ignore_index=True) if lift_tables else pd.DataFrame()
-        threshold_analysis_df = pd.concat(threshold_tables, ignore_index=True) if threshold_tables else pd.DataFrame()
-        if not lift_table_df.empty:
-            lift_table_df.to_csv(output_path / "lift_table.csv", index=False, float_format="%.6f")
-            logger.info("Lift table: {} rows across {} models", len(lift_table_df), lift_table_df["model"].nunique())
-        if not threshold_analysis_df.empty:
-            threshold_analysis_df.to_csv(output_path / "threshold_analysis.csv", index=False, float_format="%.6f")
-            logger.info(
-                "Threshold analysis: {} rows across {} models",
-                len(threshold_analysis_df),
-                threshold_analysis_df["model"].nunique(),
-            )
-
-    with _log_step("17c", "Overfitting diagnostics"):
-        overfit_df = compute_overfit_report(
-            y_development_fit_booked.values,
-            y_test.values,
-            train_scores,
-            test_scores,
-            model_names=OFFICIAL_MODEL_NAMES,
-        )
-        if not overfit_df.empty:
-            overfit_df.to_csv(output_path / "overfit_report.csv", index=False, float_format="%.6f")
-            logger.info("Train vs test performance comparison:")
-            logger.info(
-                "{:<25s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>10s} {:>6s}",
-                "Model",
-                "Train AUC",
-                "Test AUC",
-                "AUC Δ",
-                "Train PR",
-                "Test PR",
-                "PR Δ",
-                "Flag",
-            )
-            logger.info("{}", "─" * 97)
-            for _, row in overfit_df.iterrows():
-                logger.info(
-                    "{:<25s} {:>10.4f} {:>10.4f} {:>+10.4f} {:>10.4f} {:>10.4f} {:>+10.4f} {:>6s}",
-                    row["model"],
-                    row["train_auc"],
-                    row["test_auc"],
-                    row["auc_delta"],
-                    row["train_pr_auc"],
-                    row["test_pr_auc"],
-                    row["pr_auc_delta"],
-                    row["overfit_flag"],
-                )
-            n_flagged = int((overfit_df["overfit_flag"] == "YES").sum())
-            if n_flagged > 0:
-                logger.warning(
-                    "{} model(s) flagged for potential overfitting (AUC or PR AUC delta > 0.03)",
-                    n_flagged,
-                )
-            else:
-                logger.info("No models flagged for overfitting")
-
-    with _log_step("17d", "Model selection"):
-        model_selection_df = select_best_model(
-            official_results_df,
-            overfit_df=overfit_df if not overfit_df.empty else None,
-            rolling_oot_summary_df=rolling_oot_summary_df if not rolling_oot_summary_df.empty else None,
-            candidate_names=OFFICIAL_MODEL_NAMES,
-            benchmark_comparisons_df=benchmark_comparisons_df if not benchmark_comparisons_df.empty else None,
-        )
-        if not model_selection_df.empty:
-            model_selection_df.to_csv(output_path / "model_selection.csv", index=False, float_format="%.1f")
-            logger.info("Model selection scorecard (weights: discrimination=35%, stability=20%, calibration=15%, generalization=15%, lift=15%):")
-            logger.info(
-                "{:<25s} {:>6s} {:>6s} {:>6s} {:>6s} {:>6s} {:>8s} {:>5s}",
-                "Model",
-                "Disc.",
-                "Calib.",
-                "Stab.",
-                "Gen.",
-                "Lift",
-                "Overall",
-                "Rec.",
-            )
-            logger.info("{}", "─" * 87)
-            for _, row in model_selection_df.iterrows():
-                logger.info(
-                    "{:<25s} {:>6.1f} {:>6.1f} {:>6.1f} {:>6.1f} {:>6.1f} {:>8.1f} {:>5s}",
-                    row["model"],
-                    row["discrimination_score"],
-                    row["calibration_score"],
-                    row["stability_score"],
-                    row["generalization_score"],
-                    row["lift_score"],
-                    row["weighted_score"],
-                    "<<<" if row["recommended"] else "",
-                )
-            recommended = model_selection_df.loc[model_selection_df["recommended"]].iloc[0]
-            logger.info(
-                "Recommended model: {} (weighted score: {:.1f})",
-                recommended["model"],
-                recommended["weighted_score"],
-            )
-            compute_shap_analysis(
-                models,
-                X_test,
-                num_cols,
-                cat_cols,
-                output_path,
-                preferred_model_name=str(recommended["model"]),
-            )
-
-    with _log_step("17e", "Model governance artifacts"):
-        iv_df_for_dict = None
-        iv_path = output_path / "iv_summary.csv"
-        if iv_path.exists():
-            iv_df_for_dict = pd.read_csv(iv_path)
-        generate_model_card(
-            official_results_df,
-            model_selection_df=model_selection_df if not model_selection_df.empty else None,
-            overfit_df=overfit_df if not overfit_df.empty else None,
-            benchmark_comparisons_df=benchmark_comparisons_df if not benchmark_comparisons_df.empty else None,
-            population_summary_df=population_summary_df if not population_summary_df.empty else None,
-            feature_provenance_df=feature_provenance_df if not feature_provenance_df.empty else None,
-            output_path=output_path,
-        )
-        generate_variable_dictionary(
-            feature_cols,
-            num_cols,
-            cat_cols,
-            feature_provenance_df=feature_provenance_df if not feature_provenance_df.empty else None,
-            iv_df=iv_df_for_dict,
-            output_path=output_path,
-        )
-        generate_data_quality_report(
-            X_development_fit,
-            num_cols,
-            cat_cols,
-            output_path,
-            label="development_fit",
-        )
-        generate_data_quality_report(
-            X_test,
-            num_cols,
-            cat_cols,
-            output_path,
-            label="test",
-        )
+    overfit_df, model_selection_df = _run_diagnostics_and_governance(
+        y_test=y_test,
+        y_development_fit_booked=y_development_fit_booked,
+        test_scores=test_scores,
+        train_scores=train_scores,
+        models=models,
+        X_test=X_test,
+        X_development_fit=X_development_fit,
+        num_cols=num_cols,
+        cat_cols=cat_cols,
+        feature_cols=feature_cols,
+        official_results_df=official_results_df,
+        rolling_oot_summary_df=rolling_oot_summary_df,
+        benchmark_comparisons_df=benchmark_comparisons_df,
+        population_summary_df=population_summary_df,
+        feature_provenance_df=feature_provenance_df,
+        applicant_scores_df=applicant_scores_df,
+        age_values=df.loc[X_test_base.index, "AGE_T1"].values if "AGE_T1" in df.columns else None,
+        output_path=output_path,
+    )
 
     with _log_step(18, "Save artifacts"):
         feat_imp = extract_feature_importance(models, num_cols, cat_cols)
