@@ -62,6 +62,7 @@ Feature discovery is fully separated from final estimation:
 - Pairwise interaction search runs only on the earlier pre-split discovery sample
 - Numerical pairs are screened via ratios and products
 - Categorical pairs are screened with cross-validated target encoding to reduce in-sample optimism
+- Binned numerical x categorical interactions capture threshold effects that ratios miss (quantile-binned numerical crossed with categorical value)
 - Additional post-screening enrichments include frequency encoding and group-relative statistics computed from training data only
 - Correlation pruning removes near-duplicate signals before the final selector
 - Final feature elimination uses temporal stability selection across expanding folds
@@ -72,24 +73,32 @@ Feature discovery is fully separated from final estimation:
 
 | Model | Preprocessing | Tuning | Notes |
 |-------|---------------|--------|-------|
-| Logistic Regression | Median imputation + scaling + target encoding | Optuna on `C` | Recommended model in the current weighted selection |
-| LightGBM | Median imputation + ordinal encoding | Optuna | Strong raw hold-out candidate, but materially weaker generalization than Logistic Regression |
-| XGBoost | Median imputation + scaling + target encoding | Optuna | Competitive discrimination, but unstable in the current generalization checks |
-| CatBoost | Median imputation + ordinal encoding | Optuna | Best raw calibration score in model selection, but weakest held-out generalization in the current run |
+| Logistic Regression | Median imputation + scaling + target encoding | Optuna on `C` + `smooth` | Recommended model in the current weighted selection |
+| LightGBM | Median imputation + ordinal encoding | Optuna (multivariate TPE + pruning) | Strong raw hold-out candidate, but materially weaker generalization than Logistic Regression |
+| XGBoost | Median imputation + scaling + target encoding | Optuna (multivariate TPE + pruning) | Competitive discrimination, but unstable in the current generalization checks |
+| CatBoost | Median imputation + ordinal encoding | Optuna (multivariate TPE + pruning) | Best raw calibration score in model selection, but weakest held-out generalization in the current run |
+| Post-hoc ensemble | Weighted average of LR + best tree | Grid search on calibration holdout | Added automatically; weights optimized on PR AUC |
 | Stacking | Mixed base learners | None | Experimental only until temporal OOF stacking is implemented |
+
+**Optuna enhancements:** All studies use `TPESampler(multivariate=True)` to model hyperparameter correlations. Tree objectives use `MedianPruner` to terminate unpromising trials after 1-2 CV folds. Trial histories saved as `optuna_{model}.csv` for post-hoc sensitivity analysis.
+
+**Regularization controls:** Tree complexity bounds are tightened for the ~5% base rate (LGBM `num_leaves` 8-31, `max_bin` 63-127, `colsample_bynode` 0.6-1.0; XGB `max_depth` 2-4, `min_child_weight` 20-100). `N_ESTIMATORS_CEILING=1000` and `EARLY_STOPPING_ROUNDS=30`. When reject inference provides `sample_weight`, `scale_pos_weight` is disabled to avoid double-rebalancing.
+
+**TargetEncoder smooth tuning:** The LR Optuna objective jointly tunes `C` and `TargetEncoder(smooth=...)` in [1, 200] log-scale, rebuilding the preprocessor per trial.
 
 Cardinality reduction keeps the top categories per feature and groups the tail into `"Other"`.
 
 ### 5. Calibration
 
-Probability calibration uses sigmoid (Platt) scaling on the latest booked pre-split holdout. This preserves ranking metrics while materially improving Brier score calibration for the model probabilities.
+Probability calibration uses **isotonic regression** for tree models (LGBM, XGB, CatBoost) and **sigmoid (Platt) scaling** for Logistic Regression, fitted on the latest booked pre-split holdout. Isotonic calibration better matches tree models' step-function score distributions, while sigmoid is appropriate for LR's already-log-odds output. The model selection scorecard uses the calibrated Brier score to evaluate calibration quality.
 
 ### 6. Benchmark comparison and validation
 
 - Hold-out evaluation reports ROC AUC, Gini, KS, PR AUC, and Brier
-- `confidence_intervals.csv` stores marginal bootstrap intervals
-- `benchmark_comparisons.csv` stores paired candidate-vs-benchmark comparisons against `risk_score_rf` and `score_RF`
+- `confidence_intervals.csv` stores marginal bootstrap CIs (point estimates from observed statistic, not bootstrap median)
+- `benchmark_comparisons.csv` stores paired candidate-vs-benchmark comparisons with Holm-Bonferroni adjusted p-values and effect-size columns (`auc_improvement_pct_of_max`)
 - `rolling_oot_results.csv` and `rolling_oot_summary.csv` store 4-window rolling out-of-time validation summaries on the booked proxy population
+- `concept_drift.csv` detects degrading score-to-outcome relationships via PR AUC trend across OOT folds
 
 ### 7. Underwriting-specific outputs
 
@@ -100,7 +109,31 @@ Underwriting mode adds two applicant-population artifacts:
 
 Official score tables, benchmark comparisons, rolling OOT summaries, and ablations are tagged with `population_mode` and `evaluation_population` so booked-proxy metrics are explicitly labeled.
 
-### 8. Experimental modes
+### 8. Population bias analysis
+
+Three population bias diagnostics are generated automatically:
+
+- **Booked vs non-booked KS test** (`population_ks_test.csv`): two-sample KS test comparing model score distributions between booked and rejected/canceled applicants
+- **Selection bias correlation** (`selection_bias_correlation.csv`): Pearson and Spearman correlation between model PD and `risk_score_rf`, flagged HIGH (>0.90), MODERATE (>0.70), or LOW
+- **Adverse impact by age band** (`adverse_impact_age.csv`): approval rate at 10% rejection threshold per age band, with 80% AIR (adverse impact ratio) threshold for disparate impact detection
+
+### 9. Scoring API
+
+`scoring.py` provides a production scoring interface:
+
+```python
+from scoring import ScoringService
+service = ScoringService.from_output_dir("output")
+result = service.score_applicant({"INCOME_T1": 45000, "AGE_T1": 32, ...})
+print(result.predicted_pd, result.risk_tier, result.warnings)
+```
+
+- `from_output_dir()` auto-loads the recommended model, feature list, and training statistics
+- `score_applicant()` returns `ScoringResult` with predicted PD, risk tier (LOW/MODERATE/ELEVATED/HIGH/VERY_HIGH), and out-of-distribution warnings
+- `score_batch()` provides vectorized scoring for DataFrames
+- Input validation flags values outside the training distribution
+
+### 10. Experimental modes
 
 - **Reject inference:** score-anchored parceling using `risk_score_rf`; opt-in and excluded from the official benchmark tables
 - **Stacking:** still excluded from the official path because the current implementation relies on non-temporal folds for meta-learner training
@@ -198,20 +231,21 @@ The underwriting-specific artifacts extend the pipeline beyond the booked holdou
 ## Limitations
 
 - **Booked-proxy evaluation only:** even in underwriting mode, the measurable target exists only for booked accounts, so the headline metrics do not fully identify applicant-stage grant/decline performance
-- **Selection bias is still unresolved:** reject inference is available only as an experimental option and is excluded from the official benchmark tables
+- **Selection bias is partially quantified but unresolved:** `selection_bias_correlation.csv` and `population_ks_test.csv` measure the gap, but reject inference remains experimental
 - **Stacking is still not temporally clean:** the current stacking implementation depends on non-temporal folds and therefore remains experimental
-- **Tree ensembles remain overfit in the current setup:** all official candidates breach the overfit threshold, but the tree models do so by a much wider margin than Logistic Regression
+- **Tree ensembles remain overfit in the current setup:** tightened complexity bounds and isotonic calibration help, but all tree models still show significant train-test gaps versus Logistic Regression
 - **Benchmark ceiling remains external:** Logistic Regression slightly edges `risk_score_rf` on held-out ROC AUC, but `risk_score_rf` still leads on PR AUC and on the rolling OOT benchmark view
 - **Feature selection currently favors stable numeric surrogates:** raw categorical variables often give way to frequency-encoded or grouped numeric derivatives, which helps stability but can reduce direct interpretability of the original categories
+- **Adverse impact analysis is limited to age:** only `AGE_T1` is analyzed; other protected attributes (gender, marital status) may warrant analysis depending on jurisdiction
 
 ## Next Steps
 
 - Implement applicant-stage policy evaluation: approval-rate curves, bad-rate curves, and expected-loss / profit simulations
 - Rebuild or remove stacking from any official path unless temporal out-of-fold predictions are used end to end
-- Explore better selection-bias correction for underwriting evaluation, rather than treating reject inference as the only experimental option
-- Add grouped or quota-based feature selection if retaining more raw categorical variables becomes a business or governance requirement
-- Add richer underwriting outputs such as score deciles, decline-threshold analysis, and benchmark-vs-model routing scenarios
-- Continue closing the gap to `risk_score_rf`, especially on PR AUC and benchmark event concentration where the current feature set still trails
+- Explore better selection-bias correction for underwriting evaluation beyond the current reject inference approach
+- Add champion-challenger logging framework: track recommended model + metrics per retraining run over time
+- Extend adverse impact analysis to additional protected attributes
+- Continue closing the gap to `risk_score_rf`, especially on PR AUC and benchmark event concentration
 
 ---
 
@@ -371,6 +405,15 @@ output/
   woe_detail.csv                       # Weight of Evidence per bin
   psi.csv                              # Population Stability Index per model
   csi.csv                              # Characteristic Stability Index per feature
+  concept_drift.csv                    # PR AUC trend and drift detection across OOT folds
+  population_ks_test.csv               # Booked vs non-booked score distribution KS test
+  selection_bias_correlation.csv       # Correlation between model PD and risk_score_rf
+  adverse_impact_age.csv               # Adverse impact ratio by age band (80% AIR threshold)
+  ensemble_weights.csv                 # Post-hoc LR+tree ensemble weight optimization
+  optuna_logistic_regression.csv       # Optuna trial history for LR
+  optuna_lightgbm.csv                  # Optuna trial history for LGBM
+  optuna_xgboost.csv                   # Optuna trial history for XGB
+  optuna_catboost.csv                  # Optuna trial history for CatBoost
   model_card.txt                       # Governance summary for the current run
   variable_dictionary.csv              # Feature dictionary with provenance and IV
   data_quality_development_fit.csv     # Missingness / uniqueness checks on fit sample
@@ -382,7 +425,12 @@ output/
     shap_summary.png                   # SHAP beeswarm plot
     shap_importance.png                # SHAP bar importance
     shap_dependence.png                # Top-6 SHAP dependence plots
-    stakeholder_*.png                  # Stakeholder chart pack outputs
+    stakeholder_executive_summary.png  # Executive summary one-pager
+    stakeholder_gains.png              # Decile gains chart
+    stakeholder_threshold_analysis.png # Precision/recall at rejection thresholds
+    stakeholder_reliability.png        # Calibration reliability diagram
+    stakeholder_top_drivers.png        # Top 10 feature drivers
+    stakeholder_*.png                  # Full stakeholder chart pack
 ```
 
 ## Pipeline Phases
@@ -392,24 +440,26 @@ output/
 | 1 | Load the chosen population mode and build `population_summary.csv` |
 | 2 | Engineer raw, ratio, log, interaction, and missingness features |
 | 3 | Split the booked pre-test sample into feature-discovery and estimation windows |
-| 4 | Run interaction search, enrichment, correlation pruning, and temporal stability selection |
-| 5 | Freeze the feature set, split development vs calibration, and train the official candidate models |
-| 6 | Calibrate official models on the latest booked pre-split holdout |
-| 7 | Run rolling OOT validation, booked-proxy hold-out evaluation, and applicant-population scoring |
-| 8 | Produce bootstrap comparisons, ablations, SHAP, WoE / IV, PSI / CSI, lift, threshold, and overfit diagnostics |
+| 4 | Run interaction search (ratio, product, binned num x cat), enrichment, correlation pruning, and temporal stability selection |
+| 5 | Freeze the feature set, split development vs calibration, and train the official candidate models (multivariate TPE + pruning) |
+| 6 | Calibrate (isotonic for trees, sigmoid for LR) and train post-hoc LR+tree ensemble |
+| 7 | Run rolling OOT validation, concept drift detection, booked-proxy hold-out evaluation, and applicant-population scoring |
+| 8 | Produce bootstrap comparisons (Holm-Bonferroni corrected), ablations, SHAP, WoE / IV, PSI / CSI, lift, threshold, and overfit diagnostics |
 | 9 | Select the recommended model with the weighted multi-criteria scorecard |
-| 10 | Save governance artifacts, stakeholder inputs, plots, and serialized models |
+| 10 | Generate governance artifacts (model card, variable dictionary, data quality), population bias analysis (KS test, selection bias, adverse impact), and save all outputs |
 
 ## Project Structure
 
 ```
 direct_score/
   main.py               # Thin CLI entrypoint used by `uv run main.py`
-  training.py           # Pipeline orchestration
-  training_features.py  # Feature discovery, interaction search, and selection
-  training_reporting.py # Evaluation, model selection, and artifact helpers
-  stakeholder_charts.py # Stakeholder-facing chart pack generator
-  model_governance.py   # Model card and variable dictionary generation
+  training.py           # Pipeline orchestration (main + model training)
+  training_features.py  # Feature discovery, interaction search, and stability selection
+  training_reporting.py # Evaluation, model selection, population bias, and artifact helpers
+  training_constants.py # Shared constants (thresholds, feature lists, search spaces)
+  stakeholder_charts.py # Stakeholder-facing chart pack generator (selected model highlighting)
+  model_governance.py   # Model card, variable dictionary, and data quality reports
+  scoring.py            # Production scoring API (ScoringService)
   pyproject.toml        # Dependencies (uv)
   CLAUDE.md             # Development instructions
   todo_list.md          # Known issues and improvement backlog
@@ -419,5 +469,5 @@ direct_score/
     1-eda.ipynb        # Exploratory data analysis
     3-model.ipynb      # Model development notebook
   output/              # Generated artifacts (not committed)
-  tests/               # Unit tests
+  tests/               # 239 unit tests
 ```

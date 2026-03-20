@@ -102,14 +102,20 @@ def _millions_formatter() -> FuncFormatter:
 
 
 def _non_calibrated_results(results_df: pd.DataFrame) -> pd.DataFrame:
-    mask = ~results_df["Model"].str.contains("(calibrated)", regex=False, na=False)
+    mask = (
+        ~results_df["Model"].str.contains("(calibrated)", regex=False, na=False)
+        & results_df["Model"].isin(MODEL_ORDER)
+    )
     df = results_df.loc[mask].copy()
     df["Model"] = pd.Categorical(df["Model"], categories=MODEL_ORDER, ordered=True)
     return df.sort_values("Model")
 
 
 def _non_calibrated_comparisons(comparisons_df: pd.DataFrame) -> pd.DataFrame:
-    mask = ~comparisons_df["candidate_model"].str.contains("(calibrated)", regex=False, na=False)
+    mask = (
+        ~comparisons_df["candidate_model"].str.contains("(calibrated)", regex=False, na=False)
+        & comparisons_df["candidate_model"].isin(CANDIDATE_ORDER)
+    )
     df = comparisons_df.loc[mask].copy()
     df["candidate_model"] = pd.Categorical(df["candidate_model"], categories=CANDIDATE_ORDER, ordered=True)
     return df.sort_values(["reference_model", "candidate_model"])
@@ -706,13 +712,23 @@ def create_reliability_diagram(
         mask = np.isfinite(scores)
         y, s = y_true[mask], scores[mask]
 
-        bin_edges = np.linspace(0, 1, n_bins + 1)
+        # Use quantile-based (equal-count) bins instead of equal-width bins.
+        # Credit scores are heavily concentrated near the base rate, so
+        # equal-width [0,1] bins leave most bins empty and produce a
+        # meaningless diagram.
+        try:
+            bin_edges = np.unique(np.percentile(s, np.linspace(0, 100, n_bins + 1)))
+        except Exception:
+            bin_edges = np.linspace(s.min(), s.max(), n_bins + 1)
+        if len(bin_edges) < 3:
+            bin_edges = np.linspace(s.min(), s.max(), n_bins + 1)
+
         bin_centers = []
         observed_rates = []
         bin_sizes = []
-        for i in range(n_bins):
+        for i in range(len(bin_edges) - 1):
             in_bin = (s >= bin_edges[i]) & (s < bin_edges[i + 1])
-            if i == n_bins - 1:
+            if i == len(bin_edges) - 2:
                 in_bin = (s >= bin_edges[i]) & (s <= bin_edges[i + 1])
             if in_bin.sum() > 0:
                 bin_centers.append(s[in_bin].mean())
@@ -721,7 +737,6 @@ def create_reliability_diagram(
 
         color = MODEL_COLORS.get(model_name, "#577590")
         linewidth, markersize = _line_emphasis(model_name, selected_model)
-        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.5, color="#9ca3af", label="Perfect calibration")
         ax.plot(
             bin_centers,
             observed_rates,
@@ -734,11 +749,18 @@ def create_reliability_diagram(
             label=_label_with_selection(model_name, selected_model),
         )
 
+        # Set axis limits to the actual score range (not 0-1) for readability
+        if bin_centers:
+            axis_max = max(max(bin_centers), max(observed_rates)) * 1.3
+            axis_max = max(axis_max, 0.05)  # at least 5% to avoid degenerate axis
+        else:
+            axis_max = 0.3
+        ax.plot([0, axis_max], [0, axis_max], linestyle="--", linewidth=1.5, color="#9ca3af", zorder=1)
         ax.set_title(_label_with_selection(model_name, selected_model), fontsize=14, fontweight="bold", color=TEXT_DARK)
         ax.set_xlabel("Predicted probability")
         ax.set_ylabel("Observed default rate")
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, max(0.3, max(observed_rates) * 1.2) if observed_rates else 0.3)
+        ax.set_xlim(0, axis_max)
+        ax.set_ylim(0, axis_max)
         ax.grid(alpha=0.25)
         ax.spines[["top", "right"]].set_visible(False)
         ax.legend(frameon=False, fontsize=9)
