@@ -1285,6 +1285,74 @@ def fit_pipeline_from_template(
     return fitted_model
 
 
+def compute_temporal_oof_scores(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    model_templates: dict[str, Pipeline],
+    cv,
+    sample_weight: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    if not isinstance(y_train, pd.Series):
+        y_train = pd.Series(y_train, index=X_train.index)
+    else:
+        y_train = y_train.copy()
+
+    if len(X_train) != len(y_train):
+        raise ValueError("X_train and y_train must have the same length")
+
+    if sample_weight is not None:
+        sample_weight = np.asarray(sample_weight)
+        if len(sample_weight) != len(X_train):
+            raise ValueError("sample_weight must have the same length as X_train")
+
+    oof_scores: dict[str, np.ndarray] = {}
+    for name, model_template in model_templates.items():
+        if not isinstance(model_template, Pipeline):
+            logger.warning(
+                "Skipping temporal OOF scores for {}: unsupported model type {}",
+                name,
+                model_template.__class__.__name__,
+            )
+            continue
+
+        model_scores = np.full(len(X_train), np.nan, dtype=float)
+        folds_used = 0
+        for fold_number, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train), start=1):
+            y_fold_train = y_train.iloc[train_idx]
+            class_counts = pd.Series(y_fold_train).value_counts()
+            if len(class_counts) < 2 or class_counts.min() < 2:
+                logger.warning(
+                    "OOF fold {} for {} skipped: insufficient class support ({})",
+                    fold_number,
+                    name,
+                    class_counts.to_dict(),
+                )
+                continue
+
+            X_fold_train = X_train.iloc[train_idx].copy()
+            X_fold_validation = X_train.iloc[val_idx].copy()
+            w_fold_train = sample_weight[train_idx] if sample_weight is not None else None
+            fold_model = fit_pipeline_from_template(
+                model_template,
+                X_fold_train,
+                y_fold_train,
+                sample_weight=w_fold_train,
+            )
+            model_scores[val_idx] = fold_model.predict_proba(X_fold_validation)[:, 1]
+            folds_used += 1
+
+        logger.info(
+            "Temporal OOF scores for {}: {:,} / {:,} rows covered across {} folds",
+            name,
+            int(np.isfinite(model_scores).sum()),
+            len(model_scores),
+            folds_used,
+        )
+        oof_scores[name] = model_scores
+
+    return oof_scores
+
+
 def train_stacking(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -1507,7 +1575,7 @@ def build_applicant_score_frame(
     if applicant_df.empty:
         return pd.DataFrame(
             columns=[
-                "authorization_id", "mis_Date", "status_name", TARGET,
+                "authorization_id", "mis_Date", "status_name", "AGE_T1", TARGET,
                 "has_observed_target", "target_source", "risk_score_rf", "score_RF",
             ]
         )
@@ -1520,9 +1588,11 @@ def build_applicant_score_frame(
         base_cat_cols,
     )
     X_applicant = X_applicant[frozen_feature_cols].copy()
+    if "AGE_T1" not in applicant_df.columns:
+        applicant_df["AGE_T1"] = np.nan
 
     score_frame = applicant_df.loc[:, [
-        "authorization_id", "mis_Date", "status_name", TARGET, "risk_score_rf", "score_RF",
+        "authorization_id", "mis_Date", "status_name", "AGE_T1", TARGET, "risk_score_rf", "score_RF",
     ]].copy()
     score_frame["has_observed_target"] = score_frame[TARGET].notna()
     score_frame["target_source"] = np.where(
@@ -2494,28 +2564,57 @@ def _run_diagnostics_and_governance(
         else:
             logger.info("Applicant scores not available (booked-monitoring mode) — skipping population KS and selection bias")
 
-        if age_values is not None:
-            ai_tables = []
+        ai_tables = []
+        ai_population_label = None
+        if (
+            applicant_scores_df is not None
+            and not applicant_scores_df.empty
+            and "AGE_T1" in applicant_scores_df.columns
+        ):
             for name in OFFICIAL_MODEL_NAMES:
-                if name in test_scores:
-                    ai_tables.append(compute_adverse_impact_analysis(y_test.values, test_scores[name], age_values, name))
-            ai_df = pd.concat(ai_tables, ignore_index=True) if ai_tables else pd.DataFrame()
-            if not ai_df.empty:
-                ai_df.to_csv(output_path / "adverse_impact_age.csv", index=False, float_format="%.6f")
-                logger.info("Adverse impact analysis by age band (10%% rejection threshold):")
-                for name in OFFICIAL_MODEL_NAMES:
-                    model_ai = ai_df.loc[ai_df["model"] == name]
-                    if model_ai.empty:
-                        continue
-                    n_fail = int((model_ai["air_flag"] == "FAIL").sum())
-                    if n_fail > 0:
-                        failing = model_ai.loc[model_ai["air_flag"] == "FAIL"]
-                        logger.warning("  {}: {} age band(s) below 80%% AIR threshold: {}",
-                                       name, n_fail, ", ".join(f"{r['age_band']} (AIR={r['adverse_impact_ratio']:.2f})" for _, r in failing.iterrows()))
-                    else:
-                        logger.info("  {}: all age bands pass 80%% AIR threshold", name)
+                score_col = f"score__{sanitize_output_name(name)}"
+                if score_col not in applicant_scores_df.columns:
+                    continue
+                ai_table = compute_adverse_impact_analysis(
+                    applicant_scores_df[TARGET].values,
+                    applicant_scores_df[score_col].values,
+                    applicant_scores_df["AGE_T1"].values,
+                    name,
+                )
+                if not ai_table.empty:
+                    ai_table["analysis_population"] = "underwriting_applicants"
+                    ai_tables.append(ai_table)
+            ai_population_label = "post-split underwriting applicants"
+        elif age_values is not None:
+            for name in OFFICIAL_MODEL_NAMES:
+                if name not in test_scores:
+                    continue
+                ai_table = compute_adverse_impact_analysis(y_test.values, test_scores[name], age_values, name)
+                if not ai_table.empty:
+                    ai_table["analysis_population"] = "booked_holdout"
+                    ai_tables.append(ai_table)
+            ai_population_label = "booked holdout"
         else:
             logger.info("AGE_T1 not available — skipping adverse impact analysis")
+
+        ai_df = pd.concat(ai_tables, ignore_index=True) if ai_tables else pd.DataFrame()
+        if not ai_df.empty:
+            ai_df.to_csv(output_path / "adverse_impact_age.csv", index=False, float_format="%.6f")
+            logger.info(
+                "Adverse impact analysis by age band ({}, 10%% rejection threshold):",
+                ai_population_label,
+            )
+            for name in OFFICIAL_MODEL_NAMES:
+                model_ai = ai_df.loc[ai_df["model"] == name]
+                if model_ai.empty:
+                    continue
+                n_fail = int((model_ai["air_flag"] == "FAIL").sum())
+                if n_fail > 0:
+                    failing = model_ai.loc[model_ai["air_flag"] == "FAIL"]
+                    logger.warning("  {}: {} age band(s) below 80%% AIR threshold: {}",
+                                   name, n_fail, ", ".join(f"{r['age_band']} (AIR={r['adverse_impact_ratio']:.2f})" for _, r in failing.iterrows()))
+                else:
+                    logger.info("  {}: all age bands pass 80%% AIR threshold", name)
 
     return overfit_df, model_selection_df
 
@@ -2856,6 +2955,20 @@ def main(
                 sample_weight=w_development_fit,
             )
 
+    with _log_step("11b", "Temporal OOF development scores"):
+        development_oof_scores = compute_temporal_oof_scores(
+            X_development_fit,
+            y_development_fit,
+            {
+                "Logistic Regression": lr_model,
+                "LightGBM": lgbm_model,
+                "XGBoost": xgb_model,
+                "CatBoost": catboost_model,
+            },
+            cv,
+            sample_weight=w_development_fit,
+        )
+
     with _log_step(12, "Calibration — booked ground-truth holdout"):
         models = {
             "Logistic Regression": lr_model,
@@ -3013,10 +3126,10 @@ def main(
     else:
         X_development_fit_booked = X_development_fit
         y_development_fit_booked = y_development_fit
-    train_scores = {}
-    for name, mdl in models.items():
-        if "(calibrated)" not in name:
-            train_scores[name] = mdl.predict_proba(X_development_fit_booked)[:, 1]
+    train_scores = {
+        name: scores[development_fit_booked_mask] if w_development_fit is not None else scores
+        for name, scores in development_oof_scores.items()
+    }
 
     with _log_step(14, "Bootstrap confidence intervals — booked test sample"):
         ci_df = bootstrap_confidence_intervals(y_test.values, test_scores)

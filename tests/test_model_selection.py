@@ -151,3 +151,44 @@ class TestSelectBestModel:
         # LightGBM has best PR AUC, best Brier, best OOT, low overfit → should win
         recommended = df.loc[df["recommended"]].iloc[0]
         assert recommended["model"] == "LightGBM"
+
+    def test_prefers_stronger_benchmark_evidence_within_selection_band(self):
+        results_df = pd.DataFrame(
+            {
+                "ROC AUC": [0.85, 0.85, 0.80],
+                "PR AUC": [0.18, 0.18, 0.13],
+                "KS": [0.55, 0.55, 0.45],
+                "Brier": [0.055, 0.055, 0.065],
+                "N": [1000, 1000, 1000],
+            },
+            index=["Logistic Regression", "LightGBM", "XGBoost"],
+        )
+        overfit_df = pd.DataFrame({
+            "model": ["Logistic Regression", "LightGBM", "XGBoost"],
+            "auc_delta": [0.015, 0.015, 0.040],
+        })
+        rolling_oot = pd.DataFrame({
+            "Model": ["Logistic Regression", "LightGBM", "XGBoost"],
+            "mean_PR_AUC": [0.17, 0.17, 0.12],
+            "n_folds": [4, 4, 4],
+        })
+        benchmark_comparisons_df = pd.DataFrame({
+            "candidate_model": ["Logistic Regression", "LightGBM", "XGBoost"],
+            "reference_model": ["risk_score_rf (benchmark)"] * 3,
+            "auc_improvement": [0.020, 0.020, 0.005],
+            "auc_improvement_lo": [-0.005, 0.005, -0.010],
+            "auc_p_adjusted": [0.200, 0.040, 0.900],
+        })
+
+        df = select_best_model(
+            results_df,
+            overfit_df=overfit_df,
+            rolling_oot_summary_df=rolling_oot,
+            candidate_names=list(results_df.index),
+            benchmark_comparisons_df=benchmark_comparisons_df,
+        )
+
+        recommended = df.loc[df["recommended"]].iloc[0]
+        assert recommended["model"] == "LightGBM"
+        assert bool(df.loc[df["model"] == "Logistic Regression", "selection_band"].iloc[0]) is True
+        assert bool(df.loc[df["model"] == "LightGBM", "selection_band"].iloc[0]) is True

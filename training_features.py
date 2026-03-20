@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import warnings
 from dataclasses import dataclass
 from itertools import combinations
@@ -189,6 +190,51 @@ def normalize_interaction_name(name: str) -> str:
     return name.replace("/", "_DIV_").replace("*", "_X_")
 
 
+def _apply_binned_numeric_labels(values: np.ndarray, bin_edges) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    bin_labels = np.full(len(values), "missing", dtype=object)
+    valid = np.isfinite(values)
+    if valid.sum() == 0:
+        return bin_labels
+
+    edges = np.unique(np.asarray(bin_edges, dtype=float))
+    if len(edges) < 2:
+        return bin_labels
+    edges[0] = -np.inf
+    edges[-1] = np.inf
+
+    binned = pd.cut(values[valid], bins=edges, include_lowest=True)
+    bin_labels[valid] = np.asarray(binned.astype(str), dtype=object)
+    return bin_labels
+
+
+def _fit_binned_numeric_labels(
+    values: np.ndarray,
+    q: int = 5,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    values = np.asarray(values, dtype=float)
+    valid = np.isfinite(values)
+    if valid.sum() < 2:
+        return None, None
+
+    try:
+        _, raw_bin_edges = pd.qcut(
+            pd.Series(values[valid]),
+            q=q,
+            retbins=True,
+            duplicates="drop",
+        )
+    except Exception:
+        return None, None
+
+    bin_edges = np.unique(np.asarray(raw_bin_edges, dtype=float))
+    if len(bin_edges) < 2:
+        return None, None
+    bin_edges[0] = -np.inf
+    bin_edges[-1] = np.inf
+    return _apply_binned_numeric_labels(values, bin_edges), bin_edges
+
+
 @dataclass
 class InteractionSearchResult:
     selected_interactions: pd.DataFrame
@@ -334,14 +380,11 @@ def search_interactions(
         logger.info("Screening {} binned num x cat pairs", len(binned_pairs))
     for num, cat in tqdm(binned_pairs, desc="Binned num x cat", leave=False):
         vals = df_search[num].values.astype(float)
-        valid = np.isfinite(vals)
-        if valid.sum() < 50:
+        if np.isfinite(vals).sum() < 50:
             continue
-        try:
-            binned = pd.qcut(pd.Series(vals[valid]), q=5, duplicates="drop")
-            bin_labels = np.full(len(vals), "missing", dtype=object)
-            bin_labels[valid] = binned.astype(str).values
-        except Exception:
+
+        bin_labels, bin_edges = _fit_binned_numeric_labels(vals, q=5)
+        if bin_labels is None or bin_edges is None:
             continue
         combo = np.char.add(np.char.add(bin_labels, "_"), df_search[cat].astype(str).values)
         auc_bc, _ = _temporal_target_encode_auc(combo, y_search, dates_search, temporal_splits=temporal_splits)
@@ -361,12 +404,13 @@ def search_interactions(
                 "power": power,
                 "selected": lift >= MIN_LIFT,
                 "scoring_strategy": categorical_scoring_strategy,
+                "bin_edges": tuple(float(edge) for edge in bin_edges),
             })
 
     leaderboard_cols = [
         "name", "type", "auc", "lift", "feat_a", "feat_b",
         "feat_a_power", "feat_b_power", "parent_power", "power",
-        "selected", "scoring_strategy",
+        "selected", "scoring_strategy", "bin_edges",
     ]
     all_results = pd.DataFrame(results, columns=leaderboard_cols)
     selected_results = all_results.loc[all_results["selected"]].copy() if not all_results.empty else all_results.copy()
@@ -433,13 +477,26 @@ def add_interactions(df: pd.DataFrame, all_results: pd.DataFrame) -> pd.DataFram
             df[col_name] = df[a].astype(str) + "_" + df[b].astype(str)
         elif row["type"] == "binned_num_cat":
             vals = df[a].values.astype(float)
-            valid = np.isfinite(vals)
-            bin_labels = np.full(len(vals), "missing", dtype=object)
-            try:
-                binned = pd.qcut(pd.Series(vals[valid]), q=5, duplicates="drop")
-                bin_labels[valid] = binned.astype(str).values
-            except Exception:
-                bin_labels[valid] = "single_bin"
+            stored_edges = row.get("bin_edges", pd.NA)
+            if isinstance(stored_edges, str) and stored_edges.strip():
+                try:
+                    stored_edges = ast.literal_eval(stored_edges)
+                except (SyntaxError, ValueError):
+                    stored_edges = pd.NA
+
+            bin_edges = None
+            if isinstance(stored_edges, (list, tuple, np.ndarray)):
+                parsed_edges = np.asarray(stored_edges, dtype=float)
+                if parsed_edges.ndim == 1 and len(parsed_edges) >= 2:
+                    bin_edges = parsed_edges
+
+            if bin_edges is not None:
+                bin_labels = _apply_binned_numeric_labels(vals, bin_edges)
+            else:
+                bin_labels, _ = _fit_binned_numeric_labels(vals, q=5)
+                if bin_labels is None:
+                    bin_labels = np.full(len(vals), "missing", dtype=object)
+
             df[col_name] = np.char.add(np.char.add(bin_labels, "_"), df[b].astype(str).values)
         added.append(col_name)
         existing.add(col_name)

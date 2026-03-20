@@ -930,6 +930,8 @@ class TestUnderwritingOutputs:
         assert len(applicant_scores_df) == expected_rows
         assert (applicant_scores_df["mis_Date"] >= pd.Timestamp(SPLIT_DATE)).all()
         assert applicant_scores_df["status_name"].isin(["Booked", "Rejected", "Canceled"]).all()
+        assert "AGE_T1" in applicant_scores_df.columns
+        assert applicant_scores_df["AGE_T1"].notna().all()
         assert "score__logistic_regression" in applicant_scores_df.columns
         assert applicant_scores_df["score__logistic_regression"].notna().all()
         assert (

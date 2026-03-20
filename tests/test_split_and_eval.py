@@ -5,10 +5,16 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from training import (
     TemporalExpandingCV,
     build_rolling_oot_windows,
+    compute_temporal_oof_scores,
     load_data,
     make_temporal_cv,
     resolve_temporal_feature_discovery_cutoff,
@@ -149,6 +155,38 @@ class TestMakeTemporalCV:
 
         with pytest.raises(ValueError, match="at least 3 distinct date blocks"):
             make_temporal_cv(dates, max_splits=5)
+
+
+class TestComputeTemporalOofScores:
+    def test_returns_partial_oof_coverage_for_expanding_cv(self):
+        dates = pd.to_datetime([
+            "2024-01-01", "2024-01-01",
+            "2024-02-01", "2024-02-01",
+            "2024-03-01", "2024-03-01",
+            "2024-04-01", "2024-04-01",
+            "2024-05-01", "2024-05-01",
+            "2024-06-01", "2024-06-01",
+        ])
+        X = pd.DataFrame({"x": np.linspace(0.0, 1.0, len(dates))})
+        y = pd.Series([0, 1] * (len(dates) // 2), name=TARGET)
+        cv = TemporalExpandingCV(dates, n_splits=3)
+        model = Pipeline([
+            ("preprocessor", ColumnTransformer([
+                ("num", Pipeline([
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                ]), ["x"]),
+            ])),
+            ("classifier", LogisticRegression(max_iter=5000, random_state=42)),
+        ])
+
+        scores = compute_temporal_oof_scores(X, y, {"Logistic Regression": model}, cv)
+
+        assert set(scores) == {"Logistic Regression"}
+        model_scores = scores["Logistic Regression"]
+        assert len(model_scores) == len(X)
+        assert np.isfinite(model_scores).sum() > 0
+        assert np.isfinite(model_scores).sum() < len(X)
 
 
 class TestTemporalCalibrationSplit:

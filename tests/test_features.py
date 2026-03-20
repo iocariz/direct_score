@@ -148,6 +148,23 @@ class TestAddInteractions:
         result = add_interactions(df, interactions)
         assert result["A_DIV_B"].iloc[0] == 99.0  # unchanged
 
+    def test_binned_num_cat_reuses_stored_bin_edges(self):
+        df = pd.DataFrame({
+            "A": [1.0, 2.0, 100.0],
+            "B": ["x", "x", "x"],
+        })
+        bin_edges = (-np.inf, 1.5, 2.5, np.inf)
+        interactions = pd.DataFrame([{
+            "name": "BIN_A_x_B", "type": "binned_num_cat", "feat_a": "A", "feat_b": "B",
+            "auc": 0.6, "lift": 0.05, "bin_edges": bin_edges,
+        }])
+
+        result = add_interactions(df, interactions)
+
+        expected_bins = pd.cut(df["A"], bins=np.array(bin_edges), include_lowest=True).astype(str)
+        expected = expected_bins + "_" + df["B"]
+        assert list(result["BIN_A_x_B"]) == list(expected)
+
 
 class TestTemporalInteractionScoring:
     def test_temporal_numeric_auc_penalizes_late_regime_shift(self, monkeypatch):

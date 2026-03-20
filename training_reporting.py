@@ -894,8 +894,8 @@ def compute_overfit_report(
         te = np.asarray(test_scores[name], dtype=float)
         is_prob = _score_is_probability(te)
 
-        train_metrics = evaluate(f"{name} (train)", y_train, tr, is_probability=is_prob)
-        test_metrics = evaluate(f"{name} (test)", y_test, te, is_probability=is_prob)
+        train_metrics = evaluate_safely(f"{name} (train)", y_train, tr, is_probability=is_prob)
+        test_metrics = evaluate_safely(f"{name} (test)", y_test, te, is_probability=is_prob)
 
         auc_delta = train_metrics["ROC AUC"] - test_metrics["ROC AUC"]
         pr_delta = train_metrics["PR AUC"] - test_metrics["PR AUC"]
@@ -959,6 +959,13 @@ def select_best_model(
     if not available:
         return pd.DataFrame()
 
+    benchmark_p_col = None
+    if benchmark_comparisons_df is not None and not benchmark_comparisons_df.empty:
+        if "auc_p_adjusted" in benchmark_comparisons_df.columns:
+            benchmark_p_col = "auc_p_adjusted"
+        elif "auc_p_value" in benchmark_comparisons_df.columns:
+            benchmark_p_col = "auc_p_value"
+
     records = []
     for name in available:
         row = results_df.loc[name]
@@ -1019,12 +1026,17 @@ def select_best_model(
 
         # 5. Benchmark lift — best AUC improvement vs any benchmark
         lift_score = 50.0
+        conservative_auc_lift = np.nan
+        benchmark_evidence_tier = 0
+        benchmark_evidence = "none"
         if benchmark_comparisons_df is not None and not benchmark_comparisons_df.empty:
             cand_rows = benchmark_comparisons_df.loc[
                 benchmark_comparisons_df["candidate_model"] == name
             ]
             if not cand_rows.empty:
                 best_lift = cand_rows["auc_improvement"].astype(float).max()
+                if "auc_improvement_lo" in cand_rows.columns:
+                    conservative_auc_lift = cand_rows["auc_improvement_lo"].astype(float).max()
                 all_lifts = benchmark_comparisons_df.loc[
                     benchmark_comparisons_df["candidate_model"].isin(available),
                     "auc_improvement",
@@ -1034,6 +1046,29 @@ def select_best_model(
                     ((best_lift - l_min) / (l_max - l_min) * 100)
                     if l_max > l_min else 50.0
                 )
+
+                positive_lower = bool(np.isfinite(conservative_auc_lift) and conservative_auc_lift > 0)
+                significant_positive = False
+                if benchmark_p_col is not None:
+                    p_values = cand_rows[benchmark_p_col].astype(float)
+                    if "auc_improvement_lo" in cand_rows.columns:
+                        significant_positive = bool(
+                            ((p_values <= 0.05) & (cand_rows["auc_improvement_lo"].astype(float) > 0)).any()
+                        )
+                    else:
+                        significant_positive = bool(
+                            ((p_values <= 0.05) & (cand_rows["auc_improvement"].astype(float) > 0)).any()
+                        )
+
+                if significant_positive:
+                    benchmark_evidence_tier = 3
+                    benchmark_evidence = "strong"
+                elif positive_lower:
+                    benchmark_evidence_tier = 2
+                    benchmark_evidence = "supported"
+                elif best_lift > 0:
+                    benchmark_evidence_tier = 1
+                    benchmark_evidence = "point_only"
 
         weighted = (
             0.35 * discrimination
@@ -1058,6 +1093,9 @@ def select_best_model(
             "generalization_score": round(generalization, 1),
             "lift_score": round(lift_score, 1),
             "weighted_score": round(weighted, 1),
+            "conservative_auc_lift": conservative_auc_lift,
+            "benchmark_evidence_tier": benchmark_evidence_tier,
+            "benchmark_evidence": benchmark_evidence,
             "test_pr_auc": pr_auc,
             "test_auc": float(row["ROC AUC"]),
             "test_brier_raw": raw_brier,
@@ -1065,10 +1103,57 @@ def select_best_model(
             "recommended": False,
         })
 
-    df = pd.DataFrame(records).sort_values("weighted_score", ascending=False).reset_index(drop=True)
-    if not df.empty:
-        df.loc[0, "recommended"] = True
-    return df
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    df["selection_band"] = False
+    if benchmark_comparisons_df is not None and not benchmark_comparisons_df.empty:
+        max_weighted = float(df["weighted_score"].max())
+        df["selection_band"] = df["weighted_score"] >= max_weighted - 2.0
+        winner_idx = (
+            df.loc[df["selection_band"]]
+            .sort_values(
+                [
+                    "benchmark_evidence_tier",
+                    "conservative_auc_lift",
+                    "generalization_score",
+                    "calibration_score",
+                    "discrimination_score",
+                    "stability_score",
+                    "weighted_score",
+                    "test_pr_auc",
+                    "test_auc",
+                ],
+                ascending=[False, False, False, False, False, False, False, False, False],
+                na_position="last",
+            )
+            .index[0]
+        )
+    else:
+        winner_idx = df["weighted_score"].idxmax()
+
+    df.loc[:, "recommended"] = False
+    df.loc[winner_idx, "recommended"] = True
+    return (
+        df.sort_values(
+            [
+                "recommended",
+                "weighted_score",
+                "benchmark_evidence_tier",
+                "conservative_auc_lift",
+                "generalization_score",
+                "calibration_score",
+                "discrimination_score",
+                "stability_score",
+                "test_pr_auc",
+                "test_auc",
+            ],
+            ascending=[False, False, False, False, False, False, False, False, False, False],
+            na_position="last",
+        )
+        .reset_index(drop=True)
+    )
 
 
 # ── Population Bias Analysis ─────────────────────────────────────────────────
@@ -1193,20 +1278,13 @@ def compute_adverse_impact_analysis(
     model_name: str,
     age_bins: list[tuple[float, float]] | None = None,
 ) -> pd.DataFrame:
-    """Adverse impact analysis by age band.
-
-    For each age band, computes observed default rate, predicted PD,
-    approval rate at a 10% rejection threshold, and the adverse impact
-    ratio (AIR) relative to the best-performing age band.  AIR < 0.80
-    is the conventional regulatory threshold for disparate impact.
-    """
     y_true = np.asarray(y_true, dtype=float)
     y_score = np.asarray(y_score, dtype=float)
     age = np.asarray(age, dtype=float)
 
-    valid = np.isfinite(y_true) & np.isfinite(y_score) & np.isfinite(age)
+    valid = np.isfinite(y_score) & np.isfinite(age)
     y_true, y_score, age = y_true[valid], y_score[valid], age[valid]
-    if len(y_true) == 0:
+    if len(y_score) == 0:
         return pd.DataFrame()
 
     if age_bins is None:
@@ -1225,8 +1303,10 @@ def compute_adverse_impact_analysis(
             continue
         y_band = y_true[mask]
         s_band = y_score[mask]
-        n_defaults = int(y_band.sum())
-        observed_rate = float(y_band.mean())
+        observed_mask = np.isfinite(y_band)
+        n_observed = int(observed_mask.sum())
+        n_defaults = int(np.nansum(y_band[observed_mask])) if n_observed > 0 else 0
+        observed_rate = float(np.nanmean(y_band[observed_mask])) if n_observed > 0 else np.nan
         predicted_pd = float(s_band.mean())
         approved = s_band < score_threshold
         approval_rate = float(approved.mean())
@@ -1235,6 +1315,7 @@ def compute_adverse_impact_analysis(
             "model": model_name,
             "age_band": f"{int(lo)}-{int(hi)}",
             "n": n,
+            "n_observed_outcomes": n_observed,
             "n_defaults": n_defaults,
             "observed_default_rate": observed_rate,
             "mean_predicted_pd": predicted_pd,

@@ -119,7 +119,7 @@ class TestComputeAdverseImpactAnalysis:
     def test_returns_expected_columns(self, ai_data):
         y, scores, age = ai_data
         df = compute_adverse_impact_analysis(y, scores, age, "test")
-        expected = {"model", "age_band", "n", "n_defaults", "observed_default_rate",
+        expected = {"model", "age_band", "n", "n_observed_outcomes", "n_defaults", "observed_default_rate",
                     "mean_predicted_pd", "approval_rate_at_10pct_reject",
                     "adverse_impact_ratio", "air_flag"}
         assert expected.issubset(df.columns)
@@ -154,6 +154,23 @@ class TestComputeAdverseImpactAnalysis:
         y, scores, age = ai_data
         df = compute_adverse_impact_analysis(y, scores, age, "test", age_bins=[(18, 40), (40, 70)])
         assert len(df) == 2
+
+    def test_keeps_unobserved_applicants_in_approval_analysis(self):
+        age = np.array([22.0] * 20 + [50.0] * 20)
+        y = np.array([np.nan] * 20 + [0.0] * 20)
+        scores = np.array([0.90] * 20 + [0.10] * 20)
+
+        df = compute_adverse_impact_analysis(y, scores, age, "test")
+
+        assert int(df["n"].sum()) == 40
+        young_band = df.loc[df["age_band"] == "18-25"].iloc[0]
+        older_band = df.loc[df["age_band"] == "45-55"].iloc[0]
+        assert young_band["n"] == 20
+        assert young_band["n_observed_outcomes"] == 0
+        assert np.isnan(young_band["observed_default_rate"])
+        assert young_band["approval_rate_at_10pct_reject"] == pytest.approx(0.0)
+        assert older_band["n_observed_outcomes"] == 20
+        assert older_band["approval_rate_at_10pct_reject"] == pytest.approx(1.0)
 
     def test_empty_when_no_valid_data(self):
         df = compute_adverse_impact_analysis(
