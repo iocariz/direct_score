@@ -12,34 +12,28 @@ from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 from sklearn.metrics import precision_recall_curve, roc_curve
+from training_constants import BENCHMARK_MODEL_NAMES, OFFICIAL_MODEL_NAMES
 
 TARGET = "basel_bad"
 
 MODEL_ORDER = [
-    "risk_score_rf (benchmark)",
-    "Logistic Regression",
-    "XGBoost",
-    "CatBoost",
-    "LightGBM",
-    "score_RF (benchmark)",
+    BENCHMARK_MODEL_NAMES[0],
+    *OFFICIAL_MODEL_NAMES,
+    BENCHMARK_MODEL_NAMES[1],
 ]
 
-CANDIDATE_ORDER = [
-    "Logistic Regression",
-    "XGBoost",
-    "CatBoost",
-    "LightGBM",
-]
+CANDIDATE_ORDER = list(OFFICIAL_MODEL_NAMES)
 
 STATUS_ORDER = ["Booked", "Rejected", "Canceled"]
 
 MODEL_COLORS = {
-    "risk_score_rf (benchmark)": "#1f4e79",
+    BENCHMARK_MODEL_NAMES[0]: "#1f4e79",
     "Logistic Regression": "#2a9d8f",
+    "EBM": "#7b2cbf",
+    "LightGBM": "#8d99ae",
     "XGBoost": "#577590",
     "CatBoost": "#f4a261",
-    "LightGBM": "#8d99ae",
-    "score_RF (benchmark)": "#d62828",
+    BENCHMARK_MODEL_NAMES[1]: "#d62828",
 }
 
 STATUS_COLORS = {
@@ -923,7 +917,7 @@ def create_top_drivers_chart(feature_importance_df: pd.DataFrame, output_path: P
  
     # Pick one model — prefer LightGBM, then XGBoost
     models = feature_importance_df["model"].unique()
-    preferred = ["LightGBM", "XGBoost", "CatBoost", "Logistic Regression"]
+    preferred = ["LightGBM", "XGBoost", "CatBoost", "EBM", "Logistic Regression"]
     chosen = selected_model if selected_model in models else next((m for m in preferred if m in models), models[0])
  
     mdf = feature_importance_df.loc[feature_importance_df["model"] == chosen].copy()

@@ -19,6 +19,7 @@ from training import (
     run_rolling_out_of_time_validation,
     temporal_split,
     train_catboost,
+    train_ebm,
     train_logistic_regression,
     train_lgbm,
     train_stacking,
@@ -48,7 +49,6 @@ from training_reporting import (
 )
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
 
@@ -308,9 +308,14 @@ def _patch_fast_main_dependencies(monkeypatch, structured_raw_df_with_rejects):
 
 
 @pytest.fixture()
-def pipeline_data(train_test_data):
-    """Prepare data ready for model training (cardinality reduced, preprocessors built)."""
-    X_train, y_train, X_test, y_test, num_cols, cat_cols, feature_cols, train_dates = train_test_data
+def pipeline_data(structured_raw_df):
+    """Prepare data ready for model training (cardinality reduced, preprocessors built).
+
+    Uses structured temporal data to guarantee both classes in every temporal fold.
+    """
+    df = engineer_features(structured_raw_df)
+    feature_cols, num_cols, cat_cols = select_features(df)
+    X_train, y_train, X_test, y_test, _, _, train_dates = temporal_split(df, feature_cols)
 
     if len(X_train) < 20 or y_train.sum() < 2:
         pytest.skip("Not enough data for model training")
@@ -318,45 +323,28 @@ def pipeline_data(train_test_data):
     X_train, X_test, _ = reduce_cardinality(X_train, X_test, cat_cols)
     preprocessor, lgbm_preprocessor, lgbm_cat_indices = build_preprocessors(num_cols, cat_cols)
     pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
-    cv = StratifiedKFold(n_splits=2, shuffle=True, random_state=RANDOM_STATE)
+    temporal_dates = pd.to_datetime(np.asarray(train_dates))
+    cv = training_module.make_temporal_cv(temporal_dates, max_splits=2)
 
     return {
         "X_train": X_train, "y_train": y_train,
         "X_test": X_test, "y_test": y_test,
         "num_cols": num_cols, "cat_cols": cat_cols,
-        "preprocessor": preprocessor,
-        "lgbm_preprocessor": lgbm_preprocessor,
-        "lgbm_cat_indices": lgbm_cat_indices,
-        "pos_weight": pos_weight,
-        "cv": cv,
-        "train_dates": pd.to_datetime(np.asarray(train_dates)),
-    }
-
-
-@pytest.fixture()
-def temporal_pipeline_data(structured_raw_df):
-    df = engineer_features(structured_raw_df)
-    feature_cols, num_cols, cat_cols = select_features(df)
-    X_train, y_train, X_test, y_test, _, _, train_dates = temporal_split(df, feature_cols)
-    X_train, X_test, _ = reduce_cardinality(X_train, X_test, cat_cols)
-    preprocessor, lgbm_preprocessor, lgbm_cat_indices = build_preprocessors(num_cols, cat_cols)
-    pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
-    temporal_cv = training_module.make_temporal_cv(train_dates, max_splits=3)
-    return {
-        "X_train": X_train,
-        "y_train": y_train,
-        "X_test": X_test,
-        "y_test": y_test,
-        "num_cols": num_cols,
-        "cat_cols": cat_cols,
         "feature_cols": feature_cols,
         "preprocessor": preprocessor,
         "lgbm_preprocessor": lgbm_preprocessor,
         "lgbm_cat_indices": lgbm_cat_indices,
         "pos_weight": pos_weight,
-        "temporal_cv": temporal_cv,
-        "train_dates": pd.to_datetime(np.asarray(train_dates)),
+        "cv": cv,
+        "train_dates": temporal_dates,
     }
+
+
+@pytest.fixture()
+def temporal_pipeline_data(pipeline_data):
+    d = dict(pipeline_data)
+    d["temporal_cv"] = training_module.make_temporal_cv(d["train_dates"], max_splits=3)
+    return d
 
 
 class TestTrainLogisticRegression:
@@ -374,6 +362,28 @@ class TestTrainLogisticRegression:
         w = np.ones(len(d["X_train"]))
         w[::3] = 0.5  # every 3rd sample at half weight
         model, study = train_logistic_regression(
+            d["X_train"], d["y_train"], d["preprocessor"], d["cv"],
+            n_trials=2, sample_weight=w,
+        )
+        proba = model.predict_proba(d["X_test"])
+        assert proba.shape[1] == 2
+
+
+class TestTrainEbm:
+    def test_returns_fitted_model(self, pipeline_data):
+        d = pipeline_data
+        model, study = train_ebm(
+            d["X_train"], d["y_train"], d["preprocessor"], d["cv"], n_trials=2,
+        )
+        proba = model.predict_proba(d["X_test"])
+        assert proba.shape == (len(d["X_test"]), 2)
+        assert study.best_value > 0
+
+    def test_with_sample_weight(self, pipeline_data):
+        d = pipeline_data
+        w = np.ones(len(d["X_train"]))
+        w[::3] = 0.5
+        model, study = train_ebm(
             d["X_train"], d["y_train"], d["preprocessor"], d["cv"],
             n_trials=2, sample_weight=w,
         )

@@ -15,7 +15,6 @@ import sys
 import time
 import warnings
 from contextlib import contextmanager
-from itertools import combinations
 from pathlib import Path
 
 import matplotlib
@@ -41,6 +40,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler, TargetEncoder
 from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 from catboost import CatBoostClassifier
+from interpret.glassbox import ExplainableBoostingClassifier
 from xgboost import XGBClassifier
 
 from training_constants import (
@@ -898,6 +898,93 @@ def train_logistic_regression(X_train, y_train, preprocessor, cv, n_trials: int,
     ])
     lr_model.fit(X_train, y_train, classifier__sample_weight=sample_weight)
     return lr_model, study
+
+
+def train_ebm(X_train, y_train, preprocessor, cv, n_trials: int, sample_weight=None):
+    """Train an Explainable Boosting Machine (GAM) with Optuna hyperparameter search.
+
+    EBMs learn additive shape functions per feature + optional pairwise interactions.
+    They sit between LR and full tree ensembles in complexity: more flexible than LR
+    (captures non-linear effects per feature) but less prone to overfitting than
+    tree ensembles (additive structure prevents high-order interactions).
+    """
+    logger.info("Optuna: {} trials x {} folds (EBM — Explainable Boosting Machine)",
+                n_trials, cv.n_splits)
+    folds = list(cv.split(X_train, y_train))
+
+    def objective(trial):
+        max_bins = trial.suggest_int("max_bins", 64, 256)
+        learning_rate = trial.suggest_float("learning_rate", 0.005, 0.05, log=True)
+        max_interaction_bins = trial.suggest_int("max_interaction_bins", 16, 64)
+        interactions = trial.suggest_int("interactions", 0, 15)
+        inner_bags = trial.suggest_int("inner_bags", 0, 8)
+        outer_bags = trial.suggest_int("outer_bags", 4, 16)
+        smoothing_rounds = trial.suggest_int("smoothing_rounds", 0, 500)
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 2, 50)
+
+        fold_scores = []
+        for fold_i, (train_idx, val_idx) in enumerate(folds):
+            pre = clone(preprocessor)
+            X_tr_t = pre.fit_transform(X_train.iloc[train_idx], y=y_train.iloc[train_idx])
+            X_va_t = pre.transform(X_train.iloc[val_idx])
+            w_fold = sample_weight[train_idx] if sample_weight is not None else None
+
+            ebm = ExplainableBoostingClassifier(
+                max_bins=max_bins,
+                learning_rate=learning_rate,
+                max_interaction_bins=max_interaction_bins,
+                interactions=interactions,
+                inner_bags=inner_bags,
+                outer_bags=outer_bags,
+                smoothing_rounds=smoothing_rounds,
+                min_samples_leaf=min_samples_leaf,
+                random_state=RANDOM_STATE,
+            )
+            if w_fold is not None:
+                ebm.fit(X_tr_t, y_train.iloc[train_idx], sample_weight=w_fold)
+            else:
+                ebm.fit(X_tr_t, y_train.iloc[train_idx])
+            y_pred = ebm.predict_proba(X_va_t)[:, 1]
+            fold_scores.append(average_precision_score(y_train.iloc[val_idx], y_pred))
+
+            trial.report(np.mean(fold_scores), fold_i)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return np.mean(fold_scores)
+
+    study = optuna.create_study(
+        direction="maximize", study_name="ebm",
+        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+    )
+    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+
+    bp = study.best_params
+    logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
+    logger.info("  max_bins={}, lr={:.4f}, interactions={}, outer_bags={}, min_samples_leaf={}",
+                bp["max_bins"], bp["learning_rate"], bp["interactions"],
+                bp["outer_bags"], bp["min_samples_leaf"])
+
+    ebm_model = Pipeline([
+        ("preprocessor", preprocessor),
+        ("classifier", ExplainableBoostingClassifier(
+            max_bins=bp["max_bins"],
+            learning_rate=bp["learning_rate"],
+            max_interaction_bins=bp["max_interaction_bins"],
+            interactions=bp["interactions"],
+            inner_bags=bp["inner_bags"],
+            outer_bags=bp["outer_bags"],
+            smoothing_rounds=bp["smoothing_rounds"],
+            min_samples_leaf=bp["min_samples_leaf"],
+            random_state=RANDOM_STATE,
+        )),
+    ])
+    if sample_weight is not None:
+        ebm_model.fit(X_train, y_train, classifier__sample_weight=sample_weight)
+    else:
+        ebm_model.fit(X_train, y_train)
+    return ebm_model, study
 
 
 def _lgbm_prauc_eval(y_true, y_raw):
@@ -2895,6 +2982,15 @@ def main(
             num_cols=num_cols,
             cat_cols=cat_cols,
         )
+    with _log_step("7b", "EBM — development fit sample"):
+        ebm_model, ebm_study = train_ebm(
+            X_development_fit,
+            y_development_fit,
+            preprocessor,
+            cv,
+            optuna_trials,
+            sample_weight=w_development_fit,
+        )
     with _log_step(8, "LightGBM — development fit sample"):
         lgbm_model, lgbm_study, lgbm_best_n = train_lgbm(
             X_development_fit,
@@ -2933,6 +3029,7 @@ def main(
     # Save Optuna trial histories for hyperparameter sensitivity analysis
     for study_name, study_obj in [
         ("Logistic Regression", lr_study),
+        ("EBM", ebm_study),
         ("LightGBM", lgbm_study),
         ("XGBoost", xgb_study),
         ("CatBoost", catboost_study),
@@ -2947,6 +3044,7 @@ def main(
                 y_development_fit,
                 {
                     "Logistic Regression": lr_model,
+                    "EBM": ebm_model,
                     "LightGBM": lgbm_model,
                     "XGBoost": xgb_model,
                     "CatBoost": catboost_model,
@@ -2961,6 +3059,7 @@ def main(
             y_development_fit,
             {
                 "Logistic Regression": lr_model,
+                "EBM": ebm_model,
                 "LightGBM": lgbm_model,
                 "XGBoost": xgb_model,
                 "CatBoost": catboost_model,
@@ -2972,6 +3071,7 @@ def main(
     with _log_step(12, "Calibration — booked ground-truth holdout"):
         models = {
             "Logistic Regression": lr_model,
+            "EBM": ebm_model,
             "LightGBM": lgbm_model,
             "XGBoost": xgb_model,
             "CatBoost": catboost_model,
@@ -2979,13 +3079,13 @@ def main(
         if stack_model is not None:
             models[EXPERIMENTAL_STACKING_NAME] = stack_model
         for name in OFFICIAL_MODEL_NAMES:
-            # Isotonic for tree models (step-function scores); sigmoid for LR (already log-odds)
-            method = "sigmoid" if name == "Logistic Regression" else "isotonic"
+            # Isotonic for tree models (step-function scores); sigmoid for LR/EBM (smooth scores)
+            method = "sigmoid" if name in ("Logistic Regression", "EBM") else "isotonic"
             cal = CalibratedClassifierCV(FrozenEstimator(models[name]), method=method)
             cal.fit(X_calibration_booked, y_calibration_booked)
             models[f"{name} (calibrated)"] = cal
         logger.info(
-            "Calibration on {:,} booked held-out samples ({:,} pos) — sigmoid for LR, isotonic for tree models",
+            "Calibration on {:,} booked held-out samples ({:,} pos) — sigmoid for LR/EBM, isotonic for tree models",
             len(y_calibration_booked),
             y_calibration_booked.sum(),
         )

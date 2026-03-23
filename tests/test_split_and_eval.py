@@ -260,6 +260,54 @@ class TestTemporalCalibrationSplit:
         }
         assert X_calib.index.tolist() == [6, 7, 8, 9]
 
+    def test_calibration_remains_pre_test(self):
+        """Calibration dates must all be strictly before SPLIT_DATE."""
+        dates = pd.to_datetime([
+            "2024-01-01", "2024-01-01",
+            "2024-02-01", "2024-02-01",
+            "2024-03-01", "2024-03-01",
+            "2024-04-01", "2024-04-01",
+            "2024-05-01", "2024-05-01",
+            "2024-06-01", "2024-06-01",
+        ])
+        X = pd.DataFrame({"x": np.arange(len(dates))})
+        y = pd.Series([0, 1] * (len(dates) // 2), name=TARGET)
+
+        _, _, _, _, dates_fit, dates_calib = temporal_calibration_split(
+            X, y, dates, calibration_fraction=0.25,
+        )
+
+        split_ts = pd.Timestamp(SPLIT_DATE)
+        assert pd.to_datetime(dates_calib).max() < split_ts, (
+            "Calibration dates must be strictly before SPLIT_DATE"
+        )
+        assert pd.to_datetime(dates_fit).max() < pd.to_datetime(dates_calib).min(), (
+            "Fit dates must precede calibration dates"
+        )
+
+    def test_calibration_metadata_date_range(self):
+        """Calibration split reports correct date boundaries."""
+        dates = pd.to_datetime([
+            "2024-01-01", "2024-01-01",
+            "2024-02-01", "2024-02-01",
+            "2024-03-01", "2024-03-01",
+            "2024-04-01", "2024-04-01",
+        ])
+        X = pd.DataFrame({"x": np.arange(len(dates))})
+        y = pd.Series([0, 1] * (len(dates) // 2), name=TARGET)
+
+        _, X_calib, _, y_calib, dates_fit, dates_calib = temporal_calibration_split(
+            X, y, dates, calibration_fraction=0.25,
+        )
+
+        assert len(X_calib) == len(y_calib) == len(dates_calib)
+        assert len(dates_calib) > 0, "Calibration set must not be empty"
+        calib_dates = pd.to_datetime(dates_calib)
+        fit_dates = pd.to_datetime(dates_fit)
+        assert calib_dates.min() > fit_dates.max(), (
+            "Calibration window must start after fit window ends"
+        )
+
 
 class TestTemporalFeatureDiscoverySplit:
     def test_uses_earliest_dates_for_discovery(self):

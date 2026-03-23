@@ -22,6 +22,7 @@ POPULATION_MODE_UNDERWRITING = "underwriting"
 UNDERWRITING_DECISION_STATUSES = ("Booked", "Rejected", "Canceled")
 OFFICIAL_MODEL_NAMES = [
     "Logistic Regression",
+    "EBM",
     "LightGBM",
     "XGBoost",
     "CatBoost",

@@ -17,6 +17,7 @@ from docx.shared import Inches, Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
+from training_constants import OFFICIAL_MODEL_NAMES
 
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
@@ -39,6 +40,24 @@ def _int_fmt(val):
 def _read(output_dir: Path, name: str) -> pd.DataFrame | None:
     path = output_dir / name
     return pd.read_csv(path) if path.exists() else None
+
+
+def _recommended_model_name(results_df: pd.DataFrame | None, selection_df: pd.DataFrame | None) -> str:
+    if selection_df is not None and not selection_df.empty and {"model", "recommended"}.issubset(selection_df.columns):
+        recommended_rows = selection_df.loc[selection_df["recommended"].fillna(False).astype(bool)]
+        if not recommended_rows.empty:
+            return str(recommended_rows.iloc[0]["model"])
+
+    if results_df is not None and not results_df.empty and "Model" in results_df.columns:
+        candidate_df = results_df.loc[
+            results_df["Model"].isin(OFFICIAL_MODEL_NAMES)
+            & ~results_df["Model"].str.contains("calibrated|Ensemble", regex=True, na=False)
+        ].copy()
+        if not candidate_df.empty:
+            candidate_df = candidate_df.sort_values(["PR AUC", "ROC AUC"], ascending=False)
+            return str(candidate_df.iloc[0]["Model"])
+
+    return OFFICIAL_MODEL_NAMES[0]
 
 
 # ── Table helpers ─────────────────────────────────────────────────────────────
@@ -111,23 +130,36 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
     ablation = _read(o, "ablation_results.csv")
 
     # Derive key numbers
-    recommended = "Logistic Regression"
-    if sel is not None:
-        rec_row = sel.loc[sel["recommended"].fillna(False).astype(bool)]
-        if not rec_row.empty:
-            recommended = str(rec_row.iloc[0]["model"])
-    rec_r = results.loc[results["Model"] == recommended].iloc[0] if results is not None else None
+    recommended = _recommended_model_name(results, sel)
+    rec_r = None
+    if results is not None and not results.empty:
+        rec_rows = results.loc[results["Model"] == recommended]
+        rec_r = rec_rows.iloc[0] if not rec_rows.empty else results.iloc[0]
 
-    test_n = int(rec_r["N"]) if rec_r is not None else 0
-    test_pos = int(bench.iloc[0]["n_pos"]) if bench is not None else 0
+    test_n = int(rec_r["N"]) if rec_r is not None and "N" in rec_r else 0
+    test_pos = int(bench.iloc[0]["n_pos"]) if bench is not None and not bench.empty else 0
     test_rate = test_pos / test_n if test_n > 0 else 0
 
-    pre_booked = pop.loc[(pop["split"] == "pre_split") & (pop["status_name"] == "Booked")].iloc[0] if pop is not None else None
+    pre_booked = None
+    if pop is not None:
+        pre_booked_rows = pop.loc[(pop["split"] == "pre_split") & (pop["status_name"] == "Booked")]
+        if not pre_booked_rows.empty:
+            pre_booked = pre_booked_rows.iloc[0]
     post_total = int(pop.loc[pop["split"] == "post_split", "n_rows"].sum()) if pop is not None else 0
 
     lr_lift_df = lift.loc[lift["model"] == recommended] if lift is not None else None
     lr_thresh_df = thresh.loc[thresh["model"] == recommended] if thresh is not None else None
     lr_ai_df = ai.loc[ai["model"] == recommended] if ai is not None else None
+    non_cal_results = pd.DataFrame()
+    if results is not None and not results.empty:
+        non_cal_results = results.loc[
+            ~results["Model"].str.contains("calibrated|Ensemble", regex=True, na=False)
+        ].copy()
+    best_auc_model = recommended
+    best_pr_model = recommended
+    if not non_cal_results.empty:
+        best_auc_model = str(non_cal_results.loc[non_cal_results["ROC AUC"].astype(float).idxmax(), "Model"])
+        best_pr_model = str(non_cal_results.loc[non_cal_results["PR AUC"].astype(float).idxmax(), "Model"])
 
     # ══════════════════════════════════════════════════════════════════════
     # TITLE
@@ -199,21 +231,26 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
         )
     if overfit is not None:
         lr_of = overfit.loc[overfit["model"] == recommended]
-        tree_of = overfit.loc[overfit["model"] != recommended]
+        tree_of = overfit.loc[(overfit["model"].isin(OFFICIAL_MODEL_NAMES)) & (overfit["model"] != recommended)]
         if not lr_of.empty and not tree_of.empty:
+            worst_peer = tree_of.sort_values("auc_delta", ascending=False).iloc[0]
             findings.append(
-                f"Logistic Regression shows a mild overfit gap (AUC delta {lr_of.iloc[0]['auc_delta']:+.4f}), "
-                f"while tree models exhibit severe overfitting (AUC deltas from "
-                f"+{tree_of['auc_delta'].min():.2f} to +{tree_of['auc_delta'].max():.2f}). "
-                f"This is the primary reason the multi-criteria selection favors the linear model "
-                f"despite competitive held-out discrimination from LightGBM and XGBoost."
+                f"{recommended} shows an AUC overfit gap of {lr_of.iloc[0]['auc_delta']:+.4f}. "
+                f"Across the remaining candidates, AUC deltas range from "
+                f"{tree_of['auc_delta'].min():+.4f} to {tree_of['auc_delta'].max():+.4f}, "
+                f"with {worst_peer['model']} exhibiting the largest gap. "
+                f"This generalization advantage is one of the main reasons the scorecard favors {recommended}."
+            )
+        elif not lr_of.empty:
+            findings.append(
+                f"{recommended} shows an AUC overfit gap of {lr_of.iloc[0]['auc_delta']:+.4f} on the held-out sample."
             )
     if lr_lift_df is not None and not lr_lift_df.empty:
         top2_capture = lr_lift_df.loc[lr_lift_df["decile"] <= 2, "capture_rate"].max()
         top_lift = lr_lift_df.iloc[0]["lift"]
         findings.append(
             f"The top score decile concentrates defaults at {top_lift:.1f}x the population average. "
-            f"The top two deciles capture {_pct(top2_capture)} of all observed defaults, demonstrating "
+            f"The top two deciles capture {_pct(top2_capture)} of all defaults, demonstrating "
             f"meaningful separation for underwriting cutoff decisions."
         )
     if lr_ai_df is not None:
@@ -230,10 +267,20 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
         else:
             findings.append("All age bands pass the 80% adverse impact ratio threshold.")
 
-    findings.append(
-        "Score distributions are highly stable between training and test (all PSI < 0.02) "
-        "and no concept drift is detected across rolling out-of-time windows."
-    )
+    if psi_df is not None and not psi_df.empty:
+        max_psi = float(psi_df["psi"].max())
+        findings.append(
+            f"Score distributions remain stable between training and test, with maximum PSI {_fmt(max_psi)}."
+        )
+    if drift is not None and not drift.empty:
+        n_drift = int((drift["concept_drift_flag"] == "YES").sum())
+        if n_drift == 0:
+            findings.append("No concept drift is detected across the rolling out-of-time validation windows.")
+        else:
+            drift_models = ", ".join(drift.loc[drift["concept_drift_flag"] == "YES", "model"].astype(str).tolist())
+            findings.append(
+                f"Concept drift is detected for {n_drift} model(s): {drift_models}."
+            )
 
     for f in findings:
         doc.add_paragraph(f, style="List Bullet")
@@ -353,7 +400,7 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
 
     doc.add_heading("3.4 Model Training", level=2)
     doc.add_paragraph(
-        "Four candidate architectures are trained with Optuna Bayesian hyperparameter optimization "
+        "Five candidate architectures are trained with Optuna Bayesian hyperparameter optimization "
         "using multivariate TPE sampling (models correlations between hyperparameters) and median "
         "pruning (terminates unpromising trials after the first 1-2 cross-validation folds)."
     )
@@ -361,6 +408,7 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
         ["Model", "Approach", "Calibration", "Key Regularization"],
         [
             ["Logistic Regression", "L2-penalized, LBFGS solver, C and TargetEncoder smooth tuned jointly", "Sigmoid (Platt)", "class_weight='balanced'"],
+            ["EBM", "Explainable boosting machine with additive shape functions and limited pairwise interactions", "Sigmoid (Platt)", "max_bins 64-256, interactions 0-15, min_samples_leaf 2-50"],
             ["LightGBM", "Gradient boosting, native categorical handling via ordinal encoding", "Isotonic", "num_leaves 8-31, max_bin 63-127, colsample_bynode 0.6-1.0, early stopping after 30 rounds"],
             ["XGBoost", "Gradient boosting, TargetEncoder preprocessing", "Isotonic", "max_depth 2-4, min_child_weight 20-100, colsample_bynode 0.6-1.0, early stopping after 30 rounds"],
             ["CatBoost", "Oblivious gradient boosting, balanced class weights", "Isotonic", "depth 3-5, min_data_in_leaf 50-300, early stopping after 30 rounds"],
@@ -379,8 +427,8 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
         "Probability calibration is fitted on the latest pre-split booked holdout (15% of "
         "development data by date). Isotonic calibration is used for tree models because their "
         "output distributions are step-functions that violate the linear log-odds assumption of "
-        "Platt scaling. Sigmoid (Platt) calibration is retained for Logistic Regression, whose "
-        "output is already in log-odds form. The model selection scorecard evaluates calibration "
+        "Platt scaling. Sigmoid (Platt) calibration is retained for Logistic Regression and EBM, "
+        "whose score distributions are smoother and closer to a log-odds scale. The model selection scorecard evaluates calibration "
         "quality using the calibrated Brier score, since that reflects production probability quality."
     )
 
@@ -427,12 +475,18 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
     _add_image(doc, o / "plots" / "stakeholder_holdout_benchmarks.png")
     doc.add_paragraph("")
 
-    doc.add_paragraph(
-        "Logistic Regression and the post-hoc ensemble (55% LR + 45% LightGBM) lead on "
-        "ROC AUC, while risk_score_rf retains the highest PR AUC. The tree models cluster "
-        "below Logistic Regression on both metrics despite having far more expressive architectures, "
-        "which is a direct consequence of their overfitting to the training data."
-    )
+    if best_auc_model == best_pr_model:
+        doc.add_paragraph(
+            f"On the non-calibrated leaderboard, {best_auc_model} leads both ROC AUC and PR AUC. "
+            f"{recommended} remains the recommended production candidate because the final decision balances "
+            "discrimination with calibration, stability, generalization, and benchmark lift."
+        )
+    else:
+        doc.add_paragraph(
+            f"On the non-calibrated leaderboard, {best_auc_model} leads ROC AUC while {best_pr_model} "
+            f"delivers the strongest PR AUC. {recommended} remains the recommended production candidate because "
+            "the final decision balances discrimination with calibration, stability, generalization, and benchmark lift."
+        )
 
     doc.add_heading("4.2 Model Selection Scorecard", level=2)
     if sel is not None:
@@ -448,18 +502,16 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
         doc.add_paragraph("")
         doc.add_paragraph(
             f"{recommended} achieves the highest weighted score ({sel.iloc[0]['weighted_score']:.1f}/100) "
-            f"by combining the best discrimination, the best benchmark lift, and the cleanest "
-            f"generalization profile. Tree models score well on calibration (isotonic calibration "
-            f"helps their Brier scores) and stability, but are heavily penalized on generalization "
-            f"due to their extreme train-test gaps."
+            "on the multi-criteria scorecard. The recommendation balances discrimination, calibration, "
+            "stability, generalization, and benchmark lift rather than optimizing only a single held-out metric."
         )
 
     doc.add_heading("4.3 Overfitting Analysis", level=2)
     doc.add_paragraph(
         "The overfitting report compares each model's metrics on the training data versus the "
         "held-out test. A train-test delta above 0.03 on AUC or PR AUC triggers a flag. "
-        "This analysis explains why tree models, despite having access to more expressive "
-        "hypothesis spaces, underperform the linear model on held-out data."
+        "This analysis helps explain why models with extremely strong in-sample fit do not always "
+        "translate into the best production recommendation."
     )
     if overfit is not None:
         rows = []
@@ -471,14 +523,16 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
             ])
         _add_table(doc, ["Model", "Train AUC", "Test AUC", "Delta", "Train PR", "Test PR", "PR Delta", "Flag"], rows)
         doc.add_paragraph("")
-        doc.add_paragraph(
-            "Logistic Regression's AUC delta (+0.035) is borderline, reflecting modest memorization "
-            "that does not substantially harm generalization. In contrast, LightGBM (+0.333), "
-            "XGBoost (+0.262), and CatBoost (+0.253) achieve near-perfect training performance "
-            "but lose most of this advantage on unseen data. This pattern is typical of tree "
-            "ensembles on low-event-rate credit data where a small number of default cases can "
-            "be perfectly separated by complex splits that do not generalize."
-        )
+        rec_overfit = overfit.loc[overfit["model"] == recommended]
+        peer_overfit = overfit.loc[(overfit["model"].isin(OFFICIAL_MODEL_NAMES)) & (overfit["model"] != recommended)]
+        if not rec_overfit.empty and not peer_overfit.empty:
+            worst_peer = peer_overfit.sort_values("auc_delta", ascending=False).iloc[0]
+            doc.add_paragraph(
+                f"{recommended} posts an AUC delta of {rec_overfit.iloc[0]['auc_delta']:+.4f} and a PR AUC delta of "
+                f"{rec_overfit.iloc[0]['pr_auc_delta']:+.4f}. Among the remaining candidates, the largest AUC gap is "
+                f"{worst_peer['model']} at {worst_peer['auc_delta']:+.4f}. This indicates that the more flexible "
+                "models fit the development sample more aggressively than they generalize to unseen accounts."
+            )
 
     doc.add_heading("4.4 Bootstrap Confidence Intervals", level=2)
     doc.add_paragraph(
@@ -534,10 +588,18 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
             ])
         _add_table(doc, ["Model", "First PR", "Last PR", "Slope/Fold", "Drift"], rows)
         doc.add_paragraph("")
-        doc.add_paragraph(
-            "No models show concept drift in the current evaluation period. PR AUC fluctuations "
-            "are within normal sampling variance across all four forward windows."
-        )
+        n_drift = int((drift["concept_drift_flag"] == "YES").sum())
+        n_windows = int(oot_unc["n_folds"].max()) if oot is not None and not oot.empty else 0
+        if n_drift == 0:
+            doc.add_paragraph(
+                f"No models show concept drift in the current evaluation period. PR AUC fluctuations "
+                f"remain within normal sampling variance across {n_windows} forward validation windows."
+            )
+        else:
+            drift_models = ", ".join(drift.loc[drift["concept_drift_flag"] == "YES", "model"].astype(str).tolist())
+            doc.add_paragraph(
+                f"{n_drift} model(s) are flagged for concept drift across {n_windows} forward validation windows: {drift_models}."
+            )
 
     # ══════════════════════════════════════════════════════════════════════
     # 5. OPERATIONAL ANALYSIS
@@ -561,9 +623,10 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
         doc.add_paragraph("")
         top_rate = lr_lift_df.iloc[0]["default_rate"]
         bot_rate = lr_lift_df.iloc[-1]["default_rate"]
+        concentration_ratio = f"{top_rate/bot_rate:.0f}:1" if pd.notna(bot_rate) and bot_rate > 0 else "N/A"
         doc.add_paragraph(
             f"The riskiest decile has a {_pct(top_rate)} default rate versus {_pct(bot_rate)} in the "
-            f"safest decile -- an {top_rate/bot_rate:.0f}:1 concentration ratio. The top two deciles "
+            f"safest decile -- an {concentration_ratio} concentration ratio. The top two deciles "
             f"capture {_pct(lr_lift_df.loc[lr_lift_df['decile']<=2, 'capture_rate'].max())} of all defaults."
         )
 
@@ -607,10 +670,11 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
             rows.append([str(r["model"]), _fmt(r["psi"]), flag])
         _add_table(doc, ["Model", "PSI", "Interpretation"], rows)
         doc.add_paragraph("")
+        max_psi = float(psi_df["psi"].max())
         doc.add_paragraph(
-            "All PSI values are far below 0.10, confirming that the score distributions are "
-            "highly stable between development and test. This is expected given the short time "
-            "span and stable lending environment across the evaluation period."
+            f"The highest observed PSI is {_fmt(max_psi)}, which indicates "
+            f"{'stable' if max_psi < 0.10 else 'some' if max_psi < 0.25 else 'material'} score-distribution shift "
+            "between development and test."
         )
 
     _add_image(doc, o / "plots" / "stakeholder_calibration.png")
@@ -651,11 +715,19 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
             ])
         _add_table(doc, ["Model", "Pearson r", "Spearman rho", "Flag"], rows)
         doc.add_paragraph("")
-        doc.add_paragraph(
-            "All models show LOW correlation with the existing risk_score_rf (Pearson 0.09-0.16), "
-            "confirming that the new models capture genuinely different risk dimensions rather than "
-            "simply replicating the existing decisioning mechanism."
-        )
+        max_abs_pearson = float(selbias["pearson_corr"].abs().max())
+        n_high_selbias = int((selbias["selection_bias_flag"] == "HIGH").sum())
+        if n_high_selbias == 0:
+            doc.add_paragraph(
+                f"No model is flagged HIGH for correlation with the existing risk_score_rf. "
+                f"The maximum absolute Pearson correlation is {_fmt(max_abs_pearson)}, suggesting that the new models add information beyond the incumbent score."
+            )
+        else:
+            high_models = ", ".join(selbias.loc[selbias["selection_bias_flag"] == "HIGH", "model"].astype(str).tolist())
+            doc.add_paragraph(
+                f"{n_high_selbias} model(s) are flagged HIGH for correlation with risk_score_rf: {high_models}. "
+                "Those candidates may be recapitulating the existing decision boundary rather than contributing distinct signal."
+            )
 
     doc.add_heading("7.2 Adverse Impact by Age", level=2)
     doc.add_paragraph(
@@ -674,14 +746,18 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
             ])
         _add_table(doc, ["Age Band", "N", "Obs. Default", "Mean PD", "Approval", "AIR", "Flag"], rows)
         doc.add_paragraph("")
-        doc.add_paragraph(
-            "The 18-25 age band is flagged (AIR = 0.78), reflecting a genuinely higher observed "
-            "default rate (7.4% vs 2.9% for ages 65+). The model correctly identifies this elevated "
-            "risk, but the resulting differential treatment requires regulatory review to determine "
-            "whether age-based risk differentiation is permissible in the applicable jurisdiction. "
-            "If mitigation is required, options include capping the age contribution in the model "
-            "or applying post-hoc threshold adjustments for younger applicants."
-        )
+        failing_ai = lr_ai_df.loc[lr_ai_df["air_flag"] == "FAIL"].copy()
+        if not failing_ai.empty:
+            worst_band = failing_ai.sort_values("adverse_impact_ratio").iloc[0]
+            doc.add_paragraph(
+                f"{len(failing_ai)} age band(s) fall below the 80% AIR threshold for {recommended}. "
+                f"The lowest AIR is {worst_band['adverse_impact_ratio']:.2f} in band {worst_band['age_band']}. "
+                "This pattern requires regulatory review to determine whether mitigation or monitoring actions are needed."
+            )
+        else:
+            doc.add_paragraph(
+                f"All evaluated age bands pass the 80% AIR threshold for {recommended} at the 10% rejection cutoff."
+            )
 
     # ══════════════════════════════════════════════════════════════════════
     # 8. FEATURE ASSESSMENT
@@ -721,17 +797,19 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
         doc.add_heading("9. Post-Hoc Ensemble", level=1)
         e = ens.iloc[0]
         ens_r = results.loc[results["Model"].str.contains("Ensemble")].iloc[0] if results is not None else None
+        base_component_rows = results.loc[results["Model"] == str(e["lr_name"])] if results is not None else pd.DataFrame()
+        base_component_r = base_component_rows.iloc[0] if not base_component_rows.empty else rec_r
         doc.add_paragraph(
             f"A post-hoc ensemble blends {e['lr_name']} ({e['lr_weight']:.0%}) and "
             f"{e['tree_name']} ({e['tree_weight']:.0%}), with weights optimized via grid search "
             f"on calibration holdout PR AUC. On the held-out test, the ensemble achieves "
             f"ROC AUC {_fmt(ens_r['ROC AUC'])} and PR AUC {_fmt(ens_r['PR AUC'])}, "
-            f"marginally improving on the standalone Logistic Regression "
-            f"(ROC AUC {_fmt(rec_r['ROC AUC'])}, PR AUC {_fmt(rec_r['PR AUC'])})."
+            f"compared with standalone {e['lr_name']} "
+            f"(ROC AUC {_fmt(base_component_r['ROC AUC'])}, PR AUC {_fmt(base_component_r['PR AUC'])})."
         )
         doc.add_paragraph(
-            "The ensemble provides a slight discrimination improvement by combining LR's "
-            "stable generalization with LightGBM's different error profile. However, the "
+            f"The ensemble provides a slight discrimination improvement by combining {e['lr_name']}'s "
+            f"generalization profile with {e['tree_name']}'s complementary error profile. However, the "
             "added operational complexity of maintaining two models should be weighed against "
             "the marginal performance gain."
         )
@@ -741,6 +819,11 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
     # ══════════════════════════════════════════════════════════════════════
     doc.add_heading("10. Limitations and Caveats", level=1)
 
+    ai_limit_text = (
+        "All evaluated age bands pass the 80% AIR threshold at the selected rejection cutoff. Fairness should still be monitored as the applicant mix evolves."
+        if lr_ai_df is not None and not lr_ai_df.empty and int((lr_ai_df["air_flag"] == "FAIL").sum()) == 0
+        else "At least one age band falls below the 80% AIR threshold. Even where this aligns with observed risk differentials, it may require mitigation depending on regulatory requirements."
+    )
     limitations = [
         ("Booked-proxy evaluation",
          "All metrics are computed on the accepted population only. Rejected and canceled "
@@ -748,13 +831,11 @@ def generate_report(output_dir: str = "output", report_path: str = "report.docx"
          "applicant population is unknown. The booked-proxy metrics are an optimistic estimate "
          "of true applicant-stage performance because the existing decisioning has already "
          "filtered out the highest-risk applicants."),
-        ("Tree model overfitting",
-         "Despite tightened complexity bounds (shallow depth, high minimum leaf sizes, coarse bins), "
-         "all tree models exhibit severe overfitting. This limits their contribution to the "
-         "production recommendation. Further regularization or larger training samples may help."),
+        ("Model generalization",
+         "Several flexible candidates exhibit materially larger train-test gaps than the recommended model. "
+         "This limits how much weight the governance scorecard can place on raw in-sample performance alone."),
         ("Age-based adverse impact",
-         "The 18-25 age band fails the 80% AIR threshold. While this reflects genuinely higher "
-         "default risk in this segment, it may require mitigation depending on regulatory requirements."),
+         ai_limit_text),
         ("Benchmark ceiling",
          "risk_score_rf retains a meaningful PR AUC advantage, particularly in concentrating "
          "defaults in the highest-risk segment. Closing this gap is the primary modeling opportunity."),

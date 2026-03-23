@@ -714,6 +714,9 @@ def build_preprocessors(num_cols: list[str], cat_cols: list[str], target_encoder
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
     ])
+    # TargetEncoder cv=5 uses KFold(shuffle=True) internally for regularisation.
+    # This is acceptable: it operates only within pre-split training data to prevent
+    # in-sample target leakage in the encoding, not across the temporal boundary.
     cat_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
         ("encoder", TargetEncoder(smooth=target_encoder_smooth, cv=5, random_state=RANDOM_STATE)),

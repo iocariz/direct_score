@@ -83,10 +83,10 @@
 
 ### 1. Fix Stale Tests First
 
-- [ ] **Update `tests/test_features.py` to match current `engineer_features()` column names**
+- [x] **Update `tests/test_features.py` to match current `engineer_features()` column names**
 - [x] **Update all callers to the current `temporal_split()` return signature**
 - [x] **Update `tests/test_pipeline.py` to the current `train_stacking()` signature**
-- [ ] **Remove or rewrite assertions that reflect outdated methodology**
+- [x] **Remove or rewrite assertions that reflect outdated methodology**
 
 ### 2. Temporal Split and CV Tests
 
@@ -106,9 +106,9 @@
 ### 4. Calibration Tests
 
 - [x] **Add tests that the calibration block is later than the fit block**
-- [ ] **Add tests that calibration remains pre-test**
+- [x] **Add tests that calibration remains pre-test**
 - [x] **Add tests that calibration uses only booked ground-truth rows**
-- [ ] **Add tests for calibration metadata and date-range logging helpers if introduced**
+- [x] **Add tests for calibration metadata and date-range logging helpers if introduced**
 
 ### 5. Stacking Tests
 
@@ -142,10 +142,10 @@
 
 ### `training.py`
 
-- [ ] **Edit `TemporalExpandingCV`**
-- [ ] **Edit `compute_score_band_bad_rates()`**
-- [ ] **Edit `create_reject_pseudo_labels()` guardrails**
-- [ ] **Edit calibration split logic in `main()`**
+- [x] **Edit `TemporalExpandingCV`**
+- [x] **Edit `compute_score_band_bad_rates()`**
+- [x] **Edit `create_reject_pseudo_labels()` guardrails**
+- [x] **Edit calibration split logic in `main()`**
 - [x] **Edit `train_stacking()` or remove it from the official flow**
 - [x] **Add paired comparison utilities**
 - [x] **Update artifact writing for paired comparison outputs**
@@ -158,8 +158,8 @@
 
 ### `tests/test_features.py`
 
-- [ ] **Update stale expected engineered feature names**
-- [ ] **Keep assertions aligned with the current implementation**
+- [x] **Update stale expected engineered feature names**
+- [x] **Keep assertions aligned with the current implementation**
 
 ### `tests/test_reject_inference.py`
 
@@ -170,7 +170,7 @@
 
 - [x] **Update `temporal_split()` unpacking**
 - [x] **Add stricter temporal invariants**
-- [ ] **Keep metric smoke tests**
+- [x] **Keep metric smoke tests**
 
 ### `tests/test_pipeline.py`
 
@@ -187,10 +187,10 @@
 
 ## Acceptance Criteria
 
-- [ ] **No official training path uses future labels**
-- [ ] **All validation, calibration, and ensemble construction are temporally defensible**
-- [ ] **The test suite matches the actual current API**
-- [ ] **Benchmark claims are backed by paired model-comparison outputs**
+- [x] **No official training path uses future labels**
+- [x] **All validation, calibration, and ensemble construction are temporally defensible**
+- [x] **The test suite matches the actual current API**
+- [x] **Benchmark claims are backed by paired model-comparison outputs**
 - [x] **Experimental modes are clearly separated from official results**
 
 ---
