@@ -541,14 +541,20 @@ def extract_feature_importance(
 
         if hasattr(clf, "feature_importances_"):
             importances = clf.feature_importances_
+            importance_names = feature_names
             imp_type = "split_importance"
         elif hasattr(clf, "coef_"):
             importances = clf.coef_[0]
+            importance_names = feature_names
             imp_type = "coefficient"
+        elif hasattr(clf, "term_importances"):
+            importances = clf.term_importances()
+            importance_names = list(getattr(clf, "term_names_", feature_names[: len(importances)]))
+            imp_type = "term_importance"
         else:
             continue
 
-        for feat, imp in zip(feature_names, importances):
+        for feat, imp in zip(importance_names, importances):
             records.append({"model": name, "feature": feat, "importance": imp, "type": imp_type})
 
     df = pd.DataFrame(records)
@@ -706,6 +712,7 @@ def bootstrap_confidence_intervals(
     score_arrays: dict[str, np.ndarray],
     n_bootstrap: int = N_BOOTSTRAP,
     ci: float = 0.95,
+    dates: np.ndarray | None = None,
 ) -> pd.DataFrame:
     alpha = (1 - ci) / 2
     rng = np.random.RandomState(RANDOM_STATE)
@@ -714,23 +721,42 @@ def bootstrap_confidence_intervals(
     for name, scores in score_arrays.items():
         mask = ~np.isnan(scores)
         y, s = y_true[mask], scores[mask]
-        idx_p = np.where(y == 1)[0]
-        idx_n = np.where(y == 0)[0]
         is_prob = float(s.min()) >= 0 and float(s.max()) <= 1.01
 
         boot_auc, boot_pr, boot_brier = [], [], []
-        for _ in range(n_bootstrap):
-            bp = rng.choice(idx_p, size=len(idx_p), replace=True)
-            bn = rng.choice(idx_n, size=len(idx_n), replace=True)
-            bi = np.concatenate([bp, bn])
-            y_b, s_b = y[bi], s[bi]
-            try:
-                boot_auc.append(roc_auc_score(y_b, s_b))
-                boot_pr.append(average_precision_score(y_b, s_b))
-                if is_prob:
-                    boot_brier.append(brier_score_loss(y_b, np.clip(s_b, 0, 1)))
-            except ValueError:
+        if dates is not None:
+            d = pd.to_datetime(np.asarray(dates)[mask], errors="raise").to_period("M")
+            block_values = d.astype(str)
+            unique_blocks = np.unique(block_values)
+            block_to_idx = {block: np.flatnonzero(block_values == block) for block in unique_blocks}
+            if len(unique_blocks) == 0:
                 continue
+            for _ in range(n_bootstrap):
+                sampled_blocks = rng.choice(unique_blocks, size=len(unique_blocks), replace=True)
+                bi = np.concatenate([block_to_idx[block] for block in sampled_blocks])
+                y_b, s_b = y[bi], s[bi]
+                try:
+                    boot_auc.append(roc_auc_score(y_b, s_b))
+                    boot_pr.append(average_precision_score(y_b, s_b))
+                    if is_prob:
+                        boot_brier.append(brier_score_loss(y_b, np.clip(s_b, 0, 1)))
+                except ValueError:
+                    continue
+        else:
+            idx_p = np.where(y == 1)[0]
+            idx_n = np.where(y == 0)[0]
+            for _ in range(n_bootstrap):
+                bp = rng.choice(idx_p, size=len(idx_p), replace=True)
+                bn = rng.choice(idx_n, size=len(idx_n), replace=True)
+                bi = np.concatenate([bp, bn])
+                y_b, s_b = y[bi], s[bi]
+                try:
+                    boot_auc.append(roc_auc_score(y_b, s_b))
+                    boot_pr.append(average_precision_score(y_b, s_b))
+                    if is_prob:
+                        boot_brier.append(brier_score_loss(y_b, np.clip(s_b, 0, 1)))
+                except ValueError:
+                    continue
 
         def _ci_bounds(arr):
             if not arr:

@@ -148,6 +148,12 @@ class ScoringService:
                     "n_unique": row.get("n_unique", None),
                 }
 
+        tier_thresholds = None
+        tier_path = output_path / "risk_tiers.json"
+        if tier_path.exists():
+            with tier_path.open("r", encoding="utf-8") as f:
+                tier_thresholds = json.load(f)
+
         version = _compute_model_version(model_path, feature_cols)
         logger.info("Loaded {} (version {}, {} features)", model_name, version, len(feature_cols))
 
@@ -157,6 +163,7 @@ class ScoringService:
             feature_cols=feature_cols,
             model_version=version,
             training_stats=training_stats,
+            tier_thresholds=tier_thresholds,
         )
 
     def _validate_input(self, row_df: pd.DataFrame) -> list[str]:

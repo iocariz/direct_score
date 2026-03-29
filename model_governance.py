@@ -408,8 +408,9 @@ def generate_model_card(
     lines.append("   applicants have no observed repayment outcome.")
     lines.append("2. Target variable (basel_bad) requires 12 months on book to mature.")
     lines.append(f"   Only accounts with mis_Date <= {MATURITY_CUTOFF} are used.")
-    lines.append("3. Calibration performed via Platt (sigmoid) scaling on held-out")
-    lines.append("   booked ground-truth samples.")
+    lines.append("3. Calibration is model-dependent on held-out booked ground-truth")
+    lines.append("   samples: sigmoid scaling for additive/log-odds models and")
+    lines.append("   isotonic calibration for tree ensembles.")
     lines.append("4. Monotonicity constraints applied to tree models where domain")
     lines.append(f"   knowledge dictates direction ({len(MONOTONE_MAP)} features constrained).")
 

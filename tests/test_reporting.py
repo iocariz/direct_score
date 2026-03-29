@@ -162,6 +162,16 @@ class TestBootstrapCIPointEstimate:
         assert ci.loc["test", "AUC_lo"] <= ci.loc["test", "AUC"]
         assert ci.loc["test", "AUC_hi"] >= ci.loc["test", "AUC"]
 
+    def test_block_bootstrap_accepts_dates(self):
+        rng = np.random.RandomState(42)
+        y = np.array([0] * 80 + [1] * 20)
+        scores = np.concatenate([rng.uniform(0.1, 0.5, 80), rng.uniform(0.4, 0.9, 20)])
+        dates = pd.date_range("2024-07-01", periods=100, freq="D")
+        ci = bootstrap_confidence_intervals(y, {"test": scores}, n_bootstrap=100, dates=dates)
+
+        assert "AUC_lo" in ci.columns
+        assert np.isfinite(ci.loc["test", "AUC"])
+
 
 class TestBenchmarkComparisonsAdjustedPValues:
     def test_adjusted_columns_present(self):

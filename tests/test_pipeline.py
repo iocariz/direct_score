@@ -570,6 +570,22 @@ class TestExtractFeatureImportance:
         assert not feat_imp.empty
         assert "split_importance" in feat_imp["type"].values
 
+    def test_extracts_ebm_term_importance(self):
+        classifier = SimpleNamespace(
+            term_importances=lambda: np.array([0.42, -0.11]),
+            term_names_=["num_feature", "cat_feature"],
+        )
+        model = SimpleNamespace(named_steps={"classifier": classifier})
+
+        feat_imp = extract_feature_importance(
+            {"EBM": model}, ["num_feature"], ["cat_feature"],
+        )
+
+        assert not feat_imp.empty
+        assert feat_imp["model"].astype(str).unique().tolist() == ["EBM"]
+        assert "term_importance" in feat_imp["type"].values
+        assert set(feat_imp["feature"].astype(str)) == {"num_feature", "cat_feature"}
+
     def test_skips_calibrated_and_stacking(self, pipeline_data):
         d = pipeline_data
         model, _ = train_logistic_regression(

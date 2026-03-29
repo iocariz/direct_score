@@ -4,6 +4,7 @@ phase-3 ablation schema, run_stability_analysis, _save_optuna_study."""
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -193,6 +194,50 @@ class TestComputeShapAnalysis:
             output_dir=tmp_path,
         )
         assert result is None
+
+    def test_ebm_generates_explainability_artifacts_without_shap(self, monkeypatch, tmp_path):
+        import training as training_module
+
+        original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "shap":
+                raise ImportError("shap not installed")
+            return original_import(name, *args, **kwargs)
+
+        class _FakeExplanation:
+            def data(self, index=None):
+                if index is None:
+                    return {"names": ["num_feature", "cat_feature"], "scores": [0.42, 0.11]}
+                if index == 0:
+                    return {"names": ["low", "mid", "high"], "scores": [0.05, 0.12]}
+                return {"names": ["no", "yes"], "scores": [-0.03, 0.08]}
+
+        classifier = SimpleNamespace(
+            explain_global=lambda: _FakeExplanation(),
+            term_importances=lambda: np.array([0.42, 0.11]),
+            eval_terms=lambda X: np.array([[0.10, -0.02], [0.08, 0.01], [0.12, 0.03]])[: len(X)],
+        )
+        preprocessor = SimpleNamespace(transform=lambda X: X.to_numpy(dtype=float))
+        model = SimpleNamespace(named_steps={"preprocessor": preprocessor, "classifier": classifier})
+
+        monkeypatch.setattr("builtins.__import__", mock_import)
+
+        result = training_module.compute_shap_analysis(
+            models={"EBM": model},
+            X_test=pd.DataFrame({"num_feature": [0.1, 0.2, 0.3], "cat_feature": [0.0, 1.0, 0.0]}),
+            num_cols=["num_feature"],
+            cat_cols=["cat_feature"],
+            output_dir=tmp_path,
+            preferred_model_name="EBM",
+        )
+
+        assert result is not None
+        assert set(result["feature"].astype(str)) == {"num_feature", "cat_feature"}
+        assert (tmp_path / "plots" / "shap_summary.png").exists()
+        assert (tmp_path / "plots" / "shap_importance.png").exists()
+        assert (tmp_path / "plots" / "shap_dependence.png").exists()
+        assert (tmp_path / "shap_values.csv").exists()
 
 
 class TestPhase3AblationSchema:

@@ -14,6 +14,7 @@ import argparse
 import sys
 import time
 import warnings
+from typing import Any, TypedDict
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -51,6 +52,7 @@ from training_constants import (
     EXPERIMENTAL_STACKING_NAME,
     FEATURE_DISCOVERY_FRACTION,
     MATURITY_CUTOFF,
+    MODEL_SELECTION_DATE,
     MAX_CATEGORIES,
     MIN_LIFT,
     MIN_VALID,
@@ -506,6 +508,831 @@ def temporal_split(df: pd.DataFrame, feature_cols: list[str]):
     logger.info("Train: {}  ({:.4f} target rate)", X_train.shape, y_train.mean())
     logger.info("Test:  {}  ({:.4f} target rate)", X_test.shape, y_test.mean())
     return X_train, y_train, X_test, y_test, bench_risk_score_rf, bench_score_RF, train_dates
+
+
+def split_holdout_for_model_selection(
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    bench_risk_score_test: pd.Series,
+    bench_score_test: pd.Series,
+    test_dates: np.ndarray,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """Split post-split holdout into selection and untouched final windows."""
+    test_dates_ts = pd.to_datetime(np.asarray(test_dates), errors="raise")
+    selection_mask = test_dates_ts < pd.Timestamp(MODEL_SELECTION_DATE)
+    final_mask = ~selection_mask
+    if not selection_mask.any() or not final_mask.any():
+        raise ValueError(
+            "Model-selection split produced an empty partition; "
+            "adjust MODEL_SELECTION_DATE or data date coverage."
+        )
+
+    return (
+        X_test.loc[selection_mask],
+        y_test.loc[selection_mask],
+        bench_risk_score_test.loc[selection_mask],
+        bench_score_test.loc[selection_mask],
+        X_test.loc[final_mask],
+        y_test.loc[final_mask],
+        bench_risk_score_test.loc[final_mask],
+        bench_score_test.loc[final_mask],
+    )
+
+
+class PreparedStageResult(TypedDict):
+    df: pd.DataFrame
+    rejected_df: pd.DataFrame | None
+    population_summary_df: pd.DataFrame
+    raw_feature_cols: list[str]
+    engineered_feature_cols: list[str]
+    feature_discovery_result: Any
+    X_development_base: pd.DataFrame
+    y_development: pd.Series
+    development_dates: np.ndarray
+    benchmark_risk_score_estimation: pd.Series
+    benchmark_score_estimation: pd.Series
+    sample_weight: np.ndarray | None
+    X_augmented_base_for_ablation: pd.DataFrame | None
+    y_augmented_for_ablation: pd.Series | None
+    augmented_dates_for_ablation: np.ndarray | None
+    augmented_sample_weight_for_ablation: np.ndarray | None
+    X_development: pd.DataFrame
+    X_test: pd.DataFrame
+    preprocessor: ColumnTransformer
+    lgbm_preprocessor: ColumnTransformer
+    lgbm_cat_indices: list[int]
+    monotone_constraints: list[int]
+    X_development_fit: pd.DataFrame
+    X_calibration_holdout: pd.DataFrame
+    y_development_fit: pd.Series
+    y_calibration_holdout: pd.Series
+    w_development_fit: np.ndarray | None
+    w_calibration_holdout: np.ndarray | None
+    development_fit_dates: np.ndarray
+    calibration_holdout_dates: np.ndarray
+    X_calibration_booked: pd.DataFrame
+    y_calibration_booked: pd.Series
+    pos_weight: float
+    cv: Any
+
+
+class TrainingStageResult(TypedDict):
+    models: dict[str, Any]
+    development_oof_scores: dict[str, np.ndarray]
+    rolling_oot_results_df: pd.DataFrame
+    rolling_oot_summary_df: pd.DataFrame
+
+
+class EvaluationStageResult(TypedDict):
+    results_df: pd.DataFrame
+    models: dict[str, Any]
+    official_results_df: pd.DataFrame
+    experimental_results_df: pd.DataFrame
+    benchmark_comparisons_df: pd.DataFrame
+    experimental_benchmark_comparisons_df: pd.DataFrame
+    feature_provenance_df: pd.DataFrame
+    interaction_leaderboard_df: pd.DataFrame
+    feature_discovery_boundary_df: pd.DataFrame
+    ablation_results_df: pd.DataFrame
+    rolling_oot_results_df: pd.DataFrame
+    rolling_oot_summary_df: pd.DataFrame
+    population_summary_df: pd.DataFrame
+    applicant_scores_df: pd.DataFrame | None
+    holdout_scores_df: pd.DataFrame
+    test_scores: dict[str, np.ndarray]
+    y_test: pd.Series
+    train_scores: dict[str, np.ndarray]
+    y_development_fit_booked: pd.Series
+    num_cols: list[str]
+    cat_cols: list[str]
+
+
+def _run_data_preparation_stages(
+    data_path: str,
+    population_mode: str,
+    reject_inference: bool,
+    feature_discovery_fraction: float,
+) -> PreparedStageResult:
+    with _log_step(1, "Load data"):
+        if population_mode == POPULATION_MODE_UNDERWRITING or reject_inference:
+            df, rejected_df = load_data_with_rejects(data_path)
+        else:
+            df = load_data(data_path)
+            rejected_df = None
+        population_summary_df = build_population_summary_df(
+            df,
+            rejected_df,
+            population_mode=population_mode,
+        )
+
+    with _log_step(2, "Feature engineering"):
+        raw_feature_cols, _, _ = select_features(df)
+        df = engineer_features(df)
+        if rejected_df is not None:
+            rejected_df = engineer_features(rejected_df)
+        base_feature_cols_no_interactions, _, _ = select_features(df)
+        engineered_feature_cols = [
+            feature for feature in base_feature_cols_no_interactions if feature not in raw_feature_cols
+        ]
+
+    with _log_step(3, "Feature discovery workflow"):
+        feature_discovery_result = _training_features.run_feature_discovery_workflow(
+            df=df,
+            rejected_df=rejected_df,
+            raw_feature_cols=raw_feature_cols,
+            engineered_feature_cols=engineered_feature_cols,
+            base_feature_cols_no_interactions=base_feature_cols_no_interactions,
+            feature_discovery_fraction=feature_discovery_fraction,
+            temporal_split_fn=temporal_split,
+            resolve_temporal_feature_discovery_cutoff_fn=resolve_temporal_feature_discovery_cutoff,
+            temporal_feature_discovery_split_fn=temporal_feature_discovery_split,
+            summarize_population_fn=summarize_population,
+            log_population_summary_fn=log_population_summary,
+            make_temporal_cv_fn=make_temporal_cv,
+        )
+        df = feature_discovery_result.df
+        rejected_df = feature_discovery_result.rejected_df
+
+    with _log_step(4, "Freeze feature set & prepare official matrices"):
+        X_development_base = feature_discovery_result.X_estimation_base.copy()
+        y_development = feature_discovery_result.y_estimation.copy()
+        development_dates = feature_discovery_result.estimation_dates.copy()
+        benchmark_risk_score_estimation = df.loc[feature_discovery_result.X_estimation_base.index, "risk_score_rf"].copy()
+        benchmark_score_estimation = df.loc[feature_discovery_result.X_estimation_base.index, "score_RF"].copy()
+        sample_weight = None
+        X_augmented_base_for_ablation = None
+        y_augmented_for_ablation = None
+        augmented_dates_for_ablation = None
+        augmented_sample_weight_for_ablation = None
+        log_population_summary(
+            "Official estimation sample",
+            summarize_population(
+                y_development,
+                development_dates,
+                "later pre-test booked rows used for final model estimation after feature freezing",
+            ),
+        )
+        if reject_inference and rejected_df is not None:
+            band_stats, bin_edges = compute_score_band_bad_rates(df)
+            estimation_start = pd.Timestamp(pd.to_datetime(development_dates).min())
+            reject_pool = rejected_df[rejected_df["mis_Date"] >= estimation_start].copy()
+            reject_labeled = create_reject_pseudo_labels(
+                reject_pool,
+                band_stats,
+                bin_edges,
+                n_booked_train=len(X_development_base),
+            )
+            X_development_base, y_development, sample_weight = augment_training_data(
+                X_development_base,
+                y_development,
+                reject_labeled,
+                feature_discovery_result.base_feature_cols,
+            )
+            development_dates = np.concatenate([development_dates, reject_labeled["mis_Date"].values])
+            X_augmented_base_for_ablation = X_development_base.copy()
+            y_augmented_for_ablation = y_development.copy()
+            augmented_dates_for_ablation = development_dates.copy()
+            augmented_sample_weight_for_ablation = sample_weight.copy()
+            log_population_summary(
+                "Development sample after reject inference",
+                summarize_population(
+                    y_development,
+                    development_dates,
+                    "later pre-test development rows used for modeling (booked + pseudo-labeled rejects)",
+                    sample_weight=sample_weight,
+                ),
+            )
+        X_development, X_test, _, _, _, _, _ = add_modeling_features(
+            X_development_base,
+            feature_discovery_result.X_test_base,
+            feature_discovery_result.base_feature_cols,
+            feature_discovery_result.base_num_cols,
+            feature_discovery_result.base_cat_cols,
+        )
+        X_development = X_development[feature_discovery_result.feature_cols].copy()
+        X_test = X_test[feature_discovery_result.feature_cols].copy()
+        logger.info(
+            "Official matrices with frozen features: {} train rows x {} cols, {} test rows x {} cols",
+            len(X_development),
+            len(feature_discovery_result.feature_cols),
+            len(X_test),
+            len(feature_discovery_result.feature_cols),
+        )
+
+    preprocessor, lgbm_preprocessor, lgbm_cat_indices = build_preprocessors(
+        feature_discovery_result.num_cols,
+        feature_discovery_result.cat_cols,
+    )
+    monotone_constraints = build_monotone_constraints(
+        feature_discovery_result.num_cols,
+        feature_discovery_result.cat_cols,
+    )
+
+    if sample_weight is not None:
+        X_development_fit, X_calibration_holdout, y_development_fit, y_calibration_holdout, w_development_fit, w_calibration_holdout, development_fit_dates, calibration_holdout_dates = temporal_calibration_split(
+            X_development,
+            y_development,
+            development_dates,
+            calibration_fraction=CALIBRATION_FRACTION,
+            sample_weight=sample_weight,
+        )
+        calibration_booked_mask = w_calibration_holdout == 1.0
+        X_calibration_booked = X_calibration_holdout.loc[calibration_booked_mask]
+        y_calibration_booked = y_calibration_holdout.loc[calibration_booked_mask]
+        calibration_booked_dates = calibration_holdout_dates[calibration_booked_mask]
+        log_population_summary(
+            "Calibration holdout",
+            summarize_population(
+                y_calibration_holdout,
+                calibration_holdout_dates,
+                "latest pre-test holdout rows reserved from model fitting",
+                sample_weight=w_calibration_holdout,
+            ),
+        )
+    else:
+        X_development_fit, X_calibration_holdout, y_development_fit, y_calibration_holdout, development_fit_dates, calibration_holdout_dates = temporal_calibration_split(
+            X_development,
+            y_development,
+            development_dates,
+            calibration_fraction=CALIBRATION_FRACTION,
+        )
+        w_development_fit = None
+        w_calibration_holdout = None
+        X_calibration_booked = X_calibration_holdout
+        y_calibration_booked = y_calibration_holdout
+        calibration_booked_dates = calibration_holdout_dates
+
+    if len(X_calibration_booked) == 0:
+        raise ValueError("Calibration split produced no booked ground-truth rows")
+
+    log_population_summary(
+        "Development fit sample",
+        summarize_population(
+            y_development_fit,
+            development_fit_dates,
+            "earlier pre-test rows used for model fitting",
+            sample_weight=w_development_fit,
+        ),
+    )
+    log_population_summary(
+        "Calibration ground-truth sample",
+        summarize_population(
+            y_calibration_booked,
+            calibration_booked_dates,
+            "booked subset of the latest pre-test holdout used for calibration",
+        ),
+    )
+    pos_weight = (y_development_fit == 0).sum() / (y_development_fit == 1).sum()
+    cv = make_temporal_cv(development_fit_dates)
+    fit_start = pd.Timestamp(pd.to_datetime(development_fit_dates).min()).date()
+    fit_end = pd.Timestamp(pd.to_datetime(development_fit_dates).max()).date()
+    calib_start = pd.Timestamp(pd.to_datetime(calibration_holdout_dates).min()).date()
+    calib_end = pd.Timestamp(pd.to_datetime(calibration_holdout_dates).max()).date()
+    logger.info(
+        "Development/calibration split: {:,} fit [{} to {}] + {:,} holdout [{} to {}] ({:,} booked ground-truth, {:,} pos)  (imbalance {:.0f}:1, temporal CV {} folds)",
+        len(X_development_fit),
+        fit_start,
+        fit_end,
+        len(X_calibration_holdout),
+        calib_start,
+        calib_end,
+        len(X_calibration_booked),
+        int(y_calibration_booked.sum()),
+        pos_weight,
+        cv.n_splits,
+    )
+
+    return {
+        "df": df,
+        "rejected_df": rejected_df,
+        "population_summary_df": population_summary_df,
+        "raw_feature_cols": raw_feature_cols,
+        "engineered_feature_cols": engineered_feature_cols,
+        "feature_discovery_result": feature_discovery_result,
+        "X_development_base": X_development_base,
+        "y_development": y_development,
+        "development_dates": development_dates,
+        "benchmark_risk_score_estimation": benchmark_risk_score_estimation,
+        "benchmark_score_estimation": benchmark_score_estimation,
+        "sample_weight": sample_weight,
+        "X_augmented_base_for_ablation": X_augmented_base_for_ablation,
+        "y_augmented_for_ablation": y_augmented_for_ablation,
+        "augmented_dates_for_ablation": augmented_dates_for_ablation,
+        "augmented_sample_weight_for_ablation": augmented_sample_weight_for_ablation,
+        "X_development": X_development,
+        "X_test": X_test,
+        "preprocessor": preprocessor,
+        "lgbm_preprocessor": lgbm_preprocessor,
+        "lgbm_cat_indices": lgbm_cat_indices,
+        "monotone_constraints": monotone_constraints,
+        "X_development_fit": X_development_fit,
+        "X_calibration_holdout": X_calibration_holdout,
+        "y_development_fit": y_development_fit,
+        "y_calibration_holdout": y_calibration_holdout,
+        "w_development_fit": w_development_fit,
+        "w_calibration_holdout": w_calibration_holdout,
+        "development_fit_dates": development_fit_dates,
+        "calibration_holdout_dates": calibration_holdout_dates,
+        "X_calibration_booked": X_calibration_booked,
+        "y_calibration_booked": y_calibration_booked,
+        "pos_weight": pos_weight,
+        "cv": cv,
+    }
+
+
+def _run_model_training_stages(
+    prepared: PreparedStageResult,
+    optuna_trials: int,
+    output_path: Path,
+    enable_experimental_stacking: bool,
+    population_mode: str,
+) -> TrainingStageResult:
+    feature_discovery_result = prepared["feature_discovery_result"]
+    with _log_step(7, "Logistic Regression — development fit sample"):
+        lr_model, lr_study = train_logistic_regression(
+            prepared["X_development_fit"],
+            prepared["y_development_fit"],
+            prepared["preprocessor"],
+            prepared["cv"],
+            optuna_trials,
+            sample_weight=prepared["w_development_fit"],
+            num_cols=feature_discovery_result.num_cols,
+            cat_cols=feature_discovery_result.cat_cols,
+        )
+    with _log_step("7b", "EBM — development fit sample"):
+        ebm_model, ebm_study = train_ebm(
+            prepared["X_development_fit"],
+            prepared["y_development_fit"],
+            prepared["preprocessor"],
+            prepared["cv"],
+            optuna_trials,
+            sample_weight=prepared["w_development_fit"],
+        )
+    with _log_step(8, "LightGBM — development fit sample"):
+        lgbm_model, lgbm_study, _ = train_lgbm(
+            prepared["X_development_fit"],
+            prepared["y_development_fit"],
+            prepared["lgbm_preprocessor"],
+            prepared["lgbm_cat_indices"],
+            prepared["pos_weight"],
+            prepared["cv"],
+            optuna_trials,
+            sample_weight=prepared["w_development_fit"],
+            monotone_constraints=prepared["monotone_constraints"],
+        )
+    with _log_step(9, "XGBoost — development fit sample"):
+        xgb_model, xgb_study, _ = train_xgboost(
+            prepared["X_development_fit"],
+            prepared["y_development_fit"],
+            prepared["preprocessor"],
+            prepared["pos_weight"],
+            prepared["cv"],
+            optuna_trials,
+            sample_weight=prepared["w_development_fit"],
+            monotone_constraints=prepared["monotone_constraints"],
+        )
+    with _log_step(10, "CatBoost — development fit sample"):
+        catboost_model, catboost_study, _ = train_catboost(
+            prepared["X_development_fit"],
+            prepared["y_development_fit"],
+            prepared["lgbm_preprocessor"],
+            prepared["pos_weight"],
+            prepared["cv"],
+            optuna_trials,
+            sample_weight=prepared["w_development_fit"],
+            monotone_constraints=prepared["monotone_constraints"],
+        )
+
+    for study_name, study_obj in [
+        ("Logistic Regression", lr_study),
+        ("EBM", ebm_study),
+        ("LightGBM", lgbm_study),
+        ("XGBoost", xgb_study),
+        ("CatBoost", catboost_study),
+    ]:
+        _save_optuna_study(study_obj, output_path, study_name)
+
+    stack_model = None
+    if enable_experimental_stacking:
+        with _log_step(11, "Stacking ensemble (experimental)"):
+            stack_model = train_stacking(
+                prepared["X_development_fit"],
+                prepared["y_development_fit"],
+                {
+                    "Logistic Regression": lr_model,
+                    "EBM": ebm_model,
+                    "LightGBM": lgbm_model,
+                    "XGBoost": xgb_model,
+                    "CatBoost": catboost_model,
+                },
+                prepared["cv"],
+                sample_weight=prepared["w_development_fit"],
+            )
+
+    with _log_step("11b", "Temporal OOF development scores"):
+        development_oof_scores = compute_temporal_oof_scores(
+            prepared["X_development_fit"],
+            prepared["y_development_fit"],
+            {
+                "Logistic Regression": lr_model,
+                "EBM": ebm_model,
+                "LightGBM": lgbm_model,
+                "XGBoost": xgb_model,
+                "CatBoost": catboost_model,
+            },
+            prepared["cv"],
+            sample_weight=prepared["w_development_fit"],
+        )
+
+    with _log_step(12, "Calibration — booked ground-truth holdout"):
+        models = {
+            "Logistic Regression": lr_model,
+            "EBM": ebm_model,
+            "LightGBM": lgbm_model,
+            "XGBoost": xgb_model,
+            "CatBoost": catboost_model,
+        }
+        if stack_model is not None:
+            models[EXPERIMENTAL_STACKING_NAME] = stack_model
+        for name in OFFICIAL_MODEL_NAMES:
+            method = "sigmoid" if name in ("Logistic Regression", "EBM") else "isotonic"
+            cal = CalibratedClassifierCV(FrozenEstimator(models[name]), method=method)
+            cal.fit(prepared["X_calibration_booked"], prepared["y_calibration_booked"])
+            models[f"{name} (calibrated)"] = cal
+        logger.info(
+            "Calibration on {:,} booked held-out samples ({:,} pos) — sigmoid for LR/EBM, isotonic for tree models",
+            len(prepared["y_calibration_booked"]),
+            prepared["y_calibration_booked"].sum(),
+        )
+
+    with _log_step("12b", "Rolling OOT validation — pre-test estimation sample"):
+        rolling_base_models = {name: models[name] for name in OFFICIAL_MODEL_NAMES}
+        rolling_oot_results_df, rolling_oot_summary_df = run_rolling_out_of_time_validation(
+            feature_discovery_result.X_estimation_base,
+            feature_discovery_result.y_estimation,
+            feature_discovery_result.estimation_dates,
+            prepared["benchmark_risk_score_estimation"],
+            prepared["benchmark_score_estimation"],
+            feature_discovery_result.base_feature_cols,
+            feature_discovery_result.base_num_cols,
+            feature_discovery_result.base_cat_cols,
+            feature_discovery_result.feature_cols,
+            feature_discovery_result.num_cols,
+            feature_discovery_result.cat_cols,
+            rolling_base_models,
+        )
+        if population_mode == POPULATION_MODE_UNDERWRITING:
+            if not rolling_oot_results_df.empty:
+                rolling_oot_results_df["population_mode"] = population_mode
+                rolling_oot_results_df["evaluation_population"] = "booked_proxy"
+            if not rolling_oot_summary_df.empty:
+                rolling_oot_summary_df["population_mode"] = population_mode
+                rolling_oot_summary_df["evaluation_population"] = "booked_proxy"
+        if not rolling_oot_summary_df.empty:
+            logger.info("Rolling OOT summary:")
+            for _, row in rolling_oot_summary_df.iterrows():
+                logger.info(
+                    "  {:<30s} folds={} mean PR AUC={:.4f} mean AUC={:.4f}",
+                    row["Model"],
+                    int(row["n_folds"]),
+                    row["mean_PR_AUC"],
+                    row["mean_ROC_AUC"],
+                )
+
+    with _log_step("12c", "Concept drift detection"):
+        concept_drift_df = compute_concept_drift_report(rolling_oot_results_df, model_names=OFFICIAL_MODEL_NAMES)
+        if not concept_drift_df.empty:
+            concept_drift_df.to_csv(output_path / "concept_drift.csv", index=False, float_format="%.6f")
+            logger.info("Concept drift analysis (PR AUC trend across OOT folds):")
+            for _, row in concept_drift_df.iterrows():
+                logger.info(
+                    "  {:<25s} first={:.4f} last={:.4f} slope={:+.4f}/fold  [{}]",
+                    row["model"], row["pr_auc_first"], row["pr_auc_last"],
+                    row["pr_auc_slope_per_fold"], row["concept_drift_flag"],
+                )
+            n_drift = int((concept_drift_df["concept_drift_flag"] == "YES").sum())
+            if n_drift > 0:
+                logger.warning("{} model(s) show concept drift (PR AUC declining > 0.02 across OOT folds)", n_drift)
+
+    with _log_step("12d", "Post-hoc ensemble"):
+        calib_scores_for_ensemble = {}
+        for name in OFFICIAL_MODEL_NAMES:
+            calib_scores_for_ensemble[name] = models[name].predict_proba(prepared["X_calibration_booked"])[:, 1]
+        ensemble_result = train_post_hoc_ensemble(prepared["y_calibration_booked"].values, calib_scores_for_ensemble)
+        if ensemble_result:
+            lr_w = ensemble_result["lr_weight"]
+            tree_w = ensemble_result["tree_weight"]
+            tree_name = ensemble_result["tree_name"]
+            logger.info(
+                "Best ensemble: {:.0%} {} + {:.0%} {} → calibration PR AUC {:.4f}",
+                lr_w, ensemble_result["lr_name"], tree_w, tree_name, ensemble_result["pr_auc"],
+            )
+            ensemble_name = f"Ensemble ({ensemble_result['lr_name']} + {tree_name})"
+            models[ensemble_name] = EnsembleModel(
+                models[ensemble_result["lr_name"]], models[tree_name], lr_w, tree_w,
+                name=ensemble_name,
+            )
+            pd.DataFrame([ensemble_result]).to_csv(output_path / "ensemble_weights.csv", index=False, float_format="%.4f")
+        else:
+            logger.info("Post-hoc ensemble: no valid combination found")
+
+    return {
+        "models": models,
+        "development_oof_scores": development_oof_scores,
+        "rolling_oot_results_df": rolling_oot_results_df,
+        "rolling_oot_summary_df": rolling_oot_summary_df,
+    }
+
+
+def _run_evaluation_and_diagnostics_stages(
+    prepared: PreparedStageResult,
+    training_stage: TrainingStageResult,
+    reject_inference: bool,
+    population_mode: str,
+    output_path: Path,
+) -> EvaluationStageResult:
+    df = prepared["df"]
+    rejected_df = prepared["rejected_df"]
+    feature_discovery_result = prepared["feature_discovery_result"]
+    models = training_stage["models"]
+    development_oof_scores = training_stage["development_oof_scores"]
+    rolling_oot_summary_df = training_stage["rolling_oot_summary_df"]
+    X_test = prepared["X_test"]
+    y_test_full = feature_discovery_result.y_test
+    benchmark_risk_score_test = feature_discovery_result.benchmark_risk_score_test
+    benchmark_score_test = feature_discovery_result.benchmark_score_test
+    X_test_base = feature_discovery_result.X_test_base
+
+    test_dates = df.loc[X_test_base.index, "mis_Date"].values
+    (
+        X_selection,
+        y_selection,
+        benchmark_risk_score_selection,
+        benchmark_score_selection,
+        X_final,
+        y_final,
+        benchmark_risk_score_final,
+        benchmark_score_final,
+    ) = split_holdout_for_model_selection(
+        X_test=X_test,
+        y_test=y_test_full,
+        bench_risk_score_test=benchmark_risk_score_test,
+        bench_score_test=benchmark_score_test,
+        test_dates=test_dates,
+    )
+    X_test = X_selection
+    y_test = y_selection
+
+    with _log_step(13, "Evaluation — selection holdout sample"):
+        results_df, test_scores = evaluate_all(
+            X_selection,
+            y_selection,
+            models,
+            benchmark_risk_score_selection,
+            benchmark_score_selection,
+        )
+        official_results_df, experimental_results_df = split_leaderboard_results(
+            results_df,
+            reject_inference=reject_inference,
+        )
+        if population_mode == POPULATION_MODE_UNDERWRITING:
+            results_df["population_mode"] = population_mode
+            results_df["evaluation_population"] = "booked_proxy"
+            official_results_df["population_mode"] = population_mode
+            official_results_df["evaluation_population"] = "booked_proxy"
+            if not experimental_results_df.empty:
+                experimental_results_df["population_mode"] = population_mode
+                experimental_results_df["evaluation_population"] = "booked_proxy"
+        if not experimental_results_df.empty:
+            logger.warning(
+                "Experimental rows excluded from primary leaderboard: {}",
+                ", ".join(experimental_results_df.index),
+            )
+
+    if population_mode == POPULATION_MODE_UNDERWRITING:
+        with _log_step("13b", "Score post-split underwriting applications"):
+            applicant_scores_df = build_applicant_score_frame(
+                df,
+                rejected_df,
+                prepared["X_development_base"],
+                feature_discovery_result.base_feature_cols,
+                feature_discovery_result.base_num_cols,
+                feature_discovery_result.base_cat_cols,
+                feature_discovery_result.feature_cols,
+                models,
+            )
+            observed_count = int(applicant_scores_df["has_observed_target"].sum()) if not applicant_scores_df.empty else 0
+            logger.info(
+                "Post-split applicant scoring: {:,} rows ({:,} booked rows with observed outcomes)",
+                len(applicant_scores_df),
+                observed_count,
+            )
+    else:
+        applicant_scores_df = None
+
+    holdout_scores_df = build_holdout_score_frame(
+        y_selection,
+        test_scores,
+        population_mode=population_mode if population_mode == POPULATION_MODE_UNDERWRITING else None,
+        evaluation_population="booked_proxy" if population_mode == POPULATION_MODE_UNDERWRITING else "booked_selection",
+    )
+
+    with _log_step("13c", "Evaluation — final untouched holdout sample"):
+        final_results_df, final_scores = evaluate_all(
+            X_final,
+            y_final,
+            models,
+            benchmark_risk_score_final,
+            benchmark_score_final,
+        )
+        if population_mode == POPULATION_MODE_UNDERWRITING:
+            final_results_df["population_mode"] = population_mode
+            final_results_df["evaluation_population"] = "booked_proxy_final"
+        final_results_df.to_csv(output_path / "final_holdout_results.csv", float_format="%.6f")
+        final_holdout_scores_df = build_holdout_score_frame(
+            y_final,
+            final_scores,
+            population_mode=population_mode if population_mode == POPULATION_MODE_UNDERWRITING else None,
+            evaluation_population="booked_proxy_final" if population_mode == POPULATION_MODE_UNDERWRITING else "booked_final",
+        )
+        final_holdout_scores_df.to_csv(output_path / "final_holdout_scores.csv", index=False, float_format="%.6f")
+
+    w_development_fit = prepared["w_development_fit"]
+    if w_development_fit is not None:
+        development_fit_booked_mask = w_development_fit == 1.0
+        X_development_fit_booked = prepared["X_development_fit"].loc[development_fit_booked_mask]
+        y_development_fit_booked = prepared["y_development_fit"].loc[development_fit_booked_mask]
+    else:
+        X_development_fit_booked = prepared["X_development_fit"]
+        y_development_fit_booked = prepared["y_development_fit"]
+
+    train_scores = {
+        name: scores[development_fit_booked_mask] if w_development_fit is not None else scores
+        for name, scores in development_oof_scores.items()
+    }
+
+    with _log_step(14, "Bootstrap confidence intervals — booked test sample"):
+        ci_df = bootstrap_confidence_intervals(
+            y_selection.values,
+            test_scores,
+            dates=df.loc[X_selection.index, "mis_Date"].values,
+        )
+        ci_df.to_csv(output_path / "confidence_intervals.csv", float_format="%.6f")
+        official_candidate_names = [name for name in official_results_df.index if name not in BENCHMARK_MODEL_NAMES]
+        experimental_candidate_names = list(experimental_results_df.index)
+        benchmark_comparisons_df = paired_bootstrap_benchmark_comparisons(
+            y_selection.values,
+            test_scores,
+            official_candidate_names,
+        )
+        experimental_benchmark_comparisons_df = paired_bootstrap_benchmark_comparisons(
+            y_selection.values,
+            test_scores,
+            experimental_candidate_names,
+        )
+        if population_mode == POPULATION_MODE_UNDERWRITING:
+            if not benchmark_comparisons_df.empty:
+                benchmark_comparisons_df["population_mode"] = population_mode
+                benchmark_comparisons_df["evaluation_population"] = "booked_proxy"
+            if not experimental_benchmark_comparisons_df.empty:
+                experimental_benchmark_comparisons_df["population_mode"] = population_mode
+                experimental_benchmark_comparisons_df["evaluation_population"] = "booked_proxy"
+
+    with _log_step("14b", "Phase 3 ablations"):
+        ablation_results_df = run_phase3_ablations(
+            feature_discovery_result.X_estimation_base,
+            feature_discovery_result.y_estimation,
+            feature_discovery_result.estimation_dates,
+            feature_discovery_result.X_test_base,
+            y_test_full,
+            prepared["raw_feature_cols"],
+            prepared["engineered_feature_cols"],
+            feature_discovery_result.interaction_feature_cols,
+            feature_discovery_result.base_feature_cols,
+            feature_discovery_result.base_num_cols,
+            feature_discovery_result.base_cat_cols,
+            feature_discovery_result.rfecv_candidate_feature_cols,
+            feature_discovery_result.feature_cols,
+            feature_discovery_result.num_cols,
+            feature_discovery_result.cat_cols,
+            X_augmented_base=prepared["X_augmented_base_for_ablation"],
+            y_augmented=prepared["y_augmented_for_ablation"],
+            augmented_dates=prepared["augmented_dates_for_ablation"],
+            augmented_sample_weight=prepared["augmented_sample_weight_for_ablation"],
+        )
+        logger.info("Phase 3 ablations completed: {} rows", len(ablation_results_df))
+    if population_mode == POPULATION_MODE_UNDERWRITING and not ablation_results_df.empty:
+        ablation_results_df["population_mode"] = population_mode
+        ablation_results_df["evaluation_population"] = "booked_proxy"
+
+    with _log_step(15, "SHAP explainability"):
+        compute_shap_analysis(models, X_test, feature_discovery_result.num_cols, feature_discovery_result.cat_cols, output_path)
+
+    with _log_step(16, "WoE / IV analysis"):
+        woe_df, iv_df = compute_woe_iv(
+            prepared["X_development_fit"],
+            prepared["y_development_fit"],
+            feature_discovery_result.num_cols,
+            feature_discovery_result.cat_cols,
+        )
+        woe_df.to_csv(output_path / "woe_detail.csv", index=False, float_format="%.6f")
+        iv_df.to_csv(output_path / "iv_summary.csv", index=False, float_format="%.6f")
+
+    with _log_step(17, "PSI / CSI stability"):
+        run_stability_analysis(
+            X_development_fit_booked,
+            X_test,
+            train_scores,
+            test_scores,
+            feature_discovery_result.num_cols,
+            feature_discovery_result.cat_cols,
+            output_path,
+        )
+
+    overfit_df, model_selection_df = _run_diagnostics_and_governance(
+        y_test=y_test,
+        y_development_fit_booked=y_development_fit_booked,
+        test_scores=test_scores,
+        train_scores=train_scores,
+        models=models,
+        X_test=X_test,
+        X_development_fit=prepared["X_development_fit"],
+        num_cols=feature_discovery_result.num_cols,
+        cat_cols=feature_discovery_result.cat_cols,
+        feature_cols=feature_discovery_result.feature_cols,
+        official_results_df=official_results_df,
+        rolling_oot_summary_df=rolling_oot_summary_df,
+        benchmark_comparisons_df=benchmark_comparisons_df,
+        population_summary_df=prepared["population_summary_df"],
+        feature_provenance_df=feature_discovery_result.feature_provenance_df,
+        applicant_scores_df=applicant_scores_df,
+        age_values=df.loc[X_test.index, "AGE_T1"].values if "AGE_T1" in df.columns else None,
+        output_path=output_path,
+    )
+
+    return {
+        "results_df": results_df,
+        "models": models,
+        "official_results_df": official_results_df,
+        "experimental_results_df": experimental_results_df,
+        "benchmark_comparisons_df": benchmark_comparisons_df,
+        "experimental_benchmark_comparisons_df": experimental_benchmark_comparisons_df,
+        "feature_provenance_df": feature_discovery_result.feature_provenance_df,
+        "interaction_leaderboard_df": feature_discovery_result.interaction_leaderboard_df,
+        "feature_discovery_boundary_df": feature_discovery_result.feature_discovery_boundary_df,
+        "ablation_results_df": ablation_results_df,
+        "rolling_oot_results_df": training_stage["rolling_oot_results_df"],
+        "rolling_oot_summary_df": rolling_oot_summary_df,
+        "population_summary_df": prepared["population_summary_df"],
+        "applicant_scores_df": applicant_scores_df,
+        "holdout_scores_df": holdout_scores_df,
+        "test_scores": test_scores,
+        "y_test": y_test,
+        "train_scores": train_scores,
+        "y_development_fit_booked": y_development_fit_booked,
+        "num_cols": feature_discovery_result.num_cols,
+        "cat_cols": feature_discovery_result.cat_cols,
+    }
+
+
+def _run_artifact_persistence_stage(
+    eval_stage: EvaluationStageResult,
+    output_path: Path,
+) -> None:
+    with _log_step(18, "Save artifacts"):
+        feat_imp = extract_feature_importance(eval_stage["models"], eval_stage["num_cols"], eval_stage["cat_cols"])
+        plots_dir = output_path / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        plot_score_distributions(
+            eval_stage["y_test"].values,
+            eval_stage["test_scores"],
+            plots_dir / "score_dist_test.png",
+            title_prefix="Test",
+        )
+        plot_score_distributions(
+            eval_stage["y_development_fit_booked"].values,
+            eval_stage["train_scores"],
+            plots_dir / "score_dist_train.png",
+            title_prefix="Train",
+        )
+        save_artifacts(
+            eval_stage["models"],
+            eval_stage["official_results_df"],
+            feat_imp,
+            output_path,
+            experimental_results_df=eval_stage["experimental_results_df"],
+            benchmark_comparisons_df=eval_stage["benchmark_comparisons_df"],
+            experimental_benchmark_comparisons_df=eval_stage["experimental_benchmark_comparisons_df"],
+            feature_provenance_df=eval_stage["feature_provenance_df"],
+            interaction_leaderboard_df=eval_stage["interaction_leaderboard_df"],
+            feature_discovery_boundary_df=eval_stage["feature_discovery_boundary_df"],
+            ablation_results_df=eval_stage["ablation_results_df"],
+            rolling_oot_results_df=eval_stage["rolling_oot_results_df"],
+            rolling_oot_summary_df=eval_stage["rolling_oot_summary_df"],
+            population_summary_df=eval_stage["population_summary_df"],
+            applicant_scores_df=eval_stage["applicant_scores_df"],
+            holdout_scores_df=eval_stage["holdout_scores_df"],
+        )
 
 
 def summarize_population(
@@ -2195,11 +3022,10 @@ def compute_shap_analysis(
     try:
         import shap
     except ImportError:
-        logger.warning("shap not installed — skipping (pip install shap)")
-        return None
+        shap = None
 
     candidate_names = [preferred_model_name] if preferred_model_name is not None else []
-    candidate_names.extend(["LightGBM", "XGBoost", "CatBoost", "Logistic Regression"])
+    candidate_names.extend(OFFICIAL_MODEL_NAMES)
     tree_class_names = {"LGBMClassifier", "XGBClassifier", "CatBoostClassifier"}
 
     # Build ranked list of (model, explainer_type) — we may need to skip models
@@ -2214,12 +3040,21 @@ def compute_shap_analysis(
             ranked_candidates.append((name, candidate_model, "tree"))
         elif isinstance(candidate_clf, LogisticRegression):
             ranked_candidates.append((name, candidate_model, "linear"))
+        elif (
+            hasattr(candidate_clf, "explain_global")
+            and hasattr(candidate_clf, "term_importances")
+            and hasattr(candidate_clf, "eval_terms")
+        ):
+            ranked_candidates.append((name, candidate_model, "ebm"))
 
     if not ranked_candidates:
         logger.warning("No supported model available for SHAP")
         return None
 
     feature_names = num_cols + cat_cols
+    selected_explainer = None
+    selected_global_explanation = None
+    selected_term_scores = None
 
     for name, model, explainer_type in ranked_candidates:
         pre = model.named_steps["preprocessor"]
@@ -2239,14 +3074,21 @@ def compute_shap_analysis(
 
         try:
             if explainer_type == "linear":
+                if shap is None:
+                    raise ImportError("shap not installed")
                 background = X_t
                 if X_t.shape[0] > 1000:
                     rng = np.random.RandomState(RANDOM_STATE)
                     bg_idx = rng.choice(X_t.shape[0], 1000, replace=False)
                     background = X_t[bg_idx]
-                explainer = shap.LinearExplainer(clf, background)
+                selected_explainer = shap.LinearExplainer(clf, background)
+            elif explainer_type == "ebm":
+                selected_global_explanation = clf.explain_global()
+                selected_term_scores = clf.eval_terms(X_t)
             else:
-                explainer = shap.TreeExplainer(clf)
+                if shap is None:
+                    raise ImportError("shap not installed")
+                selected_explainer = shap.TreeExplainer(clf)
             break
         except (ValueError, TypeError, Exception) as exc:
             logger.warning("SHAP explainer failed for {} ({}), trying next model: {}", name, explainer_type, exc)
@@ -2254,14 +3096,96 @@ def compute_shap_analysis(
     else:
         logger.warning("All SHAP explainer attempts failed — skipping")
         return None
-    shap_values = explainer.shap_values(X_t)
+
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    if explainer_type == "ebm":
+        overall_data = selected_global_explanation.data()
+        term_names = [str(term_name) for term_name in overall_data.get("names", [])]
+        term_importances = np.asarray(overall_data.get("scores", []), dtype=float)
+        if len(term_names) == 0 or term_importances.size == 0:
+            logger.warning("EBM global explanation is empty — skipping")
+            return None
+
+        order = np.argsort(np.abs(term_importances))[::-1]
+        ordered_names = [term_names[idx] for idx in order]
+        ordered_importances = np.abs(term_importances[order])
+        summary = pd.DataFrame({
+            "feature": ordered_names,
+            "mean_abs_shap": ordered_importances,
+        })
+
+        top_n = min(20, len(summary))
+        plot_df = summary.head(top_n).iloc[::-1]
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.barh(plot_df["feature"], plot_df["mean_abs_shap"], color="#7b2cbf")
+        ax.set_xlabel("Global importance")
+        ax.set_ylabel("Term")
+        ax.set_title(f"Global term importance — {name}")
+        fig.tight_layout()
+        fig.savefig(plots_dir / "shap_summary.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.barh(plot_df["feature"], plot_df["mean_abs_shap"], color="#7b2cbf")
+        ax.set_xlabel("Global importance")
+        ax.set_ylabel("Term")
+        ax.set_title(f"Global term importance — {name}")
+        fig.tight_layout()
+        fig.savefig(plots_dir / "shap_importance.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        axes = axes.flatten()
+        plotted = 0
+        for term_idx in order:
+            if plotted >= 6:
+                break
+            term_data = selected_global_explanation.data(int(term_idx))
+            scores = np.asarray(term_data.get("scores", []), dtype=float)
+            if scores.size == 0:
+                continue
+            names = [str(label) for label in term_data.get("names", [])]
+            if len(names) == len(scores) + 1:
+                labels = names[1:]
+            else:
+                labels = names[: len(scores)]
+            ax = axes[plotted]
+            positions = np.arange(len(scores))
+            ax.bar(positions, scores, color="#7b2cbf", alpha=0.85)
+            if labels and len(labels) == len(scores) and len(labels) <= 12:
+                ax.set_xticks(positions)
+                ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+            else:
+                ax.set_xticks([])
+            ax.set_title(term_names[int(term_idx)])
+            plotted += 1
+        for j in range(plotted, 6):
+            axes[j].set_visible(False)
+        fig.suptitle(f"EBM term effects — {name} (top {plotted})", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(plots_dir / "shap_dependence.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        if selected_term_scores is not None:
+            term_score_names = term_names[: selected_term_scores.shape[1]]
+            shap_df = pd.DataFrame(selected_term_scores, columns=term_score_names)
+            shap_df.to_csv(output_dir / "shap_values.csv", index=False, float_format="%.6f")
+
+        summary.to_csv(output_dir / "shap_importance.csv", index=False, float_format="%.6f")
+        logger.info("Explainability ({}): {} terms", name, len(summary))
+        for _, r in summary.head(10).iterrows():
+            logger.info("  {:<35s} mean|effect|={:.4f}", r["feature"], r["mean_abs_shap"])
+
+        return summary
+
+    shap_values = selected_explainer.shap_values(X_t)
     if isinstance(shap_values, list):
         shap_values = shap_values[1]
     if shap_values.ndim == 3:
         shap_values = shap_values[:, :, 1]
-
-    plots_dir = output_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
 
     shap.summary_plot(
         shap_values, X_t, feature_names=feature_names,
@@ -2769,634 +3693,72 @@ def main(
     if enable_experimental_stacking:
         logger.warning("Stacking is experimental and excluded from official baseline comparisons")
 
-    with _log_step(1, "Load data"):
-        if population_mode == POPULATION_MODE_UNDERWRITING or reject_inference:
-            df, rejected_df = load_data_with_rejects(data_path)
-        else:
-            df = load_data(data_path)
-            rejected_df = None
-        population_summary_df = build_population_summary_df(
-            df,
-            rejected_df,
-            population_mode=population_mode,
-        )
-
-    with _log_step(2, "Feature engineering"):
-        raw_feature_cols, _, _ = select_features(df)
-        df = engineer_features(df)
-        if rejected_df is not None:
-            rejected_df = engineer_features(rejected_df)
-        base_feature_cols_no_interactions, _, _ = select_features(df)
-        engineered_feature_cols = [
-            feature for feature in base_feature_cols_no_interactions if feature not in raw_feature_cols
-        ]
-
-    with _log_step(3, "Feature discovery workflow"):
-        feature_discovery_result = _training_features.run_feature_discovery_workflow(
-            df=df,
-            rejected_df=rejected_df,
-            raw_feature_cols=raw_feature_cols,
-            engineered_feature_cols=engineered_feature_cols,
-            base_feature_cols_no_interactions=base_feature_cols_no_interactions,
-            feature_discovery_fraction=feature_discovery_fraction,
-            temporal_split_fn=temporal_split,
-            resolve_temporal_feature_discovery_cutoff_fn=resolve_temporal_feature_discovery_cutoff,
-            temporal_feature_discovery_split_fn=temporal_feature_discovery_split,
-            summarize_population_fn=summarize_population,
-            log_population_summary_fn=log_population_summary,
-            make_temporal_cv_fn=make_temporal_cv,
-        )
-        df = feature_discovery_result.df
-        rejected_df = feature_discovery_result.rejected_df
-        interaction_feature_cols = feature_discovery_result.interaction_feature_cols
-        interaction_leaderboard_df = feature_discovery_result.interaction_leaderboard_df
-        feature_discovery_boundary_df = feature_discovery_result.feature_discovery_boundary_df
-        base_feature_cols = feature_discovery_result.base_feature_cols
-        base_num_cols = feature_discovery_result.base_num_cols
-        base_cat_cols = feature_discovery_result.base_cat_cols
-        X_estimation_base = feature_discovery_result.X_estimation_base
-        y_estimation = feature_discovery_result.y_estimation
-        estimation_dates = feature_discovery_result.estimation_dates
-        X_test_base = feature_discovery_result.X_test_base
-        y_test = feature_discovery_result.y_test
-        benchmark_risk_score_test = feature_discovery_result.benchmark_risk_score_test
-        benchmark_score_test = feature_discovery_result.benchmark_score_test
-        feature_cols = feature_discovery_result.feature_cols
-        num_cols = feature_discovery_result.num_cols
-        cat_cols = feature_discovery_result.cat_cols
-        rfecv_candidate_feature_cols = feature_discovery_result.rfecv_candidate_feature_cols
-        feature_provenance_df = feature_discovery_result.feature_provenance_df
-
-    with _log_step(4, "Freeze feature set & prepare official matrices"):
-        X_development_base = X_estimation_base.copy()
-        y_development = y_estimation.copy()
-        development_dates = estimation_dates.copy()
-        benchmark_risk_score_estimation = df.loc[X_estimation_base.index, "risk_score_rf"].copy()
-        benchmark_score_estimation = df.loc[X_estimation_base.index, "score_RF"].copy()
-        sample_weight = None
-        X_augmented_base_for_ablation = None
-        y_augmented_for_ablation = None
-        augmented_dates_for_ablation = None
-        augmented_sample_weight_for_ablation = None
-        log_population_summary(
-            "Official estimation sample",
-            summarize_population(
-                y_development,
-                development_dates,
-                "later pre-test booked rows used for final model estimation after feature freezing",
-            ),
-        )
-        if reject_inference and rejected_df is not None:
-            band_stats, bin_edges = compute_score_band_bad_rates(df)
-            estimation_start = pd.Timestamp(pd.to_datetime(estimation_dates).min())
-            reject_pool = rejected_df[rejected_df["mis_Date"] >= estimation_start].copy()
-            reject_labeled = create_reject_pseudo_labels(
-                reject_pool,
-                band_stats,
-                bin_edges,
-                n_booked_train=len(X_development_base),
-            )
-            X_development_base, y_development, sample_weight = augment_training_data(
-                X_development_base,
-                y_development,
-                reject_labeled,
-                base_feature_cols,
-            )
-            development_dates = np.concatenate([development_dates, reject_labeled["mis_Date"].values])
-            X_augmented_base_for_ablation = X_development_base.copy()
-            y_augmented_for_ablation = y_development.copy()
-            augmented_dates_for_ablation = development_dates.copy()
-            augmented_sample_weight_for_ablation = sample_weight.copy()
-            log_population_summary(
-                "Development sample after reject inference",
-                summarize_population(
-                    y_development,
-                    development_dates,
-                    "later pre-test development rows used for modeling (booked + pseudo-labeled rejects)",
-                    sample_weight=sample_weight,
-                ),
-            )
-        X_development, X_test, _, _, _, _, _ = add_modeling_features(
-            X_development_base,
-            X_test_base,
-            base_feature_cols,
-            base_num_cols,
-            base_cat_cols,
-        )
-        X_development = X_development[feature_cols].copy()
-        X_test = X_test[feature_cols].copy()
-        logger.info(
-            "Official matrices with frozen features: {} train rows x {} cols, {} test rows x {} cols",
-            len(X_development),
-            len(feature_cols),
-            len(X_test),
-            len(feature_cols),
-        )
-
-    preprocessor, lgbm_preprocessor, lgbm_cat_indices = build_preprocessors(num_cols, cat_cols)
-    monotone_constraints = build_monotone_constraints(num_cols, cat_cols)
-
-    if sample_weight is not None:
-        X_development_fit, X_calibration_holdout, y_development_fit, y_calibration_holdout, w_development_fit, w_calibration_holdout, development_fit_dates, calibration_holdout_dates = temporal_calibration_split(
-            X_development,
-            y_development,
-            development_dates,
-            calibration_fraction=CALIBRATION_FRACTION,
-            sample_weight=sample_weight,
-        )
-        calibration_booked_mask = w_calibration_holdout == 1.0
-        X_calibration_booked = X_calibration_holdout.loc[calibration_booked_mask]
-        y_calibration_booked = y_calibration_holdout.loc[calibration_booked_mask]
-        calibration_booked_dates = calibration_holdout_dates[calibration_booked_mask]
-        log_population_summary(
-            "Calibration holdout",
-            summarize_population(
-                y_calibration_holdout,
-                calibration_holdout_dates,
-                "latest pre-test holdout rows reserved from model fitting",
-                sample_weight=w_calibration_holdout,
-            ),
-        )
-    else:
-        X_development_fit, X_calibration_holdout, y_development_fit, y_calibration_holdout, development_fit_dates, calibration_holdout_dates = temporal_calibration_split(
-            X_development,
-            y_development,
-            development_dates,
-            calibration_fraction=CALIBRATION_FRACTION,
-        )
-        w_development_fit = None
-        w_calibration_holdout = None
-        X_calibration_booked = X_calibration_holdout
-        y_calibration_booked = y_calibration_holdout
-        calibration_booked_dates = calibration_holdout_dates
-
-    if len(X_calibration_booked) == 0:
-        raise ValueError("Calibration split produced no booked ground-truth rows")
-
-    log_population_summary(
-        "Development fit sample",
-        summarize_population(
-            y_development_fit,
-            development_fit_dates,
-            "earlier pre-test rows used for model fitting",
-            sample_weight=w_development_fit,
-        ),
+    prepared = _run_data_preparation_stages(
+        data_path=data_path,
+        population_mode=population_mode,
+        reject_inference=reject_inference,
+        feature_discovery_fraction=feature_discovery_fraction,
     )
-    log_population_summary(
-        "Calibration ground-truth sample",
-        summarize_population(
-            y_calibration_booked,
-            calibration_booked_dates,
-            "booked subset of the latest pre-test holdout used for calibration",
-        ),
+    df = prepared["df"]
+    rejected_df = prepared["rejected_df"]
+    population_summary_df = prepared["population_summary_df"]
+    feature_discovery_result = prepared["feature_discovery_result"]
+    raw_feature_cols = prepared["raw_feature_cols"]
+    engineered_feature_cols = prepared["engineered_feature_cols"]
+    X_development_base = prepared["X_development_base"]
+    y_development = prepared["y_development"]
+    development_dates = prepared["development_dates"]
+    X_augmented_base_for_ablation = prepared["X_augmented_base_for_ablation"]
+    y_augmented_for_ablation = prepared["y_augmented_for_ablation"]
+    augmented_dates_for_ablation = prepared["augmented_dates_for_ablation"]
+    augmented_sample_weight_for_ablation = prepared["augmented_sample_weight_for_ablation"]
+    X_test = prepared["X_test"]
+    X_development_fit = prepared["X_development_fit"]
+    y_development_fit = prepared["y_development_fit"]
+    w_development_fit = prepared["w_development_fit"]
+    X_calibration_booked = prepared["X_calibration_booked"]
+    y_calibration_booked = prepared["y_calibration_booked"]
+    X_test_base = feature_discovery_result.X_test_base
+    y_test = feature_discovery_result.y_test
+    benchmark_risk_score_test = feature_discovery_result.benchmark_risk_score_test
+    benchmark_score_test = feature_discovery_result.benchmark_score_test
+    interaction_feature_cols = feature_discovery_result.interaction_feature_cols
+    interaction_leaderboard_df = feature_discovery_result.interaction_leaderboard_df
+    feature_discovery_boundary_df = feature_discovery_result.feature_discovery_boundary_df
+    base_feature_cols = feature_discovery_result.base_feature_cols
+    base_num_cols = feature_discovery_result.base_num_cols
+    base_cat_cols = feature_discovery_result.base_cat_cols
+    X_estimation_base = feature_discovery_result.X_estimation_base
+    y_estimation = feature_discovery_result.y_estimation
+    estimation_dates = feature_discovery_result.estimation_dates
+    feature_cols = feature_discovery_result.feature_cols
+    num_cols = feature_discovery_result.num_cols
+    cat_cols = feature_discovery_result.cat_cols
+    rfecv_candidate_feature_cols = feature_discovery_result.rfecv_candidate_feature_cols
+    feature_provenance_df = feature_discovery_result.feature_provenance_df
+
+    training_stage = _run_model_training_stages(
+        prepared=prepared,
+        optuna_trials=optuna_trials,
+        output_path=output_path,
+        enable_experimental_stacking=enable_experimental_stacking,
+        population_mode=population_mode,
     )
+    models = training_stage["models"]
+    development_oof_scores = training_stage["development_oof_scores"]
+    rolling_oot_results_df = training_stage["rolling_oot_results_df"]
+    rolling_oot_summary_df = training_stage["rolling_oot_summary_df"]
 
-    pos_weight = (y_development_fit == 0).sum() / (y_development_fit == 1).sum()
-    cv = make_temporal_cv(development_fit_dates)
-    fit_start = pd.Timestamp(pd.to_datetime(development_fit_dates).min()).date()
-    fit_end = pd.Timestamp(pd.to_datetime(development_fit_dates).max()).date()
-    calib_start = pd.Timestamp(pd.to_datetime(calibration_holdout_dates).min()).date()
-    calib_end = pd.Timestamp(pd.to_datetime(calibration_holdout_dates).max()).date()
-    logger.info(
-        "Development/calibration split: {:,} fit [{} to {}] + {:,} holdout [{} to {}] ({:,} booked ground-truth, {:,} pos)  (imbalance {:.0f}:1, temporal CV {} folds)",
-        len(X_development_fit),
-        fit_start,
-        fit_end,
-        len(X_calibration_holdout),
-        calib_start,
-        calib_end,
-        len(X_calibration_booked),
-        int(y_calibration_booked.sum()),
-        pos_weight,
-        cv.n_splits,
-    )
-
-    with _log_step(7, "Logistic Regression — development fit sample"):
-        lr_model, lr_study = train_logistic_regression(
-            X_development_fit,
-            y_development_fit,
-            preprocessor,
-            cv,
-            optuna_trials,
-            sample_weight=w_development_fit,
-            num_cols=num_cols,
-            cat_cols=cat_cols,
-        )
-    with _log_step("7b", "EBM — development fit sample"):
-        ebm_model, ebm_study = train_ebm(
-            X_development_fit,
-            y_development_fit,
-            preprocessor,
-            cv,
-            optuna_trials,
-            sample_weight=w_development_fit,
-        )
-    with _log_step(8, "LightGBM — development fit sample"):
-        lgbm_model, lgbm_study, lgbm_best_n = train_lgbm(
-            X_development_fit,
-            y_development_fit,
-            lgbm_preprocessor,
-            lgbm_cat_indices,
-            pos_weight,
-            cv,
-            optuna_trials,
-            sample_weight=w_development_fit,
-            monotone_constraints=monotone_constraints,
-        )
-    with _log_step(9, "XGBoost — development fit sample"):
-        xgb_model, xgb_study, xgb_best_n = train_xgboost(
-            X_development_fit,
-            y_development_fit,
-            preprocessor,
-            pos_weight,
-            cv,
-            optuna_trials,
-            sample_weight=w_development_fit,
-            monotone_constraints=monotone_constraints,
-        )
-    with _log_step(10, "CatBoost — development fit sample"):
-        catboost_model, catboost_study, catboost_best_n = train_catboost(
-            X_development_fit,
-            y_development_fit,
-            lgbm_preprocessor,
-            pos_weight,
-            cv,
-            optuna_trials,
-            sample_weight=w_development_fit,
-            monotone_constraints=monotone_constraints,
-        )
-
-    # Save Optuna trial histories for hyperparameter sensitivity analysis
-    for study_name, study_obj in [
-        ("Logistic Regression", lr_study),
-        ("EBM", ebm_study),
-        ("LightGBM", lgbm_study),
-        ("XGBoost", xgb_study),
-        ("CatBoost", catboost_study),
-    ]:
-        _save_optuna_study(study_obj, output_path, study_name)
-
-    stack_model = None
-    if enable_experimental_stacking:
-        with _log_step(11, "Stacking ensemble (experimental)"):
-            stack_model = train_stacking(
-                X_development_fit,
-                y_development_fit,
-                {
-                    "Logistic Regression": lr_model,
-                    "EBM": ebm_model,
-                    "LightGBM": lgbm_model,
-                    "XGBoost": xgb_model,
-                    "CatBoost": catboost_model,
-                },
-                cv,
-                sample_weight=w_development_fit,
-            )
-
-    with _log_step("11b", "Temporal OOF development scores"):
-        development_oof_scores = compute_temporal_oof_scores(
-            X_development_fit,
-            y_development_fit,
-            {
-                "Logistic Regression": lr_model,
-                "EBM": ebm_model,
-                "LightGBM": lgbm_model,
-                "XGBoost": xgb_model,
-                "CatBoost": catboost_model,
-            },
-            cv,
-            sample_weight=w_development_fit,
-        )
-
-    with _log_step(12, "Calibration — booked ground-truth holdout"):
-        models = {
-            "Logistic Regression": lr_model,
-            "EBM": ebm_model,
-            "LightGBM": lgbm_model,
-            "XGBoost": xgb_model,
-            "CatBoost": catboost_model,
-        }
-        if stack_model is not None:
-            models[EXPERIMENTAL_STACKING_NAME] = stack_model
-        for name in OFFICIAL_MODEL_NAMES:
-            # Isotonic for tree models (step-function scores); sigmoid for LR/EBM (smooth scores)
-            method = "sigmoid" if name in ("Logistic Regression", "EBM") else "isotonic"
-            cal = CalibratedClassifierCV(FrozenEstimator(models[name]), method=method)
-            cal.fit(X_calibration_booked, y_calibration_booked)
-            models[f"{name} (calibrated)"] = cal
-        logger.info(
-            "Calibration on {:,} booked held-out samples ({:,} pos) — sigmoid for LR/EBM, isotonic for tree models",
-            len(y_calibration_booked),
-            y_calibration_booked.sum(),
-        )
-
-    with _log_step("12b", "Rolling OOT validation — pre-test estimation sample"):
-        rolling_base_models = {name: models[name] for name in OFFICIAL_MODEL_NAMES}
-        rolling_oot_results_df, rolling_oot_summary_df = run_rolling_out_of_time_validation(
-            X_estimation_base,
-            y_estimation,
-            estimation_dates,
-            benchmark_risk_score_estimation,
-            benchmark_score_estimation,
-            base_feature_cols,
-            base_num_cols,
-            base_cat_cols,
-            feature_cols,
-            num_cols,
-            cat_cols,
-            rolling_base_models,
-        )
-        if population_mode == POPULATION_MODE_UNDERWRITING:
-            if not rolling_oot_results_df.empty:
-                rolling_oot_results_df["population_mode"] = population_mode
-                rolling_oot_results_df["evaluation_population"] = "booked_proxy"
-            if not rolling_oot_summary_df.empty:
-                rolling_oot_summary_df["population_mode"] = population_mode
-                rolling_oot_summary_df["evaluation_population"] = "booked_proxy"
-        if not rolling_oot_summary_df.empty:
-            logger.info("Rolling OOT summary:")
-            for _, row in rolling_oot_summary_df.iterrows():
-                logger.info(
-                    "  {:<30s} folds={} mean PR AUC={:.4f} mean AUC={:.4f}",
-                    row["Model"],
-                    int(row["n_folds"]),
-                    row["mean_PR_AUC"],
-                    row["mean_ROC_AUC"],
-                )
-
-    # 12c. Concept drift detection
-    with _log_step("12c", "Concept drift detection"):
-        concept_drift_df = compute_concept_drift_report(rolling_oot_results_df, model_names=OFFICIAL_MODEL_NAMES)
-        if not concept_drift_df.empty:
-            concept_drift_df.to_csv(output_path / "concept_drift.csv", index=False, float_format="%.6f")
-            logger.info("Concept drift analysis (PR AUC trend across OOT folds):")
-            for _, row in concept_drift_df.iterrows():
-                logger.info(
-                    "  {:<25s} first={:.4f} last={:.4f} slope={:+.4f}/fold  [{}]",
-                    row["model"], row["pr_auc_first"], row["pr_auc_last"],
-                    row["pr_auc_slope_per_fold"], row["concept_drift_flag"],
-                )
-            n_drift = int((concept_drift_df["concept_drift_flag"] == "YES").sum())
-            if n_drift > 0:
-                logger.warning("{} model(s) show concept drift (PR AUC declining > 0.02 across OOT folds)", n_drift)
-
-    # 12d. Post-hoc ensemble (LR + best tree weighted average)
-    with _log_step("12d", "Post-hoc ensemble"):
-        # Score calibration holdout with each base model
-        calib_scores_for_ensemble = {}
-        for name in OFFICIAL_MODEL_NAMES:
-            calib_scores_for_ensemble[name] = models[name].predict_proba(X_calibration_booked)[:, 1]
-        ensemble_result = train_post_hoc_ensemble(y_calibration_booked.values, calib_scores_for_ensemble)
-        if ensemble_result:
-            lr_w = ensemble_result["lr_weight"]
-            tree_w = ensemble_result["tree_weight"]
-            tree_name = ensemble_result["tree_name"]
-            logger.info(
-                "Best ensemble: {:.0%} {} + {:.0%} {} → calibration PR AUC {:.4f}",
-                lr_w, ensemble_result["lr_name"], tree_w, tree_name, ensemble_result["pr_auc"],
-            )
-            # Create a blending wrapper and add to models dict
-            ensemble_name = f"Ensemble ({ensemble_result['lr_name']} + {tree_name})"
-            models[ensemble_name] = EnsembleModel(
-                models[ensemble_result["lr_name"]], models[tree_name], lr_w, tree_w,
-                name=ensemble_name,
-            )
-            pd.DataFrame([ensemble_result]).to_csv(output_path / "ensemble_weights.csv", index=False, float_format="%.4f")
-        else:
-            logger.info("Post-hoc ensemble: no valid combination found")
-
-    with _log_step(13, "Evaluation — booked test sample"):
-        results_df, test_scores = evaluate_all(
-            X_test,
-            y_test,
-            models,
-            benchmark_risk_score_test,
-            benchmark_score_test,
-        )
-        official_results_df, experimental_results_df = split_leaderboard_results(
-            results_df,
-            reject_inference=reject_inference,
-        )
-        if population_mode == POPULATION_MODE_UNDERWRITING:
-            results_df["population_mode"] = population_mode
-            results_df["evaluation_population"] = "booked_proxy"
-            official_results_df["population_mode"] = population_mode
-            official_results_df["evaluation_population"] = "booked_proxy"
-            if not experimental_results_df.empty:
-                experimental_results_df["population_mode"] = population_mode
-                experimental_results_df["evaluation_population"] = "booked_proxy"
-        if not experimental_results_df.empty:
-            logger.warning(
-                "Experimental rows excluded from primary leaderboard: {}",
-                ", ".join(experimental_results_df.index),
-            )
-
-    if population_mode == POPULATION_MODE_UNDERWRITING:
-        with _log_step("13b", "Score post-split underwriting applications"):
-            applicant_scores_df = build_applicant_score_frame(
-                df,
-                rejected_df,
-                X_development_base,
-                base_feature_cols,
-                base_num_cols,
-                base_cat_cols,
-                feature_cols,
-                models,
-            )
-            observed_count = int(applicant_scores_df["has_observed_target"].sum()) if not applicant_scores_df.empty else 0
-            logger.info(
-                "Post-split applicant scoring: {:,} rows ({:,} booked rows with observed outcomes)",
-                len(applicant_scores_df),
-                observed_count,
-            )
-    else:
-        applicant_scores_df = None
-
-    holdout_scores_df = build_holdout_score_frame(
-        y_test,
-        test_scores,
-        population_mode=population_mode if population_mode == POPULATION_MODE_UNDERWRITING else None,
-        evaluation_population="booked_proxy" if population_mode == POPULATION_MODE_UNDERWRITING else None,
-    )
-
-    if w_development_fit is not None:
-        development_fit_booked_mask = w_development_fit == 1.0
-        X_development_fit_booked = X_development_fit.loc[development_fit_booked_mask]
-        y_development_fit_booked = y_development_fit.loc[development_fit_booked_mask]
-    else:
-        X_development_fit_booked = X_development_fit
-        y_development_fit_booked = y_development_fit
-    train_scores = {
-        name: scores[development_fit_booked_mask] if w_development_fit is not None else scores
-        for name, scores in development_oof_scores.items()
-    }
-
-    with _log_step(14, "Bootstrap confidence intervals — booked test sample"):
-        ci_df = bootstrap_confidence_intervals(y_test.values, test_scores)
-        ci_df.to_csv(output_path / "confidence_intervals.csv", float_format="%.6f")
-        official_candidate_names = [name for name in official_results_df.index if name not in BENCHMARK_MODEL_NAMES]
-        experimental_candidate_names = list(experimental_results_df.index)
-        benchmark_comparisons_df = paired_bootstrap_benchmark_comparisons(
-            y_test.values,
-            test_scores,
-            official_candidate_names,
-        )
-        experimental_benchmark_comparisons_df = paired_bootstrap_benchmark_comparisons(
-            y_test.values,
-            test_scores,
-            experimental_candidate_names,
-        )
-        if population_mode == POPULATION_MODE_UNDERWRITING:
-            if not benchmark_comparisons_df.empty:
-                benchmark_comparisons_df["population_mode"] = population_mode
-                benchmark_comparisons_df["evaluation_population"] = "booked_proxy"
-            if not experimental_benchmark_comparisons_df.empty:
-                experimental_benchmark_comparisons_df["population_mode"] = population_mode
-                experimental_benchmark_comparisons_df["evaluation_population"] = "booked_proxy"
-        logger.info("95% CIs ({:,} stratified bootstrap iterations):", N_BOOTSTRAP)
-        for model_name, row in ci_df.iterrows():
-            brier_str = (
-                f"  Brier={row['Brier']:.4f} [{row['Brier_lo']:.4f}, {row['Brier_hi']:.4f}]"
-                if not np.isnan(row["Brier"])
-                else ""
-            )
-            logger.info(
-                "  {:<30s} AUC={:.4f} [{:.4f}, {:.4f}]  PR={:.4f} [{:.4f}, {:.4f}]{}",
-                model_name,
-                row["AUC"],
-                row["AUC_lo"],
-                row["AUC_hi"],
-                row["PR_AUC"],
-                row["PR_AUC_lo"],
-                row["PR_AUC_hi"],
-                brier_str,
-            )
-        if not benchmark_comparisons_df.empty:
-            logger.info(
-                "Paired benchmark comparisons: {} official candidate/reference pairs",
-                len(benchmark_comparisons_df),
-            )
-        if not experimental_benchmark_comparisons_df.empty:
-            logger.warning(
-                "Experimental benchmark comparisons saved separately: {} candidate/reference pairs",
-                len(experimental_benchmark_comparisons_df),
-            )
-
-    with _log_step("14b", "Phase 3 ablations"):
-        ablation_results_df = run_phase3_ablations(
-            X_estimation_base,
-            y_estimation,
-            estimation_dates,
-            X_test_base,
-            y_test,
-            raw_feature_cols,
-            engineered_feature_cols,
-            interaction_feature_cols,
-            base_feature_cols,
-            base_num_cols,
-            base_cat_cols,
-            rfecv_candidate_feature_cols,
-            feature_cols,
-            num_cols,
-            cat_cols,
-            X_augmented_base=X_augmented_base_for_ablation,
-            y_augmented=y_augmented_for_ablation,
-            augmented_dates=augmented_dates_for_ablation,
-            augmented_sample_weight=augmented_sample_weight_for_ablation,
-        )
-        logger.info("Phase 3 ablations completed: {} rows", len(ablation_results_df))
-    if population_mode == POPULATION_MODE_UNDERWRITING and not ablation_results_df.empty:
-        ablation_results_df["population_mode"] = population_mode
-        ablation_results_df["evaluation_population"] = "booked_proxy"
-
-    with _log_step(15, "SHAP explainability"):
-        compute_shap_analysis(models, X_test, num_cols, cat_cols, output_path)
-
-    with _log_step(16, "WoE / IV analysis"):
-        woe_df, iv_df = compute_woe_iv(X_development_fit, y_development_fit, num_cols, cat_cols)
-        woe_df.to_csv(output_path / "woe_detail.csv", index=False, float_format="%.6f")
-        iv_df.to_csv(output_path / "iv_summary.csv", index=False, float_format="%.6f")
-        logger.info("{} features analyzed ({:,} fit rows)", len(iv_df), len(X_development_fit))
-        for _, row in iv_df.head(15).iterrows():
-            strength = (
-                "Useless"
-                if row["iv"] < 0.02
-                else "Weak"
-                if row["iv"] < 0.1
-                else "Medium"
-                if row["iv"] < 0.3
-                else "Strong"
-                if row["iv"] < 0.5
-                else "Suspicious"
-            )
-            logger.info("  {:<35s} IV={:.4f}  [{}]", row["feature"], row["iv"], strength)
-
-    with _log_step(17, "PSI / CSI stability"):
-        run_stability_analysis(
-            X_development_fit_booked,
-            X_test,
-            train_scores,
-            test_scores,
-            num_cols,
-            cat_cols,
-            output_path,
-        )
-
-    overfit_df, model_selection_df = _run_diagnostics_and_governance(
-        y_test=y_test,
-        y_development_fit_booked=y_development_fit_booked,
-        test_scores=test_scores,
-        train_scores=train_scores,
-        models=models,
-        X_test=X_test,
-        X_development_fit=X_development_fit,
-        num_cols=num_cols,
-        cat_cols=cat_cols,
-        feature_cols=feature_cols,
-        official_results_df=official_results_df,
-        rolling_oot_summary_df=rolling_oot_summary_df,
-        benchmark_comparisons_df=benchmark_comparisons_df,
-        population_summary_df=population_summary_df,
-        feature_provenance_df=feature_provenance_df,
-        applicant_scores_df=applicant_scores_df,
-        age_values=df.loc[X_test_base.index, "AGE_T1"].values if "AGE_T1" in df.columns else None,
+    eval_stage = _run_evaluation_and_diagnostics_stages(
+        prepared=prepared,
+        training_stage=training_stage,
+        reject_inference=reject_inference,
+        population_mode=population_mode,
         output_path=output_path,
     )
-
-    with _log_step(18, "Save artifacts"):
-        feat_imp = extract_feature_importance(models, num_cols, cat_cols)
-        plots_dir = output_path / "plots"
-        plots_dir.mkdir(parents=True, exist_ok=True)
-        plot_score_distributions(
-            y_test.values,
-            test_scores,
-            plots_dir / "score_dist_test.png",
-            title_prefix="Test",
-        )
-        plot_score_distributions(
-            y_development_fit_booked.values,
-            train_scores,
-            plots_dir / "score_dist_train.png",
-            title_prefix="Train",
-        )
-        save_artifacts(
-            models,
-            official_results_df,
-            feat_imp,
-            output_path,
-            experimental_results_df=experimental_results_df,
-            benchmark_comparisons_df=benchmark_comparisons_df,
-            experimental_benchmark_comparisons_df=experimental_benchmark_comparisons_df,
-            feature_provenance_df=feature_provenance_df,
-            interaction_leaderboard_df=interaction_leaderboard_df,
-            feature_discovery_boundary_df=feature_discovery_boundary_df,
-            ablation_results_df=ablation_results_df,
-            rolling_oot_results_df=rolling_oot_results_df,
-            rolling_oot_summary_df=rolling_oot_summary_df,
-            population_summary_df=population_summary_df,
-            applicant_scores_df=applicant_scores_df,
-            holdout_scores_df=holdout_scores_df,
-        )
+    results_df = eval_stage["results_df"]
+    models = eval_stage["models"]
+    _run_artifact_persistence_stage(eval_stage=eval_stage, output_path=output_path)
 
     total_elapsed = time.perf_counter() - pipeline_t0
     logger.info("Pipeline finished in {:.0f}m {:.0f}s", total_elapsed // 60, total_elapsed % 60)

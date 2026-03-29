@@ -156,13 +156,14 @@ def create_kpi_chart(
 ) -> Path:
     post_split = population_summary_df.loc[population_summary_df["split"] == "post_split"].copy()
     counts = post_split.set_index("status_name")["n_rows"].to_dict()
-    held_out_name = selected_model or "Logistic Regression"
-    held_out_candidates = results_df.loc[results_df["Model"] == held_out_name]
+    held_out_name = selected_model or _selected_model_name(results_df, None)
+    held_out_candidates = results_df.loc[results_df["Model"] == held_out_name] if held_out_name is not None else pd.DataFrame()
     if held_out_candidates.empty:
         held_out_candidates = results_df.loc[results_df["Model"].isin(CANDIDATE_ORDER)]
     if held_out_candidates.empty:
         held_out_candidates = results_df.copy()
     held_out_row = held_out_candidates.iloc[0]
+    held_out_name = str(held_out_row["Model"])
 
     comparison_row = None
     if not benchmark_comparisons_df.empty:

@@ -190,3 +190,48 @@ class TestScoringService:
         d = result.to_dict()
         assert d["predicted_pd"] == 0.05
         assert d["risk_tier"] == "LOW"
+
+    def test_from_output_dir_loads_recommended_model(self, tmp_path):
+        import joblib
+        from sklearn.linear_model import LogisticRegression
+        from scoring import ScoringService
+
+        model = LogisticRegression().fit(np.array([[0.0], [1.0], [2.0], [3.0]]), np.array([0, 0, 1, 1]))
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        joblib.dump(model, models_dir / "logistic_regression.joblib")
+
+        pd.DataFrame([{"model": "Logistic Regression", "recommended": True}]).to_csv(
+            tmp_path / "model_selection.csv", index=False
+        )
+        pd.DataFrame([{"feature": "a"}]).to_csv(tmp_path / "variable_dictionary.csv", index=False)
+        pd.DataFrame(
+            [{"feature": "a", "type": "numerical", "min": 0.0, "max": 3.0, "missing_pct": 0.0, "n_unique": 4}]
+        ).to_csv(tmp_path / "data_quality_development_fit.csv", index=False)
+
+        service = ScoringService.from_output_dir(tmp_path)
+        result = service.score_applicant({"a": 2.0})
+        assert service.model_name == "Logistic Regression"
+        assert 0.0 <= result.predicted_pd <= 1.0
+
+    def test_from_output_dir_loads_risk_tiers(self, tmp_path):
+        import json
+        import joblib
+        from sklearn.linear_model import LogisticRegression
+        from scoring import ScoringService
+
+        model = LogisticRegression().fit(np.array([[0.0], [1.0], [2.0], [3.0]]), np.array([0, 0, 1, 1]))
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        joblib.dump(model, models_dir / "logistic_regression.joblib")
+        pd.DataFrame([{"model": "Logistic Regression", "recommended": True}]).to_csv(
+            tmp_path / "model_selection.csv", index=False
+        )
+        pd.DataFrame([{"feature": "a"}]).to_csv(tmp_path / "variable_dictionary.csv", index=False)
+
+        custom_tiers = [[0.0, 0.9, "LOW"], [0.9, 1.01, "HIGH"]]
+        (tmp_path / "risk_tiers.json").write_text(json.dumps(custom_tiers), encoding="utf-8")
+
+        service = ScoringService.from_output_dir(tmp_path)
+        result = service.score_applicant({"a": 2.0})
+        assert result.risk_tier in {"LOW", "HIGH"}

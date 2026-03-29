@@ -19,6 +19,7 @@ from training import (
     make_temporal_cv,
     resolve_temporal_feature_discovery_cutoff,
     summarize_population,
+    split_holdout_for_model_selection,
     temporal_calibration_split,
     temporal_feature_discovery_split,
     temporal_split,
@@ -26,6 +27,7 @@ from training import (
 from training_constants import (
     MATURITY_CUTOFF,
     SPLIT_DATE,
+    MODEL_SELECTION_DATE,
     TARGET,
 )
 from training_features import select_features
@@ -64,6 +66,28 @@ class TestTemporalSplit:
 
         overlap = set(X_train.index) & set(X_test.index)
         assert len(overlap) == 0, "Train and test indices must not overlap"
+
+    def test_holdout_split_for_selection_produces_two_non_empty_windows(self, engineered_df):
+        feature_cols, _, _ = select_features(engineered_df)
+        X_train, y_train, X_test, y_test, bench_risk, bench_score, _ = temporal_split(engineered_df, feature_cols)
+        del X_train, y_train
+        test_dates = engineered_df.loc[X_test.index, "mis_Date"].values
+
+        (
+            X_selection,
+            y_selection,
+            _bench_risk_selection,
+            _bench_score_selection,
+            X_final,
+            y_final,
+            _bench_risk_final,
+            _bench_score_final,
+        ) = split_holdout_for_model_selection(X_test, y_test, bench_risk, bench_score, test_dates)
+
+        assert len(X_selection) > 0 and len(y_selection) > 0
+        assert len(X_final) > 0 and len(y_final) > 0
+        assert (engineered_df.loc[X_selection.index, "mis_Date"] < MODEL_SELECTION_DATE).all()
+        assert (engineered_df.loc[X_final.index, "mis_Date"] >= MODEL_SELECTION_DATE).all()
 
 
 class TestTemporalExpandingCV:

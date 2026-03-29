@@ -110,6 +110,18 @@ class TestGenerateModelCard:
         assert "temporal elastic-net stability selection" in content
         assert "RFECV-selected features" not in content
 
+    def test_model_card_uses_model_dependent_calibration_wording(self, tmp_path):
+        results_df = pd.DataFrame(
+            {"ROC AUC": [0.82], "PR AUC": [0.15], "KS": [0.50], "Brier": [0.06], "N": [1000]},
+            index=["EBM"],
+        )
+
+        path = generate_model_card(results_df, None, None, None, None, None, tmp_path)
+        content = path.read_text()
+
+        assert "Calibration is model-dependent" in content
+        assert "Platt (sigmoid) scaling" not in content
+
 
 class TestGenerateVariableDictionary:
     def test_creates_csv(self, tmp_path):
