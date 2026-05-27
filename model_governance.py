@@ -12,19 +12,32 @@ from loguru import logger
 from training_constants import (
     BENCHMARK_MODEL_NAMES,
     CALIBRATION_FRACTION,
+    CALIBRATION_MIN_POSITIVES,
+    CONCEPT_DRIFT_DELTA_THRESHOLD,
     DROP_COLS,
     EARLY_STOPPING_ROUNDS,
     FEATURE_DISCOVERY_FRACTION,
     MATURITY_CUTOFF,
+    MODEL_SELECTION_QUALITY_FLOOR,
     MONOTONE_MAP,
     N_BOOTSTRAP,
     N_ESTIMATORS_CEILING,
     OFFICIAL_MODEL_NAMES,
+    OPTUNA_PRUNER_WARMUP_STEPS,
+    OVERFIT_DELTA_THRESHOLD,
+    PSI_HIGH_DRIFT_THRESHOLD,
+    PSI_MODERATE_THRESHOLD,
     RANDOM_STATE,
     RAW_CAT,
     RAW_NUM,
+    REJECT_MAX_RATIO,
+    REJECT_MULTIPLIER,
+    REJECT_SAMPLE_WEIGHT,
     SPLIT_DATE,
+    STABILITY_SELECTION_MIN_FEATURES,
+    STABILITY_SELECTION_THRESHOLD,
     TARGET,
+    TREE_AWARE_IMPORTANCE_RATIO,
 )
 
 
@@ -408,9 +421,15 @@ def generate_model_card(
     lines.append("   applicants have no observed repayment outcome.")
     lines.append("2. Target variable (basel_bad) requires 12 months on book to mature.")
     lines.append(f"   Only accounts with mis_Date <= {MATURITY_CUTOFF} are used.")
-    lines.append("3. Calibration is model-dependent on held-out booked ground-truth")
-    lines.append("   samples: sigmoid scaling for additive/log-odds models and")
-    lines.append("   isotonic calibration for tree ensembles.")
+    lines.append("3. Calibration method is selected by model class, not by")
+    lines.append("   data-driven goodness-of-fit on the calibration set (which")
+    lines.append("   would double-dip the same data). Choice follows")
+    lines.append("   Niculescu-Mizil & Caruana (2005), \"Predicting Good")
+    lines.append("   Probabilities With Supervised Learning\" (ICML):")
+    lines.append("     - sigmoid (Platt) for LR and EBM (log-odds-like outputs)")
+    lines.append("     - isotonic for LightGBM, XGBoost, CatBoost (sigmoid-shaped")
+    lines.append("       reliability diagrams).")
+    lines.append("   Calibration uses booked ground-truth samples only.")
     lines.append("4. Monotonicity constraints applied to tree models where domain")
     lines.append(f"   knowledge dictates direction ({len(MONOTONE_MAP)} features constrained).")
 
@@ -423,6 +442,99 @@ def generate_model_card(
     lines.append(f"Calibration fraction:     {CALIBRATION_FRACTION:.0%}")
     lines.append("Feature selector:         temporal elastic-net stability selection")
     lines.append(f"Feature discovery split:  {FEATURE_DISCOVERY_FRACTION:.0%}")
+
+    # 10. Methodology constants — regulator paper-trail (audit fix M)
+    _section("10. METHODOLOGY CONSTANTS")
+    lines.append("Each constant below is a deliberate methodology choice. Value,")
+    lines.append("rationale, and source are listed so a reviewer can audit each one")
+    lines.append("without reading the implementation. Where a citation is given, the")
+    lines.append("constant follows that source's recommendation; where a rationale is")
+    lines.append("given without a citation, the constant is an internal decision.")
+    lines.append("")
+    lines.append("Diagnostic thresholds")
+    lines.append("─────────────────────")
+    lines.append(f"PSI moderate-drift cut:       {PSI_MODERATE_THRESHOLD:.2f}")
+    lines.append(f"PSI high-drift cut:           {PSI_HIGH_DRIFT_THRESHOLD:.2f}")
+    lines.append("  Source: Karakoulas (2004); industry-standard PSI/CSI banding")
+    lines.append("  used by every major credit bureau and validation framework.")
+    lines.append("")
+    lines.append(f"Overfit flag delta threshold: {OVERFIT_DELTA_THRESHOLD:.2f} (AUC or PR-AUC train-test delta)")
+    lines.append("  Source: internal decision. 0.03 is strict relative to the typical")
+    lines.append("  industry rule-of-thumb (>=0.05); deliberately conservative for a")
+    lines.append("  regulated PD model. The selector also penalises generalisation")
+    lines.append("  on the LARGER of the two deltas (audit fix D).")
+    lines.append("")
+    lines.append(f"Concept-drift flag threshold: {CONCEPT_DRIFT_DELTA_THRESHOLD:+.2f} (PR-AUC first-vs-last fold delta)")
+    lines.append("  Source: internal decision. Flags only severe drift across the")
+    lines.append("  rolling-OOT window; smaller monotonic drops surface in the slope")
+    lines.append("  metric (pr_auc_slope_per_fold) without raising the flag.")
+    lines.append("")
+    lines.append("Reject-inference parameters")
+    lines.append("───────────────────────────")
+    lines.append(f"Bad-rate multiplier:          {REJECT_MULTIPLIER:.1f}x")
+    lines.append("  Source: Hand & Henley (1997), \"Statistical Classification Methods")
+    lines.append("  in Consumer Credit Scoring\". Reject populations are typically")
+    lines.append("  1.5-4x riskier than booked at the same score band; the lower end")
+    lines.append("  of the literature range is used here as the conservative choice")
+    lines.append("  pending portfolio-specific calibration.")
+    lines.append(f"Sample weight on pseudo-labels: {REJECT_SAMPLE_WEIGHT:.2f}")
+    lines.append("  Source: internal decision. Half-weighting downweights")
+    lines.append("  pseudo-labels relative to observed targets so the booked-only")
+    lines.append("  signal continues to dominate gradient updates.")
+    lines.append(f"Max booked:reject ratio:      {REJECT_MAX_RATIO:.1f}:1 (applicants)")
+    lines.append("  Source: internal decision. Caps reject influence at parity with")
+    lines.append("  booked observations after row-replication expansion.")
+    lines.append("  Pseudo-labels are deterministic 2x row expansion (audit fix I):")
+    lines.append("  each reject -> (target=1, weight=p*w) and (target=0, weight=(1-p)*w),")
+    lines.append("  preserving the expected gradient of a Bernoulli(p) draw without")
+    lines.append("  Monte Carlo noise.")
+    lines.append("")
+    lines.append("Feature selection")
+    lines.append("─────────────────")
+    lines.append(f"Stability selection threshold: {STABILITY_SELECTION_THRESHOLD:.0%} of folds")
+    lines.append("  Source: Meinshausen & Bühlmann (2010), \"Stability Selection\".")
+    lines.append("  50% is the literature-default cutoff and balances false-keep")
+    lines.append("  and false-drop rates symmetrically.")
+    lines.append(f"Stability selection floor:     {STABILITY_SELECTION_MIN_FEATURES} features")
+    lines.append("  Source: internal decision. Below 5 the linear meta-model has too")
+    lines.append("  few degrees of freedom to be identifiable. Floor binds only in")
+    lines.append("  degenerate scenarios; typical kept feature count is 15-30.")
+    lines.append(f"Tree-aware importance ratio:   {TREE_AWARE_IMPORTANCE_RATIO:.0%} of max permutation importance")
+    lines.append("  Source: internal decision. The final feature contract is")
+    lines.append("  STABILITY ∪ TREE_AWARE — features kept by either selector survive")
+    lines.append("  (audit fix B). 5% catches features the linear stability selector")
+    lines.append("  misses but trees value (non-linear effects, interactions).")
+    lines.append("")
+    lines.append("Calibration")
+    lines.append("───────────")
+    lines.append(f"Calibration holdout fraction:  {CALIBRATION_FRACTION:.0%} of development sample")
+    lines.append("  Source: internal decision. Carved temporally (latest pre-test")
+    lines.append("  block) so calibration data is most representative of production.")
+    lines.append(f"Min calibration positives:     {CALIBRATION_MIN_POSITIVES}")
+    lines.append("  Source: Niculescu-Mizil & Caruana (2005), Foster & Stine (2004).")
+    lines.append("  Below this isotonic regression over-fits the holdout's noise;")
+    lines.append("  pipeline emits a warning rather than failing (audit fix G).")
+    lines.append("")
+    lines.append("Hyperparameter search")
+    lines.append("─────────────────────")
+    lines.append(f"Optuna pruner warmup:          {OPTUNA_PRUNER_WARMUP_STEPS} CV folds")
+    lines.append("  Source: internal decision (audit fix J). The first temporal fold")
+    lines.append("  is the smallest and noisiest; pruning before fold 3 was killing")
+    lines.append("  configs that recovered later in the CV sequence.")
+    lines.append("")
+    lines.append("Model selection")
+    lines.append("───────────────")
+    lines.append("Weighted score: 35% discrimination + 20% stability + 15% calibration")
+    lines.append("                + 15% generalisation + 15% benchmark lift")
+    lines.append("  Source: internal decision. Discrimination dominates because it is")
+    lines.append("  the primary lift driver, but stability + generalisation +")
+    lines.append("  calibration sum to 50% so a model overfitting on test PR AUC")
+    lines.append("  cannot win on discrimination alone.")
+    lines.append(f"Quality floor:                 weighted_score >= {MODEL_SELECTION_QUALITY_FLOOR:.0f}")
+    lines.append("  Source: internal decision (audit fix K). If no candidate clears")
+    lines.append("  this absolute floor the pipeline produces no recommendation,")
+    lines.append("  preventing endorsement of a 'least bad' model when all options")
+    lines.append("  are weak in absolute terms.")
 
     card_path = output_path / "model_card.txt"
     card_path.write_text("\n".join(lines))

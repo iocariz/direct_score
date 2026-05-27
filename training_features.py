@@ -11,17 +11,21 @@ import pandas as pd
 from loguru import logger
 from tqdm.auto import tqdm
 from sklearn.compose import ColumnTransformer
+from lightgbm import LGBMClassifier
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler, TargetEncoder
 
 from training_constants import (
+    CALIBRATION_MIN_POSITIVES,
     DROP_COLS,
     INTERACTION_SEARCH_TOP_K_CAT,
     INTERACTION_SEARCH_TOP_K_NUM,
+    MATURITY_CUTOFF,
     MAX_CATEGORIES,
     MIN_LIFT,
     MIN_VALID,
@@ -36,10 +40,84 @@ from training_constants import (
     STABILITY_SELECTION_MIN_FEATURES,
     STABILITY_SELECTION_THRESHOLD,
     TARGET,
+    TREE_AWARE_IMPORTANCE_RATIO,
+    TREE_AWARE_PERMUTATION_REPEATS,
 )
 
 
+def enforce_matured_target(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter to rows whose target is observable (mature + non-null).
+
+    The maturity invariant: ``basel_bad`` needs 12 months on book to mature,
+    so only rows with ``mis_Date <= MATURITY_CUTOFF`` have a defensible
+    observed outcome. The static cutoff is the safety mechanism — rows past
+    it are dropped regardless of what their target column says.
+
+    A regulator-visible **warning** is emitted (not raised) when rows past
+    the cutoff have non-null targets. In an ideal world the upstream feed
+    leaves immature targets NaN; in practice many feeds populate ``0`` for
+    "no default observed yet" on rows that are right-censored. The warning
+    surfaces this so a reviewer can:
+
+      - Confirm the upstream contract (12-month observation window vs.
+        observed-so-far semantics) and update MATURITY_CUTOFF accordingly
+        if the buffer is unnecessary, OR
+      - Investigate whether the upstream is leaking censored zeros into
+        the training contract.
+
+    The static cutoff filter is applied in either case, so the function is
+    safe to call on data that violates the maturity contract — the offending
+    rows are dropped, not used.
+    """
+    cutoff = pd.Timestamp(MATURITY_CUTOFF)
+    past_cutoff_with_target = (df["mis_Date"] > cutoff) & df[TARGET].notna()
+    if past_cutoff_with_target.any():
+        n_past = int(past_cutoff_with_target.sum())
+        max_past_date = pd.Timestamp(df.loc[past_cutoff_with_target, "mis_Date"].max())
+        logger.warning(
+            "Maturity contract drift: {} rows have mis_Date > {} (up to {}) "
+            "but a non-null {}. basel_bad's 12-month-maturity contract "
+            "expects immature rows to be NaN. These rows are being silently "
+            "dropped by the static cutoff filter — review whether upstream "
+            "is right-censoring (filling 0 for immature rows) and whether "
+            "MATURITY_CUTOFF should be advanced to use newly-matured data.",
+            n_past, cutoff.date(), max_past_date.date(), TARGET,
+        )
+    return df[df["mis_Date"] <= cutoff].dropna(subset=[TARGET]).copy()
+
+
+def check_calibration_holdout_size(
+    y_calibration_booked: pd.Series,
+    minimum_positives: int = CALIBRATION_MIN_POSITIVES,
+) -> bool:
+    """Warn (don't fail) when the calibration holdout has too few positives.
+
+    Isotonic regression — the calibration method used for tree models — is
+    unstable below ~100 observed defaults: with too few positives the
+    monotonic step function over-fits the holdout's noise rather than the
+    underlying probability surface. Sigmoid (Platt) calibration is more
+    reliable in that regime.
+
+    This check emits a regulator-visible warning rather than raising, so
+    portfolios that genuinely have low positive counts can still train.
+    Returns ``True`` if the holdout is large enough, ``False`` otherwise.
+    """
+    n_positives = int(pd.Series(y_calibration_booked).sum())
+    if n_positives < minimum_positives:
+        logger.warning(
+            "Calibration holdout has only {} positives (< {} recommended). "
+            "Isotonic calibration is unstable below this threshold; "
+            "consider increasing CALIBRATION_FRACTION or using sigmoid "
+            "calibration for tree models on this portfolio.",
+            n_positives,
+            minimum_positives,
+        )
+        return False
+    return True
+
+
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     n_before = len(df.columns)
 
     df["TOTAL_PRODUCTS"] = df["TOTAL_CARD_NBR"] + df["TOTAL_LOAN_NBR"]
@@ -248,7 +326,11 @@ def search_interactions(
     return_diagnostics: bool = False,
 ) -> pd.DataFrame | InteractionSearchResult:
     cutoff = pd.Timestamp(end_before_date)
-    df_search = df[df["mis_Date"] < cutoff].dropna(subset=[TARGET]).copy()
+    # enforce_matured_target both filters and asserts the maturity invariant —
+    # immature rows with non-null targets would otherwise leak in here under
+    # the bare dropna() that used to live at this site.
+    matured = enforce_matured_target(df)
+    df_search = matured[matured["mis_Date"] < cutoff].copy()
     df_search[TARGET] = df_search[TARGET].astype(int)
     y_search = df_search[TARGET].values
     dates_search = df_search["mis_Date"].to_numpy()
@@ -459,6 +541,7 @@ def search_interactions(
 
 
 def add_interactions(df: pd.DataFrame, all_results: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     existing = set(df.columns)
     added = []
 
@@ -642,6 +725,8 @@ def build_feature_provenance(
     feature_space_cat_cols: list[str],
     rfecv_candidate_cols: list[str],
     rfecv_kept_cols: list[str],
+    stability_kept_cols: list[str] | None = None,
+    tree_aware_kept_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     raw_set = set(raw_feature_cols)
     engineered_set = set(engineered_feature_cols)
@@ -651,6 +736,10 @@ def build_feature_provenance(
     cat_set = set(feature_space_cat_cols)
     candidate_set = set(rfecv_candidate_cols)
     kept_set = set(rfecv_kept_cols)
+    # When the caller doesn't split kept-by-selector, fall back to the union
+    # so the provenance frame degrades gracefully.
+    stability_set = set(stability_kept_cols) if stability_kept_cols is not None else kept_set
+    tree_aware_set = set(tree_aware_kept_cols) if tree_aware_kept_cols is not None else set()
     interaction_meta = {
         normalize_interaction_name(row["name"]): {
             "interaction_type": row["type"],
@@ -693,6 +782,17 @@ def build_feature_provenance(
         else:
             data_type = pd.NA
 
+        in_stability = feature in stability_set
+        in_tree_aware = feature in tree_aware_set
+        if in_stability and in_tree_aware:
+            kept_by = "both"
+        elif in_stability:
+            kept_by = "stability_only"
+        elif in_tree_aware:
+            kept_by = "tree_aware_only"
+        else:
+            kept_by = "dropped"
+
         records.append(
             {
                 "feature": feature,
@@ -700,6 +800,9 @@ def build_feature_provenance(
                 "data_type": data_type,
                 "rfecv_candidate": feature in candidate_set,
                 "rfecv_kept": feature in kept_set,
+                "stability_kept": in_stability,
+                "tree_aware_kept": in_tree_aware,
+                "kept_by": kept_by,
                 "interaction_type": interaction_info.get("interaction_type", pd.NA),
                 "feat_a": interaction_info.get("feat_a", pd.NA),
                 "feat_b": interaction_info.get("feat_b", pd.NA),
@@ -709,7 +812,11 @@ def build_feature_provenance(
     return pd.DataFrame(records).sort_values(["provenance", "feature"]).reset_index(drop=True)
 
 
-def build_preprocessors(num_cols: list[str], cat_cols: list[str], target_encoder_smooth="auto"):
+def build_preprocessors(
+    num_cols: list[str],
+    cat_cols: list[str],
+    target_encoder_smooth: float | str = "auto",
+) -> tuple[ColumnTransformer, ColumnTransformer, list[int]]:
     num_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
@@ -929,6 +1036,121 @@ def run_rfecv(
     return feature_cols, num_cols, cat_cols
 
 
+def run_tree_aware_feature_pass(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    num_cols: list[str],
+    cat_cols: list[str],
+    feature_cols: list[str],
+    cv,
+    importance_ratio_threshold: float = TREE_AWARE_IMPORTANCE_RATIO,
+    n_permutation_repeats: int = TREE_AWARE_PERMUTATION_REPEATS,
+    random_state: int = RANDOM_STATE,
+) -> list[str]:
+    """Tree-aware feature pass via LGBM permutation importance.
+
+    Complements LR-driven stability selection: catches features with weak main
+    effect but strong tree utility (non-linear, interaction-with-other). Uses
+    the same temporal CV as ``run_rfecv``. Per fold:
+      - Fit a small LGBM with ordinal-encoded categoricals.
+      - Compute permutation importance on validation (PR AUC scoring).
+    A feature is kept if its mean importance across folds is positive AND at
+    least ``importance_ratio_threshold`` of the most important feature's mean.
+
+    Returns the list of features the tree-aware pass would keep. Caller is
+    expected to UNION this with the LR-stability-selected set to form the
+    final feature contract.
+    """
+    if not feature_cols:
+        return []
+
+    importance_per_feature: dict[str, list[float]] = {feat: [] for feat in feature_cols}
+    folds_used = 0
+
+    for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train), start=1):
+        X_fit = X_train.iloc[train_idx][feature_cols].copy()
+        y_fit = y_train.iloc[train_idx].copy()
+        X_val = X_train.iloc[val_idx][feature_cols].copy()
+        y_val = y_train.iloc[val_idx].copy()
+        if y_fit.nunique() < 2 or y_val.nunique() < 2:
+            logger.warning(
+                "Tree-aware fold {} skipped: insufficient class diversity (train={}, val={})",
+                fold_idx,
+                y_fit.nunique(),
+                y_val.nunique(),
+            )
+            continue
+
+        _, lgbm_pre, lgbm_cat_indices = build_preprocessors(num_cols, cat_cols)
+        model = Pipeline(
+            [
+                ("preprocessor", lgbm_pre),
+                (
+                    "classifier",
+                    LGBMClassifier(
+                        n_estimators=200,
+                        learning_rate=0.05,
+                        max_depth=5,
+                        num_leaves=31,
+                        min_child_samples=100,
+                        random_state=random_state,
+                        n_jobs=1,
+                        verbosity=-1,
+                    ),
+                ),
+            ]
+        )
+        model.fit(
+            X_fit,
+            y_fit,
+            classifier__categorical_feature=lgbm_cat_indices,
+        )
+        result = permutation_importance(
+            model,
+            X_val,
+            y_val,
+            n_repeats=n_permutation_repeats,
+            random_state=random_state,
+            scoring="average_precision",
+            n_jobs=1,
+        )
+        for feat, importance in zip(feature_cols, result.importances_mean, strict=True):
+            importance_per_feature[feat].append(float(importance))
+        folds_used += 1
+
+    if folds_used == 0:
+        logger.warning(
+            "Tree-aware feature pass: no valid folds; returning empty (LR set will stand alone)"
+        )
+        return []
+
+    mean_importance = {
+        feat: float(np.mean(values)) if values else 0.0
+        for feat, values in importance_per_feature.items()
+    }
+    max_importance = max(mean_importance.values()) if mean_importance else 0.0
+    if max_importance <= 0:
+        logger.warning(
+            "Tree-aware feature pass: no positive importance values; returning empty"
+        )
+        return []
+
+    selected = [
+        feat
+        for feat, importance in mean_importance.items()
+        if importance > 0 and (importance / max_importance) >= importance_ratio_threshold
+    ]
+    logger.info(
+        "Tree-aware feature pass: {} / {} features have mean perm-importance >= {:.0%} of max ({} folds, max imp {:.4f})",
+        len(selected),
+        len(feature_cols),
+        importance_ratio_threshold,
+        folds_used,
+        max_importance,
+    )
+    return selected
+
+
 @dataclass
 class FeatureDiscoveryResult:
     df: pd.DataFrame
@@ -973,6 +1195,7 @@ def run_feature_discovery_workflow(
     add_modeling_features_fn: Callable[..., tuple[object, ...]] = add_modeling_features,
     prune_correlated_fn: Callable[..., list[str]] = prune_correlated,
     run_rfecv_fn: Callable[..., tuple[list[str], list[str], list[str]]] = run_rfecv,
+    run_tree_aware_feature_pass_fn: Callable[..., list[str]] = run_tree_aware_feature_pass,
     build_feature_provenance_fn: Callable[..., pd.DataFrame] = build_feature_provenance,
     normalize_interaction_name_fn: Callable[[str], str] = normalize_interaction_name,
 ) -> FeatureDiscoveryResult:
@@ -1029,11 +1252,16 @@ def run_feature_discovery_workflow(
         interaction_leaderboard_df = interactions.copy()
         if not interaction_leaderboard_df.empty and "selected" not in interaction_leaderboard_df.columns:
             interaction_leaderboard_df["selected"] = True
+        # Recompute the search-population counters via the same maturity-safe
+        # filter the search itself uses, so the leaderboard summary cannot
+        # report counts that include immature rows.
+        _matured_df = enforce_matured_target(df)
+        _search_window = _matured_df[_matured_df["mis_Date"] < interaction_search_cutoff]
         interaction_search_summary_df = pd.DataFrame([
             {
                 "interaction_search_cutoff": interaction_search_cutoff.date().isoformat(),
-                "search_rows": len(df[df["mis_Date"] < interaction_search_cutoff].dropna(subset=[TARGET])),
-                "search_positives": int(df.loc[(df["mis_Date"] < interaction_search_cutoff) & df[TARGET].notna(), TARGET].astype(int).sum()),
+                "search_rows": len(_search_window),
+                "search_positives": int(_search_window[TARGET].astype(int).sum()),
                 "numeric_scoring_strategy": pd.NA,
                 "categorical_scoring_strategy": pd.NA,
                 "raw_num_features": len(RAW_NUM),
@@ -1105,7 +1333,7 @@ def run_feature_discovery_workflow(
     rfecv_candidate_num_cols = [feature for feature in feature_space_num_cols if feature not in corr_drop]
     rfecv_candidate_cat_cols = [feature for feature in feature_space_cat_cols if feature in rfecv_candidate_feature_cols]
     rfe_cv = make_temporal_cv_fn(feature_discovery_dates)
-    feature_cols, num_cols, cat_cols = run_rfecv_fn(
+    stability_feature_cols, _, _ = run_rfecv_fn(
         X_feature_discovery_space[rfecv_candidate_feature_cols],
         y_feature_discovery,
         rfecv_candidate_num_cols,
@@ -1113,6 +1341,38 @@ def run_feature_discovery_workflow(
         rfecv_candidate_feature_cols,
         cv=rfe_cv,
     )
+
+    # Tree-aware augmentation: catch features the linear model dropped but
+    # tree ensembles find informative (non-linear effects, interactions). The
+    # pass uses an independent temporal CV instance so its fold construction
+    # cannot interfere with the RFECV state.
+    tree_aware_cv = make_temporal_cv_fn(feature_discovery_dates)
+    tree_aware_feature_cols = run_tree_aware_feature_pass_fn(
+        X_feature_discovery_space[rfecv_candidate_feature_cols],
+        y_feature_discovery,
+        rfecv_candidate_num_cols,
+        rfecv_candidate_cat_cols,
+        rfecv_candidate_feature_cols,
+        cv=tree_aware_cv,
+    )
+
+    # UNION the two selectors. Preserve the candidate-set ordering so
+    # downstream serialization is deterministic.
+    union_set = set(stability_feature_cols) | set(tree_aware_feature_cols)
+    feature_cols = [feat for feat in rfecv_candidate_feature_cols if feat in union_set]
+    num_cols = [feat for feat in rfecv_candidate_num_cols if feat in union_set]
+    cat_cols = [feat for feat in rfecv_candidate_cat_cols if feat in union_set]
+    only_lr = [feat for feat in feature_cols if feat in stability_feature_cols and feat not in tree_aware_feature_cols]
+    only_tree = [feat for feat in feature_cols if feat in tree_aware_feature_cols and feat not in stability_feature_cols]
+    both = [feat for feat in feature_cols if feat in stability_feature_cols and feat in tree_aware_feature_cols]
+    logger.info(
+        "Selectors converged: LR-only={}, tree-only={}, both={}, total kept={}",
+        len(only_lr),
+        len(only_tree),
+        len(both),
+        len(feature_cols),
+    )
+
     feature_provenance_df = build_feature_provenance_fn(
         raw_feature_cols,
         engineered_feature_cols,
@@ -1123,6 +1383,8 @@ def run_feature_discovery_workflow(
         feature_space_cat_cols,
         rfecv_candidate_feature_cols,
         feature_cols,
+        stability_kept_cols=stability_feature_cols,
+        tree_aware_kept_cols=tree_aware_feature_cols,
     )
     logger.info("Frozen feature set: {} num + {} cat = {}", len(num_cols), len(cat_cols), len(feature_cols))
 

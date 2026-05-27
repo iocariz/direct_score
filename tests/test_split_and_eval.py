@@ -523,3 +523,49 @@ class TestLoadData:
         raw_df_with_rejects.to_parquet(path)
         df = load_data(str(path))
         assert len(df) < len(raw_df_with_rejects)
+
+    def test_returns_data_sorted_by_mis_date(self, raw_df_with_rejects, tmp_path):
+        """Audit fix H: load_data must sort by mis_Date for reproducibility.
+
+        Several downstream operations are stable under row order today but
+        would be fragile to upstream row reordering. The conftest fixture
+        uses np.random.choice(dates) which is intentionally not sorted, so a
+        successful sort must be visible at the load-boundary contract.
+        """
+        path = tmp_path / "shuffled.parquet"
+        # Sanity: the fixture is in fact unsorted on disk so the test isn't
+        # vacuous. (If conftest ever starts pre-sorting, the assertion above
+        # would still pass but this guard ensures we know.)
+        unsorted_input = (
+            raw_df_with_rejects["mis_Date"]
+            != raw_df_with_rejects["mis_Date"].sort_values().values
+        ).any()
+        assert unsorted_input, "Fixture is unexpectedly already sorted; test is not exercising the fix"
+        raw_df_with_rejects.to_parquet(path)
+
+        df = load_data(str(path))
+
+        dates = df["mis_Date"].values
+        assert (dates[:-1] <= dates[1:]).all(), "load_data must return rows sorted by mis_Date"
+        # Index must be sequential after the reset_index inside _sort_by_mis_date
+        # so positional indexing in downstream code is reliable.
+        assert list(df.index) == list(range(len(df)))
+
+
+class TestLoadDataWithRejectsSortContract:
+    """Audit fix H: load_data_with_rejects must also sort both frames by mis_Date."""
+
+    def test_both_frames_sorted(self, raw_df_with_rejects, tmp_path):
+        from training import load_data_with_rejects
+
+        path = tmp_path / "shuffled.parquet"
+        raw_df_with_rejects.to_parquet(path)
+        booked, rejected = load_data_with_rejects(str(path))
+
+        for label, df in [("booked", booked), ("rejected", rejected)]:
+            dates = df["mis_Date"].values
+            if len(dates) <= 1:
+                continue
+            assert (dates[:-1] <= dates[1:]).all(), (
+                f"load_data_with_rejects must return {label} sorted by mis_Date"
+            )

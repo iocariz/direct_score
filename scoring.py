@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from training_constants import DEFAULT_TIER_THRESHOLDS as _SHARED_DEFAULT_TIER_THRESHOLDS
+
 
 @dataclass
 class ScoringResult:
@@ -39,23 +41,55 @@ class ScoringResult:
         }
 
 
-# Default PD thresholds for risk tiering
-DEFAULT_TIER_THRESHOLDS = [
-    (0.00, 0.03, "LOW"),
-    (0.03, 0.06, "MODERATE"),
-    (0.06, 0.10, "ELEVATED"),
-    (0.10, 0.20, "HIGH"),
-    (0.20, 1.01, "VERY_HIGH"),
-]
+# Default PD thresholds for risk tiering — re-exported from training_constants
+# so that training (writer of risk_tiers.json) and scoring (consumer) share a
+# single source of truth.
+DEFAULT_TIER_THRESHOLDS = list(_SHARED_DEFAULT_TIER_THRESHOLDS)
+
+
+def _compute_file_sha256(path: Path) -> str:
+    """SHA-256 hex digest of a file's full contents."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _compute_model_version(model_path: Path, feature_cols: list[str]) -> str:
-    """Deterministic version hash from model file + feature set."""
+    """Deterministic version hash from model file content + feature set.
+
+    Uses the full file SHA-256 (not size) so that any change to the model
+    binary surfaces as a different version string.
+    """
     h = hashlib.sha256()
     h.update(model_path.name.encode())
-    h.update(str(model_path.stat().st_size).encode())
+    h.update(_compute_file_sha256(model_path).encode())
     h.update(",".join(sorted(feature_cols)).encode())
     return h.hexdigest()[:12]
+
+
+def _sanitize_model_name(name: str) -> str:
+    """Reject path-traversal in a model name and reduce to a basename.
+
+    Mirrors training_reporting.sanitize_output_name, then takes the final
+    path component to defend against any traversal sequence that survived
+    sanitization.
+    """
+    cleaned = (
+        name.lower()
+        .replace(" ", "_")
+        .replace("(", "")
+        .replace(")", "")
+        .replace(".", "")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace("\x00", "")
+    )
+    cleaned = cleaned.strip("._-")
+    cleaned = cleaned or "model"
+    # Final guard: take only the basename in case any separator slipped through.
+    return Path(cleaned).name
 
 
 def _assign_risk_tier(
@@ -95,9 +129,17 @@ class ScoringService:
         output_dir: str | Path,
         model_name: str | None = None,
     ) -> "ScoringService":
-        """Load the recommended (or specified) model from pipeline output."""
-        output_path = Path(output_dir)
-        models_dir = output_path / "models"
+        """Load the recommended (or specified) model from pipeline output.
+
+        Defends against path traversal by:
+          - sanitizing model_name to a basename
+          - resolving model_path and asserting it is under models_dir.resolve()
+          - verifying SHA-256 against checksums.json (when present) before
+            calling joblib.load (joblib.load uses pickle and is RCE-prone if
+            the artifact is attacker-controlled).
+        """
+        output_path = Path(output_dir).resolve()
+        models_dir = (output_path / "models").resolve()
 
         # Determine which model to load
         if model_name is None:
@@ -111,18 +153,39 @@ class ScoringService:
                 model_name = "Logistic Regression"
         logger.info("Loading model: {}", model_name)
 
-        # Load model
-        safe_name = model_name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
-        model_path = models_dir / f"{safe_name}.joblib"
+        # Sanitize name and contain path under models_dir
+        safe_name = _sanitize_model_name(model_name)
+        model_path = (models_dir / f"{safe_name}.joblib").resolve()
+        if not model_path.is_relative_to(models_dir):
+            raise ValueError(f"Refusing to load model outside models_dir: {model_path}")
         if not model_path.exists():
-            # Try calibrated variant
-            cal_safe = f"{safe_name}_calibrated"
-            cal_path = models_dir / f"{cal_safe}.joblib"
-            if cal_path.exists():
+            cal_safe = _sanitize_model_name(f"{safe_name}_calibrated")
+            cal_path = (models_dir / f"{cal_safe}.joblib").resolve()
+            if cal_path.is_relative_to(models_dir) and cal_path.exists():
                 model_path = cal_path
                 model_name = f"{model_name} (calibrated)"
             else:
-                raise FileNotFoundError(f"Model not found: {model_path}")
+                raise FileNotFoundError(f"Model not found: {model_path.name} in {models_dir}")
+
+        # Verify integrity against checksums.json if present (training writes it).
+        checksums_path = models_dir / "checksums.json"
+        if checksums_path.exists():
+            with checksums_path.open("r", encoding="utf-8") as f:
+                checksums = json.load(f)
+            expected = checksums.get(model_path.name)
+            if expected is None:
+                raise ValueError(
+                    f"No checksum entry for {model_path.name} in {checksums_path}; refusing to load."
+                )
+            actual = _compute_file_sha256(model_path)
+            if actual != expected:
+                raise ValueError(
+                    f"Checksum mismatch for {model_path.name}: expected {expected}, got {actual}."
+                )
+        else:
+            logger.warning(
+                "No checksums.json in {} — loading without integrity check.", models_dir
+            )
 
         model = joblib.load(model_path)
 
@@ -167,7 +230,12 @@ class ScoringService:
         )
 
     def _validate_input(self, row_df: pd.DataFrame) -> list[str]:
-        """Check for out-of-distribution values. Returns warnings."""
+        """Check for out-of-distribution values. Returns flag-only warnings.
+
+        Warning strings deliberately omit the actual applicant value to keep
+        ScoringResult free of PII (income, age, etc.). Training-set bounds are
+        included because they are population-level statistics, not personal data.
+        """
         warnings = []
         for feat, stats in self.training_stats.items():
             if feat not in row_df.columns:
@@ -181,23 +249,70 @@ class ScoringService:
                 train_min = stats.get("min")
                 train_max = stats.get("max")
                 if train_min is not None and not pd.isna(train_min) and float(val) < float(train_min):
-                    warnings.append(f"{feat}: {val} below training min ({train_min})")
+                    warnings.append(f"{feat}: below training min ({train_min})")
                 if train_max is not None and not pd.isna(train_max) and float(val) > float(train_max):
-                    warnings.append(f"{feat}: {val} above training max ({train_max})")
+                    warnings.append(f"{feat}: above training max ({train_max})")
         return warnings
 
+    # Maximum fraction of expected feature columns allowed to be missing in
+    # caller-supplied input. Above this we assume the caller passed raw features
+    # without running the training-time engineering pipeline (engineer_features
+    # + interactions + frequency encoding + group stats), which would silently
+    # produce garbage scores. The threshold is generous (50%) because the model
+    # is robust to a few legitimately-missing values handled by the imputer.
+    _MAX_MISSING_FEATURE_FRACTION = 0.5
+
+    def _assert_engineered_features_present(self, df: pd.DataFrame) -> None:
+        """Loudly reject input that looks like raw applicant features.
+
+        The trained sklearn Pipeline expects features produced by the training
+        pipeline (engineer_features + add_interactions + add_modeling_features).
+        If most of those columns are missing, the model would predict from an
+        all-NaN matrix and quietly return invalid scores — this is the failure
+        mode flagged in the audit. Detect that case and raise instead.
+        """
+        if not self.feature_cols:
+            return
+        present_mask = pd.Series(self.feature_cols).isin(df.columns)
+        n_present_columns = int(present_mask.sum())
+        n_expected = len(self.feature_cols)
+        if n_expected == 0:
+            return
+        missing_fraction = 1.0 - (n_present_columns / n_expected)
+        if missing_fraction > self._MAX_MISSING_FEATURE_FRACTION:
+            sample_missing = [c for c, p in zip(self.feature_cols, present_mask) if not p][:8]
+            raise ValueError(
+                "ScoringService received input missing "
+                f"{missing_fraction:.0%} of expected feature columns "
+                f"({n_expected - n_present_columns}/{n_expected}). "
+                "This usually means the caller passed raw applicant features "
+                "without running the training-time engineering pipeline. "
+                f"First missing columns: {sample_missing}. "
+                "Run engineer_features + add_interactions + add_modeling_features "
+                "(or use the saved feature_engineering artifacts) before scoring."
+            )
+
     def score_applicant(self, features: dict) -> ScoringResult:
-        """Score a single applicant from a dictionary of raw features.
+        """Score a single applicant from a dictionary of pre-engineered features.
+
+        The model was trained on engineered features (engineer_features +
+        interactions + frequency encoding + group statistics). Callers must
+        run the same engineering pipeline before invoking this method. If most
+        engineered columns are missing, this method raises rather than scoring
+        silently from NaN.
 
         Args:
-            features: Dictionary mapping feature names to values.
+            features: Dictionary mapping feature names to values. Must include
+                the engineered feature set the model was trained on.
 
         Returns:
-            ScoringResult with predicted PD, risk tier, and any warnings.
+            ScoringResult with predicted PD, risk tier, and any OOD warnings.
         """
         row_df = pd.DataFrame([features])
+        self._assert_engineered_features_present(row_df)
 
-        # Ensure all required columns exist (fill missing with NaN)
+        # Fill genuinely-missing columns with NaN — the imputer in the trained
+        # pipeline is responsible for handling these.
         for col in self.feature_cols:
             if col not in row_df.columns:
                 row_df[col] = np.nan
@@ -218,14 +333,19 @@ class ScoringService:
         )
 
     def score_batch(self, features_df: pd.DataFrame) -> pd.DataFrame:
-        """Score a batch of applicants.
+        """Score a batch of pre-engineered applicants.
+
+        See `score_applicant` for the feature-engineering contract. Like
+        `score_applicant`, this raises if too many engineered columns are
+        missing rather than silently scoring from NaN.
 
         Args:
             features_df: DataFrame where each row is an applicant.
 
         Returns:
-            DataFrame with predicted_pd, risk_tier, and warning_count columns.
+            DataFrame with predicted_pd and risk_tier columns.
         """
+        self._assert_engineered_features_present(features_df)
         df = features_df.copy()
         for col in self.feature_cols:
             if col not in df.columns:

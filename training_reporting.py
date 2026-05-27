@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 from statistics import NormalDist
 
@@ -10,7 +12,12 @@ from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_s
 
 from training_constants import (
     BENCHMARK_MODEL_NAMES,
+    CONCEPT_DRIFT_DELTA_THRESHOLD,
+    DEFAULT_THRESHOLD_PCTS,
+    DEFAULT_TIER_THRESHOLDS,
+    MODEL_SELECTION_QUALITY_FLOOR,
     N_BOOTSTRAP,
+    OVERFIT_DELTA_THRESHOLD,
     RANDOM_STATE,
     SUMMARY_MODEL_NAMES,
     TARGET,
@@ -18,7 +25,23 @@ from training_constants import (
 
 
 def sanitize_output_name(name: str) -> str:
-    return name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
+    """Normalize a model name into a filesystem-safe basename.
+
+    Strips path-traversal characters (/, \\, ..) and any leading/trailing
+    separators so the result is safe to concatenate onto an output directory.
+    """
+    cleaned = (
+        name.lower()
+        .replace(" ", "_")
+        .replace("(", "")
+        .replace(")", "")
+        .replace(".", "")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace("\x00", "")
+    )
+    cleaned = cleaned.strip("._-")
+    return cleaned or "model"
 
 
 def _ks_statistic(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -28,6 +51,112 @@ def _ks_statistic(y_true: np.ndarray, y_score: np.ndarray) -> float:
     pos_cdf = np.searchsorted(pos, all_scores, side="right") / len(pos)
     neg_cdf = np.searchsorted(neg, all_scores, side="right") / len(neg)
     return float(np.max(np.abs(pos_cdf - neg_cdf)))
+
+
+def calibration_diagnostics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    n_bins: int = 10,
+) -> tuple[float, float, pd.DataFrame]:
+    """Compute Expected/Maximum Calibration Error and a per-bin reliability table.
+
+    Bins are equal-frequency over predicted probabilities (deciles by default).
+    Returns:
+        ece — Expected Calibration Error: weighted mean |predicted − observed|
+              across bins, the standard regulator-facing calibration metric.
+        mce — Maximum Calibration Error: worst-bin |predicted − observed|,
+              the upper-bound view that surfaces tail miscalibration.
+        bins_df — DataFrame with one row per bin: count, mean predicted
+              probability, observed default rate, gap, weight.
+
+    Bins with fewer than 2 rows are dropped from the ECE/MCE computation but
+    retained in the bins_df for transparency.
+    """
+    y = np.asarray(y_true, dtype=int)
+    s = np.asarray(y_score, dtype=float)
+    mask = np.isfinite(s)
+    y, s = y[mask], s[mask]
+    if len(y) == 0:
+        return float("nan"), float("nan"), pd.DataFrame(
+            columns=["bin", "n", "mean_predicted", "observed_default_rate", "gap", "weight"]
+        )
+
+    # Equal-frequency binning via score quantiles. duplicates="drop" silently
+    # collapses ties; the resulting bin count may be smaller than n_bins for
+    # heavily-tied scores.
+    try:
+        bin_edges = np.unique(np.quantile(s, np.linspace(0, 1, n_bins + 1)))
+        if len(bin_edges) < 2:
+            bin_edges = np.array([s.min(), s.max() + 1e-9])
+        bin_idx = np.clip(np.digitize(s, bin_edges[1:-1]), 0, len(bin_edges) - 2)
+    except ValueError:
+        return float("nan"), float("nan"), pd.DataFrame(
+            columns=["bin", "n", "mean_predicted", "observed_default_rate", "gap", "weight"]
+        )
+
+    records = []
+    n_total = len(y)
+    for b in sorted(np.unique(bin_idx)):
+        sel = bin_idx == b
+        n_b = int(sel.sum())
+        if n_b == 0:
+            continue
+        mean_pred = float(s[sel].mean())
+        obs_rate = float(y[sel].mean())
+        records.append({
+            "bin": int(b),
+            "n": n_b,
+            "mean_predicted": mean_pred,
+            "observed_default_rate": obs_rate,
+            "gap": mean_pred - obs_rate,
+            "weight": n_b / n_total,
+        })
+    bins_df = pd.DataFrame(records)
+
+    usable = bins_df.loc[bins_df["n"] >= 2]
+    if usable.empty:
+        return float("nan"), float("nan"), bins_df
+
+    abs_gap = usable["gap"].abs()
+    ece = float((usable["weight"] * abs_gap).sum() / usable["weight"].sum())
+    mce = float(abs_gap.max())
+    return ece, mce, bins_df
+
+
+def compute_calibration_diagnostics_report(
+    y_true: np.ndarray,
+    score_arrays: dict[str, np.ndarray],
+    n_bins: int = 10,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Per-model ECE/MCE + per-bin reliability tables.
+
+    Returns:
+        summary_df — one row per model: ece, mce, n, n_bins_used.
+        details_df — long form, one row per (model, bin) with predicted vs
+                     observed gap, suitable for plotting reliability diagrams.
+    """
+    summary_records: list[dict] = []
+    detail_records: list[dict] = []
+    for name, scores in score_arrays.items():
+        s = np.asarray(scores, dtype=float)
+        # Skip non-probability scores (e.g. legacy benchmarks negated for AUC):
+        # ECE is only meaningful when the score lives in [0, 1].
+        finite = s[np.isfinite(s)]
+        if len(finite) == 0 or finite.min() < -1e-6 or finite.max() > 1 + 1e-6:
+            continue
+        ece, mce, bins_df = calibration_diagnostics(y_true, s, n_bins=n_bins)
+        summary_records.append({
+            "model": name,
+            "ece": ece,
+            "mce": mce,
+            "n": int(np.isfinite(s).sum()),
+            "n_bins_used": int((bins_df["n"] >= 2).sum()) if not bins_df.empty else 0,
+        })
+        for _, row in bins_df.iterrows():
+            detail_records.append({"model": name, **row.to_dict()})
+    summary_df = pd.DataFrame(summary_records)
+    details_df = pd.DataFrame(detail_records)
+    return summary_df, details_df
 
 
 def evaluate(name: str, y_true: np.ndarray, y_score: np.ndarray, is_probability: bool = True) -> dict:
@@ -653,6 +782,32 @@ def save_artifacts(
         feat_imp_df.to_csv(imp_path, index=False, float_format="%.6f")
         logger.info("Saved feature importance: {} ({} rows)", imp_path, len(feat_imp_df))
 
+    # Calibration diagnostics — Expected Calibration Error and per-bin
+    # reliability table for every probabilistic model present in the holdout
+    # score frame. ECE is the standard regulator-facing calibration metric;
+    # the per-bin frame supports reliability-diagram plotting.
+    if holdout_scores_df is not None and not holdout_scores_df.empty and TARGET in holdout_scores_df.columns:
+        score_cols = [c for c in holdout_scores_df.columns if c.startswith("score__")]
+        if score_cols:
+            y_holdout = holdout_scores_df[TARGET].astype(int).to_numpy()
+            score_arrays = {
+                col[len("score__"):]: holdout_scores_df[col].to_numpy()
+                for col in score_cols
+            }
+            cal_summary, cal_details = compute_calibration_diagnostics_report(y_holdout, score_arrays)
+            if not cal_summary.empty:
+                cal_summary_path = output_dir / "calibration_diagnostics.csv"
+                cal_summary.to_csv(cal_summary_path, index=False, float_format="%.6f")
+                logger.info(
+                    "Saved calibration diagnostics: {} ({} models)", cal_summary_path, len(cal_summary)
+                )
+            if not cal_details.empty:
+                cal_details_path = output_dir / "calibration_reliability_bins.csv"
+                cal_details.to_csv(cal_details_path, index=False, float_format="%.6f")
+                logger.info(
+                    "Saved per-bin reliability table: {} ({} rows)", cal_details_path, len(cal_details)
+                )
+
     if feature_provenance_df is not None and not feature_provenance_df.empty:
         feature_provenance_path = output_dir / "feature_provenance.csv"
         feature_provenance_df.to_csv(feature_provenance_path, index=False)
@@ -698,13 +853,161 @@ def save_artifacts(
         holdout_scores_df.to_csv(holdout_scores_path, index=False, float_format="%.6f")
         logger.info("Saved hold-out test scores: {} ({} rows)", holdout_scores_path, len(holdout_scores_df))
 
+    # Risk tier thresholds — close the artifact contract with scoring.py.
+    # ScoringService.from_output_dir reads risk_tiers.json if present; without
+    # this write the file was a dead load.
+    tier_path = output_dir / "risk_tiers.json"
+    with tier_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            [list(entry) for entry in DEFAULT_TIER_THRESHOLDS],
+            f,
+            indent=2,
+        )
+    logger.info("Saved risk tiers: {}", tier_path)
+
     models_dir = output_dir / "models"
     models_dir.mkdir(exist_ok=True)
+    checksums: dict[str, str] = {}
     for name, model in models.items():
         safe_name = sanitize_output_name(name)
         path = models_dir / f"{safe_name}.joblib"
         joblib.dump(model, path)
-    logger.info("Saved {} models to {}", len(models), models_dir)
+        checksums[f"{safe_name}.joblib"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    checksums_path = models_dir / "checksums.json"
+    with checksums_path.open("w", encoding="utf-8") as f:
+        json.dump(checksums, f, indent=2, sort_keys=True)
+    logger.info("Saved {} models to {} (checksums: {})", len(models), models_dir, checksums_path)
+
+
+def _block_jackknife_metrics(
+    y: np.ndarray,
+    s: np.ndarray,
+    blocks: list[np.ndarray],
+    is_prob: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Leave-one-block-out jackknife statistics.
+
+    Returns three arrays (auc_jack, pr_jack, brier_jack) — one entry per block,
+    each entry being the metric on the dataset with that block removed. Skips
+    blocks whose removal leaves a degenerate (single-class) sample.
+    """
+    auc_jack: list[float] = []
+    pr_jack: list[float] = []
+    brier_jack: list[float] = []
+    n = len(y)
+    for block_indices in blocks:
+        if len(block_indices) >= n:
+            continue
+        keep_mask = np.ones(n, dtype=bool)
+        keep_mask[block_indices] = False
+        y_keep = y[keep_mask]
+        s_keep = s[keep_mask]
+        if len(np.unique(y_keep)) < 2:
+            continue
+        try:
+            auc_jack.append(roc_auc_score(y_keep, s_keep))
+            pr_jack.append(average_precision_score(y_keep, s_keep))
+            if is_prob:
+                brier_jack.append(brier_score_loss(y_keep, np.clip(s_keep, 0, 1)))
+        except ValueError:
+            continue
+    return np.asarray(auc_jack), np.asarray(pr_jack), np.asarray(brier_jack)
+
+
+def _bca_bounds(
+    boot_values: list[float],
+    jackknife_values: np.ndarray,
+    observed: float,
+    alpha: float,
+) -> tuple[float, float]:
+    """Bias-corrected and accelerated (BCa) bootstrap CI bounds.
+
+    Falls back to percentile bounds if BCa is degenerate (jackknife has too
+    few values, all bootstraps are below/above the observed value, or the
+    BCa-adjusted quantile points collapse).
+
+    Args:
+        boot_values: Bootstrap-resampled metric values.
+        jackknife_values: Leave-one-block-out metric values for acceleration.
+        observed: The point estimate on the full sample.
+        alpha: Half-width (e.g. 0.025 for 95% CI).
+    """
+    if not boot_values:
+        return float("nan"), float("nan")
+    boot = np.asarray(boot_values, dtype=float)
+    boot = boot[np.isfinite(boot)]
+    if len(boot) < 2:
+        return float("nan"), float("nan")
+
+    def _percentile_fallback() -> tuple[float, float]:
+        return (
+            float(np.percentile(boot, 100 * alpha)),
+            float(np.percentile(boot, 100 * (1 - alpha))),
+        )
+
+    jack = np.asarray(jackknife_values, dtype=float)
+    jack = jack[np.isfinite(jack)]
+    if len(jack) < 2:
+        return _percentile_fallback()
+
+    # Bias correction z0 = Φ⁻¹(P(boot < observed)). Clip to avoid ±∞ when
+    # all bootstraps lie on one side of the observed value.
+    p_below = float(np.mean(boot < observed))
+    p_below = float(np.clip(p_below, 1e-6, 1 - 1e-6))
+    z0 = NormalDist().inv_cdf(p_below)
+
+    # Acceleration a from jackknife.
+    diff = jack.mean() - jack
+    denom_sq = float(np.sum(diff ** 2))
+    if denom_sq <= 0:
+        a = 0.0
+    else:
+        a = float(np.sum(diff ** 3)) / (6.0 * denom_sq ** 1.5)
+
+    z_lo = NormalDist().inv_cdf(alpha)
+    z_hi = NormalDist().inv_cdf(1 - alpha)
+
+    def _adjusted(z: float) -> float | None:
+        denom = 1.0 - a * (z0 + z)
+        if denom <= 0:
+            return None
+        return NormalDist().cdf(z0 + (z0 + z) / denom)
+
+    alpha_lo_adj = _adjusted(z_lo)
+    alpha_hi_adj = _adjusted(z_hi)
+    if (
+        alpha_lo_adj is None
+        or alpha_hi_adj is None
+        or not (0 < alpha_lo_adj < alpha_hi_adj < 1)
+    ):
+        return _percentile_fallback()
+
+    return (
+        float(np.percentile(boot, 100 * alpha_lo_adj)),
+        float(np.percentile(boot, 100 * alpha_hi_adj)),
+    )
+
+
+def _build_jackknife_blocks(
+    n: int,
+    block_to_idx: dict[str, np.ndarray] | None,
+    max_blocks: int = 100,
+) -> list[np.ndarray]:
+    """Build leave-one-block-out indices for jackknife.
+
+    When monthly blocks are supplied (block_to_idx not None), the jackknife
+    drops one month at a time — matching the bootstrap structure. Otherwise
+    rows are chunked into ``min(n, max_blocks)`` equal-size blocks; this is a
+    block jackknife approximation that's much cheaper than true LOO and
+    asymptotically valid for the BCa acceleration term.
+    """
+    if block_to_idx is not None:
+        return [block_to_idx[block] for block in sorted(block_to_idx)]
+    if n <= 0:
+        return []
+    n_blocks = min(n, max_blocks)
+    chunks = np.array_split(np.arange(n), n_blocks)
+    return [np.asarray(chunk, dtype=int) for chunk in chunks if len(chunk) > 0]
 
 
 def bootstrap_confidence_intervals(
@@ -714,6 +1017,15 @@ def bootstrap_confidence_intervals(
     ci: float = 0.95,
     dates: np.ndarray | None = None,
 ) -> pd.DataFrame:
+    """Bootstrap CIs for AUC, PR AUC and Brier using the BCa method.
+
+    Bias-corrected and accelerated (BCa) CIs are robust to skewed bootstrap
+    distributions, which matters for PR AUC on imbalanced credit-default
+    samples. When ``dates`` is provided, rows are bootstrapped in monthly
+    blocks (preserves temporal autocorrelation) and the jackknife is also
+    block-level. Without dates, bootstrap is stratified by class and the
+    jackknife uses 100 equal-sized index chunks.
+    """
     alpha = (1 - ci) / 2
     rng = np.random.RandomState(RANDOM_STATE)
     records = []
@@ -723,7 +1035,11 @@ def bootstrap_confidence_intervals(
         y, s = y_true[mask], scores[mask]
         is_prob = float(s.min()) >= 0 and float(s.max()) <= 1.01
 
-        boot_auc, boot_pr, boot_brier = [], [], []
+        boot_auc: list[float] = []
+        boot_pr: list[float] = []
+        boot_brier: list[float] = []
+        block_to_idx: dict[str, np.ndarray] | None = None
+
         if dates is not None:
             d = pd.to_datetime(np.asarray(dates)[mask], errors="raise").to_period("M")
             block_values = d.astype(str)
@@ -758,20 +1074,22 @@ def bootstrap_confidence_intervals(
                 except ValueError:
                     continue
 
-        def _ci_bounds(arr):
-            if not arr:
-                return np.nan, np.nan
-            a = np.array(arr)
-            return np.percentile(a, 100 * alpha), np.percentile(a, 100 * (1 - alpha))
-
-        # Use observed test-set statistics as point estimates, not bootstrap median
+        # Use observed test-set statistics as point estimates, not bootstrap median.
         obs_auc = roc_auc_score(y, s)
         obs_pr = average_precision_score(y, s)
         obs_brier = brier_score_loss(y, np.clip(s, 0, 1)) if is_prob else np.nan
 
-        auc_lo, auc_hi = _ci_bounds(boot_auc)
-        pr_lo, pr_hi = _ci_bounds(boot_pr)
-        brier_lo, brier_hi = _ci_bounds(boot_brier)
+        # Block jackknife for BCa acceleration. Re-uses monthly blocks when
+        # dates were supplied so the jackknife matches the bootstrap design.
+        jack_blocks = _build_jackknife_blocks(len(y), block_to_idx)
+        auc_jack, pr_jack, brier_jack = _block_jackknife_metrics(y, s, jack_blocks, is_prob)
+
+        auc_lo, auc_hi = _bca_bounds(boot_auc, auc_jack, obs_auc, alpha)
+        pr_lo, pr_hi = _bca_bounds(boot_pr, pr_jack, obs_pr, alpha)
+        if is_prob:
+            brier_lo, brier_hi = _bca_bounds(boot_brier, brier_jack, obs_brier, alpha)
+        else:
+            brier_lo, brier_hi = float("nan"), float("nan")
 
         records.append(
             {
@@ -854,7 +1172,7 @@ def create_threshold_analysis(
     Each threshold is expressed as "reject the top X% riskiest by score".
     """
     if thresholds_pct is None:
-        thresholds_pct = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
+        thresholds_pct = list(DEFAULT_THRESHOLD_PCTS)
 
     y_true = np.asarray(y_true, dtype=int)
     y_score = np.asarray(y_score, dtype=float)
@@ -947,7 +1265,11 @@ def compute_overfit_report(
             "ks_delta": train_metrics["KS"] - test_metrics["KS"],
             "train_n": train_metrics["N"],
             "test_n": test_metrics["N"],
-            "overfit_flag": "YES" if auc_delta > 0.03 or pr_delta > 0.03 else "NO",
+            "overfit_flag": (
+                "YES"
+                if auc_delta > OVERFIT_DELTA_THRESHOLD or pr_delta > OVERFIT_DELTA_THRESHOLD
+                else "NO"
+            ),
         })
 
     return pd.DataFrame(records)
@@ -959,6 +1281,7 @@ def select_best_model(
     rolling_oot_summary_df: pd.DataFrame | None = None,
     candidate_names: list[str] | None = None,
     benchmark_comparisons_df: pd.DataFrame | None = None,
+    quality_floor: float = MODEL_SELECTION_QUALITY_FLOOR,
 ) -> pd.DataFrame:
     """Score and rank candidate models on multiple criteria.
 
@@ -1040,14 +1363,28 @@ def select_best_model(
                     if oot_max > oot_min else 50.0
                 )
 
-        # 4. Generalization — penalize overfitting
+        # 4. Generalization — penalize overfitting using the LARGER of the
+        # AUC and PR-AUC train-vs-test deltas. PR-AUC delta is more informative
+        # for imbalanced credit-default samples (positive rate ~3-5%), so
+        # ignoring it would hide tree-model overfit that is visible in the
+        # precision-recall curve but masked in ROC. compute_overfit_report
+        # already computes both deltas; we just take the maximum here.
         generalization = 100.0
         if overfit_df is not None and not overfit_df.empty:
             of_row = overfit_df.loc[overfit_df["model"] == name]
             if not of_row.empty:
                 auc_delta = float(of_row["auc_delta"].iloc[0])
-                # Penalty: 0 if delta <= 0.01, linearly increasing up to 100 at delta=0.10
-                penalty = max(0.0, min(100.0, (auc_delta - 0.01) / 0.09 * 100))
+                pr_auc_delta_raw = (
+                    float(of_row["pr_auc_delta"].iloc[0])
+                    if "pr_auc_delta" in of_row.columns
+                    else float("-inf")
+                )
+                effective_delta = max(auc_delta, pr_auc_delta_raw)
+                # Penalty curve: 0 if delta <= 0.01, linearly ramping to 100
+                # at delta = 0.10. Keeps the same shape as before so model-
+                # selection rankings only change for models whose PR-AUC
+                # delta exceeds their AUC delta.
+                penalty = max(0.0, min(100.0, (effective_delta - 0.01) / 0.09 * 100))
                 generalization = 100.0 - penalty
 
         # 5. Benchmark lift — best AUC improvement vs any benchmark
@@ -1159,8 +1496,29 @@ def select_best_model(
     else:
         winner_idx = df["weighted_score"].idxmax()
 
+    # Absolute quality floor (audit fix K). weighted_score is min-max-scaled
+    # per dimension across the candidate set, so one model always wins by
+    # being "least bad" even when every candidate is poor. If the proposed
+    # winner doesn't clear the floor, no model is recommended — the artifact
+    # records meets_quality_floor=False so a regulator can see the system
+    # withheld a recommendation rather than silently endorsing a weak model.
+    df["meets_quality_floor"] = df["weighted_score"] >= quality_floor
+    winner_meets_floor = bool(df.loc[winner_idx, "meets_quality_floor"])
     df.loc[:, "recommended"] = False
-    df.loc[winner_idx, "recommended"] = True
+    if winner_meets_floor:
+        df.loc[winner_idx, "recommended"] = True
+    else:
+        winner_score = float(df.loc[winner_idx, "weighted_score"])
+        winner_name = str(df.loc[winner_idx, "model"])
+        logger.warning(
+            "No model recommended: best candidate {!r} scored {:.1f}/100, "
+            "below the quality floor of {:.1f}. The pipeline will produce "
+            "models and metrics for review but will not endorse a default "
+            "deployment choice.",
+            winner_name,
+            winner_score,
+            quality_floor,
+        )
     return (
         df.sort_values(
             [
@@ -1413,8 +1771,13 @@ def compute_concept_drift_report(
         pr_range = float(pr_auc.max() - pr_auc.min())
         first_last_delta = float(pr_auc[-1] - pr_auc[0])
 
-        # Flag: PR AUC declining AND total decline > 0.02
-        drift_flag = "YES" if pr_slope < 0 and first_last_delta < -0.02 else "NO"
+        # Flag concept drift when PR AUC is declining AND first→last delta is
+        # at least CONCEPT_DRIFT_DELTA_THRESHOLD negative.
+        drift_flag = (
+            "YES"
+            if pr_slope < 0 and first_last_delta < CONCEPT_DRIFT_DELTA_THRESHOLD
+            else "NO"
+        )
 
         records.append({
             "model": name,

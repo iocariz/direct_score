@@ -7,8 +7,12 @@ import pandas as pd
 import pytest
 
 from training_reporting import (
+    _bca_bounds,
+    _block_jackknife_metrics,
     _holm_bonferroni,
     bootstrap_confidence_intervals,
+    calibration_diagnostics,
+    compute_calibration_diagnostics_report,
     create_lift_table,
     create_threshold_analysis,
     paired_bootstrap_benchmark_comparisons,
@@ -173,6 +177,72 @@ class TestBootstrapCIPointEstimate:
         assert np.isfinite(ci.loc["test", "AUC"])
 
 
+class TestBcaBootstrap:
+    def test_bca_falls_back_to_percentile_with_no_jackknife(self):
+        """With <2 jackknife values BCa cannot compute acceleration; expect percentile bounds."""
+        boot = list(np.linspace(0.6, 0.9, 200))
+        lo, hi = _bca_bounds(boot, np.array([0.7]), observed=0.75, alpha=0.025)
+        # Percentile fallback for a uniformly-spaced sample: ~2.5th and 97.5th
+        # percentile of [0.6, 0.9] are roughly 0.6075 and 0.8925.
+        assert 0.60 <= lo <= 0.62
+        assert 0.88 <= hi <= 0.90
+
+    def test_bca_returns_nan_when_no_bootstraps(self):
+        lo, hi = _bca_bounds([], np.array([0.5, 0.6, 0.7]), observed=0.6, alpha=0.025)
+        assert np.isnan(lo) and np.isnan(hi)
+
+    def test_bca_brackets_observed_when_distribution_is_skewed(self):
+        """Skewed bootstrap distribution: BCa lower bound should be tighter than the symmetric percentile bound."""
+        # Construct a deliberately right-skewed bootstrap distribution where
+        # the observed value is to the LEFT of the median — this is the
+        # regime where BCa correctly tightens the lower bound.
+        rng = np.random.RandomState(0)
+        # Lognormal samples are right-skewed.
+        boot = list(0.5 + rng.lognormal(mean=-2.5, sigma=0.4, size=2000))
+        observed = float(np.percentile(boot, 30))  # observed below the median
+        # Jackknife mimics a similar skew with smaller magnitude.
+        jack = 0.5 + rng.lognormal(mean=-2.5, sigma=0.4, size=80)
+
+        lo_bca, hi_bca = _bca_bounds(boot, jack, observed=observed, alpha=0.025)
+        # Percentile baseline:
+        lo_pct = float(np.percentile(boot, 2.5))
+        hi_pct = float(np.percentile(boot, 97.5))
+
+        # The bracket must always include the observed value.
+        assert lo_bca <= observed <= hi_bca
+        # BCa correction must produce a different bracket from raw percentile;
+        # otherwise the BCa code is a no-op.
+        assert (lo_bca, hi_bca) != (lo_pct, hi_pct)
+
+    def test_bca_observed_is_within_ci_for_real_metric(self):
+        """End-to-end: the observed AUC must lie inside the BCa CI."""
+        from sklearn.metrics import roc_auc_score
+
+        rng = np.random.RandomState(42)
+        y = np.array([0] * 200 + [1] * 50)
+        scores = np.concatenate([rng.uniform(0.1, 0.5, 200), rng.uniform(0.4, 0.9, 50)])
+        observed = roc_auc_score(y, scores)
+
+        ci = bootstrap_confidence_intervals(y, {"m": scores}, n_bootstrap=500)
+        lo = float(ci.loc["m", "AUC_lo"])
+        hi = float(ci.loc["m", "AUC_hi"])
+        assert lo <= observed <= hi
+        # CI must be non-trivial.
+        assert hi - lo > 0.01
+
+    def test_block_jackknife_skips_blocks_that_remove_a_class(self):
+        """Removing a block that contains all positives must not crash _block_jackknife_metrics."""
+        y = np.array([0, 0, 0, 0, 1, 1])
+        s = np.array([0.1, 0.2, 0.3, 0.4, 0.7, 0.9])
+        # Block 1 contains both positives — leaving it out yields all-zero y,
+        # so AUC/PR are undefined. The helper must skip it gracefully.
+        blocks = [np.array([0, 1]), np.array([4, 5])]
+        auc_jack, pr_jack, _ = _block_jackknife_metrics(y, s, blocks, is_prob=True)
+        # Only the first block is valid.
+        assert len(auc_jack) == 1
+        assert len(pr_jack) == 1
+
+
 class TestBenchmarkComparisonsAdjustedPValues:
     def test_adjusted_columns_present(self):
         y_true = np.array([0, 0, 1, 1] * 25)
@@ -197,3 +267,66 @@ class TestBenchmarkComparisonsAdjustedPValues:
             reference_model_names=[BENCHMARK_MODEL_NAMES[0]], n_bootstrap=50,
         )
         assert "auc_improvement_pct_of_max" in df.columns
+
+
+class TestCalibrationDiagnostics:
+    """ECE / MCE / per-bin reliability table — standard regulator metrics."""
+
+    def test_perfectly_calibrated_predictions_have_near_zero_ece(self):
+        """ECE measures the gap between predicted and observed default rate.
+        When the predictions equal the actual base rate, ECE → 0."""
+        rng = np.random.RandomState(0)
+        n = 5000
+        # Uniform "predictions" that match the observed rate by construction.
+        p = rng.uniform(0, 1, n)
+        y = (rng.uniform(0, 1, n) < p).astype(int)
+        ece, mce, bins_df = calibration_diagnostics(y, p, n_bins=10)
+        assert ece < 0.05, f"ECE should be near zero for calibrated preds, got {ece}"
+        assert 0 <= mce < 0.10
+        assert not bins_df.empty
+        assert (bins_df["n"] >= 1).all()
+
+    def test_systematically_overconfident_predictions_have_high_ece(self):
+        """A score that always predicts 0.9 with a 30% base rate should have ECE around 0.6."""
+        n = 1000
+        p = np.full(n, 0.9)
+        rng = np.random.RandomState(1)
+        y = (rng.uniform(0, 1, n) < 0.30).astype(int)
+        ece, mce, _ = calibration_diagnostics(y, p, n_bins=10)
+        # observed ~0.30, predicted 0.90 → gap ~0.60
+        assert ece > 0.50
+        assert mce >= ece
+
+    def test_returns_empty_for_empty_input(self):
+        ece, mce, bins_df = calibration_diagnostics(np.array([]), np.array([]))
+        assert np.isnan(ece) and np.isnan(mce)
+        assert bins_df.empty
+
+    def test_compute_report_skips_non_probability_scores(self):
+        """Benchmark scores stored as -raw_score are not in [0,1] — they must be
+        excluded from ECE (which is only meaningful on probabilities)."""
+        y = np.array([0, 1, 0, 1] * 50)
+        scores = {
+            "LR (prob)": np.linspace(0.05, 0.95, 200),
+            "raw_benchmark": np.linspace(-100, 100, 200),  # not a probability
+        }
+        summary, details = compute_calibration_diagnostics_report(y, scores, n_bins=5)
+        assert "LR (prob)" in summary["model"].values
+        assert "raw_benchmark" not in summary["model"].values
+        # The detail frame must not have raw_benchmark either.
+        if not details.empty:
+            assert "raw_benchmark" not in details["model"].values
+
+    def test_per_bin_table_has_predicted_and_observed(self):
+        """The per-bin table is the artifact reliability diagrams plot from."""
+        rng = np.random.RandomState(2)
+        n = 500
+        p = rng.uniform(0, 1, n)
+        y = (rng.uniform(0, 1, n) < p).astype(int)
+        _, _, bins_df = calibration_diagnostics(y, p, n_bins=5)
+        for col in ["bin", "n", "mean_predicted", "observed_default_rate", "gap", "weight"]:
+            assert col in bins_df.columns
+        # predicted and observed should both be in [0, 1]; gap is their difference.
+        assert (bins_df["mean_predicted"].between(0, 1)).all()
+        assert (bins_df["observed_default_rate"].between(0, 1)).all()
+        assert np.allclose(bins_df["gap"], bins_df["mean_predicted"] - bins_df["observed_default_rate"])

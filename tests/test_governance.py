@@ -119,8 +119,59 @@ class TestGenerateModelCard:
         path = generate_model_card(results_df, None, None, None, None, None, tmp_path)
         content = path.read_text()
 
-        assert "Calibration is model-dependent" in content
-        assert "Platt (sigmoid) scaling" not in content
+        # Calibration method must be selected by model class (not data-driven on the
+        # calibration set, which would double-dip).
+        assert "Calibration method is selected by model class" in content
+        # Literature citation present so a regulator can trace the choice.
+        assert "Niculescu-Mizil" in content
+        # Both methods must be named so the audit trail is explicit.
+        assert "sigmoid" in content
+        assert "isotonic" in content
+
+    def test_model_card_includes_methodology_constants_section(self, tmp_path):
+        """Audit fix M: every key methodology constant must appear in the
+        model card with a value AND either a citation or an internal-decision
+        rationale, so a regulator can audit each one without reading code."""
+        results_df = pd.DataFrame(
+            {"ROC AUC": [0.82], "PR AUC": [0.15], "KS": [0.50], "Brier": [0.06], "N": [1000]},
+            index=["LightGBM"],
+        )
+
+        path = generate_model_card(results_df, None, None, None, None, None, tmp_path)
+        content = path.read_text()
+
+        # Section header
+        assert "10. METHODOLOGY CONSTANTS" in content
+
+        # Every flagged constant must be named in the section. Names taken
+        # straight from the audit's list M.
+        assert "PSI moderate-drift cut" in content
+        assert "PSI high-drift cut" in content
+        assert "Overfit flag delta threshold" in content
+        assert "Concept-drift flag threshold" in content
+        assert "Bad-rate multiplier" in content
+        assert "Sample weight on pseudo-labels" in content
+        assert "Stability selection threshold" in content
+        assert "Stability selection floor" in content
+        assert "Tree-aware importance ratio" in content
+        assert "Calibration holdout fraction" in content
+        assert "Min calibration positives" in content
+        assert "Optuna pruner warmup" in content
+        assert "Quality floor" in content
+
+        # Required literature citations for the externally-sourced constants.
+        assert "Hand & Henley" in content       # reject-inference multiplier
+        assert "Meinshausen" in content          # stability selection threshold
+        assert "Niculescu-Mizil" in content      # calibration min positives
+        assert "Karakoulas" in content           # PSI banding
+
+        # Required selection-weight breakdown so a reviewer can audit the
+        # 35/20/15/15/15 allocation without spelunking through code.
+        assert "35% discrimination" in content
+        assert "20% stability" in content
+        assert "15% calibration" in content
+        assert "15% generalisation" in content or "15% generalization" in content
+        assert "15% benchmark lift" in content
 
 
 class TestGenerateVariableDictionary:

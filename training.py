@@ -47,22 +47,29 @@ from xgboost import XGBClassifier
 from training_constants import (
     BENCHMARK_MODEL_NAMES,
     CALIBRATION_FRACTION,
+    CALIBRATION_METHOD_BY_MODEL,
+    CONCEPT_DRIFT_DELTA_THRESHOLD,
+    DEFAULT_CALIBRATION_METHOD,
+    DEFAULT_TIER_THRESHOLDS,
     DROP_COLS,
     EARLY_STOPPING_ROUNDS,
     EXPERIMENTAL_STACKING_NAME,
     FEATURE_DISCOVERY_FRACTION,
     MATURITY_CUTOFF,
-    MODEL_SELECTION_DATE,
     MAX_CATEGORIES,
     MIN_LIFT,
     MIN_VALID,
     MISS_CANDIDATES,
+    MODEL_SELECTION_DATE,
     MONOTONE_MAP,
     N_BOOTSTRAP,
     N_ESTIMATORS_CEILING,
     OFFICIAL_MODEL_NAMES,
+    OVERFIT_DELTA_THRESHOLD,
     POPULATION_MODE_BOOKED_MONITORING,
     POPULATION_MODE_UNDERWRITING,
+    PSI_HIGH_DRIFT_THRESHOLD,
+    PSI_MODERATE_THRESHOLD,
     RANDOM_STATE,
     RAW_CAT,
     RAW_NUM,
@@ -112,6 +119,39 @@ from training_reporting import (
     split_leaderboard_results,
     train_post_hoc_ensemble,
 )
+from training_models import (
+    EnsembleModel,
+    normalize_estimator_count,
+    normalize_xgboost_monotone_constraints,
+    safe_stratified_n_splits,
+    save_optuna_study as _save_optuna_study,
+    select_conservative_boosting_rounds,
+    train_catboost,
+    train_ebm,
+    train_lgbm,
+    train_logistic_regression,
+    train_xgboost,
+)
+from training_reject_inference import (
+    augment_training_data,
+    compute_score_band_bad_rates,
+    create_reject_pseudo_labels,
+)
+from training_stacking import (
+    TemporalStackingClassifier,
+    build_fresh_pipeline_from_fitted,
+    compute_temporal_oof_scores,
+    fit_pipeline_from_template,
+    train_stacking,
+)
+from training_temporal import (
+    TemporalExpandingCV,
+    build_rolling_oot_windows,
+    make_temporal_cv,
+    resolve_temporal_feature_discovery_cutoff,
+    temporal_calibration_split,
+    temporal_feature_discovery_split,
+)
 import training_features as _training_features
 from training_features import (
     GROUP_STAT_PAIRS,
@@ -125,6 +165,8 @@ from training_features import (
     build_monotone_constraints,
     build_preprocessors,
     engineer_features,
+    check_calibration_holdout_size,
+    enforce_matured_target,
     normalize_interaction_name,
     prune_correlated,
     reduce_cardinality,
@@ -186,224 +228,31 @@ def _log_step(step_num: int | str, description: str):
         logger.info("  done ({:.1f}s)", elapsed)
 
 
-class EnsembleModel:
-    """Lightweight wrapper that blends two pipelines' predict_proba outputs."""
-
-    def __init__(self, model_a, model_b, weight_a: float, weight_b: float, name: str = "Ensemble"):
-        self._a, self._b = model_a, model_b
-        self._wa, self._wb = weight_a, weight_b
-        self.name = name
-
-    def predict_proba(self, X):
-        pa = self._a.predict_proba(X)
-        pb = self._b.predict_proba(X)
-        return self._wa * pa + self._wb * pb
-
-    @property
-    def named_steps(self):
-        return None  # Not a Pipeline — skip feature importance extraction
-
-
-def _save_optuna_study(study: optuna.Study, output_dir: Path, model_name: str) -> None:
-    """Save Optuna trial history as CSV for hyperparameter sensitivity analysis."""
-    try:
-        trials_df = study.trials_dataframe()
-        safe_name = model_name.lower().replace(" ", "_")
-        path = output_dir / f"optuna_{safe_name}.csv"
-        trials_df.to_csv(path, index=False, float_format="%.6f")
-        logger.info("Saved Optuna study for {}: {} ({} trials)", model_name, path, len(trials_df))
-    except Exception as exc:
-        logger.warning("Could not save Optuna study for {}: {}", model_name, exc)
+# EnsembleModel and _save_optuna_study live in training_models.py and are
+# imported (and re-exported) below. _save_optuna_study is exposed under its
+# legacy private name for backwards compatibility with internal callers.
 
 
 # ── Temporal CV ────────────────────────────────────────────────────────────────
-
-class TemporalExpandingCV:
-    def __init__(self, dates, n_splits=5):
-        dates = pd.to_datetime(pd.Series(dates), errors="raise")
-        if dates.isna().any():
-            raise ValueError("TemporalExpandingCV dates must not contain missing values")
-
-        unique_dates = pd.Index(np.sort(dates.unique()))
-        if len(unique_dates) < n_splits + 1:
-            raise ValueError(
-                f"TemporalExpandingCV requires at least {n_splits + 1} distinct date blocks, "
-                f"got {len(unique_dates)}"
-            )
-
-        counts_by_date = dates.value_counts().sort_index()
-        cumulative_counts = counts_by_date.cumsum().to_numpy()
-        targets = np.linspace(0, len(dates), n_splits + 2)[1:-1]
-        boundaries = [0]
-        last_boundary = 0
-        for fold_idx, target in enumerate(targets, start=1):
-            boundary = int(np.searchsorted(cumulative_counts, target, side="left")) + 1
-            min_boundary = last_boundary + 1
-            max_boundary = len(unique_dates) - (n_splits - fold_idx + 1)
-            boundary = min(max(boundary, min_boundary), max_boundary)
-            boundaries.append(boundary)
-            last_boundary = boundary
-        boundaries.append(len(unique_dates))
-
-        self._folds = []
-        self.fold_boundaries_ = []
-        dates_array = dates.to_numpy()
-        for k in range(n_splits):
-            train_dates = unique_dates[:boundaries[k + 1]]
-            val_dates = unique_dates[boundaries[k + 1]:boundaries[k + 2]]
-            if len(train_dates) == 0 or len(val_dates) == 0:
-                raise ValueError("TemporalExpandingCV produced an empty training or validation fold")
-            train_idx = np.flatnonzero(np.isin(dates_array, train_dates))
-            val_idx = np.flatnonzero(np.isin(dates_array, val_dates))
-            train_max = pd.Timestamp(train_dates[-1])
-            val_min = pd.Timestamp(val_dates[0])
-            if not train_max < val_min:
-                raise ValueError("TemporalExpandingCV validation dates must be strictly later than training dates")
-            self._folds.append((train_idx, val_idx))
-            self.fold_boundaries_.append(
-                {
-                    "fold": k,
-                    "train_start": pd.Timestamp(train_dates[0]),
-                    "train_end": train_max,
-                    "val_start": val_min,
-                    "val_end": pd.Timestamp(val_dates[-1]),
-                    "n_train": len(train_idx),
-                    "n_val": len(val_idx),
-                }
-            )
-        self.n_splits = len(self._folds)
-
-    def split(self, X=None, y=None, groups=None):
-        for train_idx, val_idx in self._folds:
-            yield train_idx, val_idx
-
-    def get_n_splits(self, X=None, y=None, groups=None):
-        return self.n_splits
-
-
-def temporal_calibration_split(
-    X: pd.DataFrame,
-    y: pd.Series,
-    dates,
-    calibration_fraction: float = CALIBRATION_FRACTION,
-    sample_weight: np.ndarray | None = None,
-):
-    dates = pd.Series(pd.to_datetime(np.asarray(dates), errors="raise"), index=X.index)
-    if dates.isna().any():
-        raise ValueError("Calibration dates must not contain missing values")
-    if len(X) != len(y) or len(X) != len(dates):
-        raise ValueError("X, y, and dates must have the same length")
-    if sample_weight is not None and len(sample_weight) != len(dates):
-        raise ValueError("sample_weight must have the same length as X")
-
-    if sample_weight is not None:
-        reference_mask = np.asarray(sample_weight) == 1.0
-        reference_dates = dates.loc[reference_mask]
-    else:
-        reference_dates = dates
-
-    if reference_dates.empty:
-        raise ValueError("Calibration split requires at least one booked row")
-
-    counts_by_date = reference_dates.value_counts().sort_index()
-    if len(counts_by_date) < 2:
-        raise ValueError("Calibration split requires at least 2 distinct date blocks")
-
-    target_rows = max(1, int(np.ceil(len(reference_dates) * calibration_fraction)))
-    calibration_start = counts_by_date.index[-1]
-    cumulative_rows = 0
-    for date_value, count in counts_by_date.sort_index(ascending=False).items():
-        cumulative_rows += int(count)
-        calibration_start = date_value
-        if cumulative_rows >= target_rows:
-            break
-
-    calibration_mask = dates >= calibration_start
-    fit_mask = ~calibration_mask
-    if not calibration_mask.any() or not fit_mask.any():
-        raise ValueError("Calibration split must produce non-empty fit and calibration sets")
-
-    X_fit = X.loc[fit_mask].copy()
-    X_calib = X.loc[calibration_mask].copy()
-    y_fit = y.loc[fit_mask].copy()
-    y_calib = y.loc[calibration_mask].copy()
-    dates_fit = dates.loc[fit_mask].to_numpy()
-    dates_calib = dates.loc[calibration_mask].to_numpy()
-
-    if sample_weight is None:
-        return X_fit, X_calib, y_fit, y_calib, dates_fit, dates_calib
-
-    sample_weight = np.asarray(sample_weight)
-    w_fit = sample_weight[fit_mask.to_numpy()]
-    w_calib = sample_weight[calibration_mask.to_numpy()]
-    return X_fit, X_calib, y_fit, y_calib, w_fit, w_calib, dates_fit, dates_calib
-
-
-def resolve_temporal_feature_discovery_cutoff(
-    dates,
-    discovery_fraction: float = FEATURE_DISCOVERY_FRACTION,
-) -> pd.Timestamp:
-    dates = pd.Series(pd.to_datetime(np.asarray(dates), errors="raise"))
-    if dates.isna().any():
-        raise ValueError("Feature discovery dates must not contain missing values")
-    if not 0 < discovery_fraction < 1:
-        raise ValueError("discovery_fraction must be strictly between 0 and 1")
-
-    counts_by_date = dates.value_counts().sort_index()
-    if len(counts_by_date) < 2:
-        raise ValueError("Feature discovery split requires at least 2 distinct date blocks")
-
-    target_rows = max(1, int(np.ceil(len(dates) * discovery_fraction)))
-    discovery_end = counts_by_date.index[0]
-    cumulative_rows = 0
-    for date_value, count in counts_by_date.items():
-        cumulative_rows += int(count)
-        discovery_end = date_value
-        if cumulative_rows >= target_rows:
-            break
-
-    discovery_mask = dates <= discovery_end
-    estimation_mask = ~discovery_mask
-    if not discovery_mask.any() or not estimation_mask.any():
-        raise ValueError("Feature discovery split must produce non-empty discovery and estimation sets")
-    return pd.Timestamp(discovery_end)
-
-
-def temporal_feature_discovery_split(
-    X: pd.DataFrame,
-    y: pd.Series,
-    dates,
-    discovery_fraction: float = FEATURE_DISCOVERY_FRACTION,
-    discovery_end: str | pd.Timestamp | None = None,
-):
-    dates = pd.Series(pd.to_datetime(np.asarray(dates), errors="raise"), index=X.index)
-    if dates.isna().any():
-        raise ValueError("Feature discovery dates must not contain missing values")
-    if len(X) != len(y) or len(X) != len(dates):
-        raise ValueError("X, y, and dates must have the same length")
-    if discovery_end is None:
-        discovery_end = resolve_temporal_feature_discovery_cutoff(
-            dates,
-            discovery_fraction=discovery_fraction,
-        )
-    else:
-        discovery_end = pd.Timestamp(discovery_end)
-
-    discovery_mask = dates <= discovery_end
-    estimation_mask = ~discovery_mask
-    if not discovery_mask.any() or not estimation_mask.any():
-        raise ValueError("Feature discovery split must produce non-empty discovery and estimation sets")
-
-    X_discovery = X.loc[discovery_mask].copy()
-    X_estimation = X.loc[estimation_mask].copy()
-    y_discovery = y.loc[discovery_mask].copy()
-    y_estimation = y.loc[estimation_mask].copy()
-    dates_discovery = dates.loc[discovery_mask].to_numpy()
-    dates_estimation = dates.loc[estimation_mask].to_numpy()
-    return X_discovery, X_estimation, y_discovery, y_estimation, dates_discovery, dates_estimation
+# TemporalExpandingCV, temporal_calibration_split, resolve_temporal_feature_discovery_cutoff,
+# temporal_feature_discovery_split live in training_temporal.py and are imported below.
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
+
+def _sort_by_mis_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Defensive temporal ordering at the data-load boundary.
+
+    Several downstream operations are stable under row order today
+    (TemporalExpandingCV uses dates directly; add_modeling_features uses
+    .map / .loc with index alignment), but they would be fragile to an
+    upstream parquet that re-ordered rows. Sorting once at the load
+    boundary makes the temporal contract explicit and reproducible.
+    Stable sort preserves intra-date order so the artifact is byte-stable
+    when the input is.
+    """
+    return df.sort_values("mis_Date", kind="stable").reset_index(drop=True)
+
 
 def load_data(data_path: str) -> pd.DataFrame:
     logger.info("Source: {}", data_path)
@@ -416,6 +265,7 @@ def load_data(data_path: str) -> pd.DataFrame:
         "Booked filter: {:,} -> {:,} rows ({:,} rejected/canceled removed)",
         n_before, len(df), n_before - len(df),
     )
+    df = _sort_by_mis_date(df)
 
     target_counts = df[TARGET].value_counts(dropna=False)
     n_pos = target_counts.get(1.0, 0)
@@ -435,8 +285,10 @@ def load_data_with_rejects(data_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pq.read_table(data_path).to_pandas()
     logger.info("Raw: {:,} rows x {} cols", len(df), len(df.columns))
 
-    booked_df = df[df["status_name"] == "Booked"].copy()
-    rejected_df = df[df["status_name"].isin(["Rejected", "Canceled"])].copy()
+    booked_df = _sort_by_mis_date(df[df["status_name"] == "Booked"].copy())
+    rejected_df = _sort_by_mis_date(
+        df[df["status_name"].isin(["Rejected", "Canceled"])].copy()
+    )
 
     # Log booked stats
     target_counts = booked_df[TARGET].value_counts(dropna=False)
@@ -458,38 +310,22 @@ def load_data_with_rejects(data_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return booked_df, rejected_df
 
 
-# ── Feature engineering ────────────────────────────────────────────────────────
-
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    return _training_features.engineer_features(df)
-
-
-# ── Interaction search ─────────────────────────────────────────────────────────
-
-def search_interactions(
-    df: pd.DataFrame,
-    end_before_date: str | pd.Timestamp = SPLIT_DATE,
-    return_diagnostics: bool = False,
-) -> pd.DataFrame | _training_features.InteractionSearchResult:
-    return _training_features.search_interactions(
-        df,
-        end_before_date=end_before_date,
-        return_diagnostics=return_diagnostics,
-    )
-
-
-def add_interactions(df: pd.DataFrame, interactions: pd.DataFrame) -> pd.DataFrame:
-    return _training_features.add_interactions(df, interactions)
-
-
 # ── Feature selection & split ──────────────────────────────────────────────────
+# engineer_features, search_interactions, add_interactions, select_features
+# are imported directly from training_features above — no wrappers needed.
 
-def select_features(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
-    return _training_features.select_features(df)
 
+def temporal_split(
+    df: pd.DataFrame, feature_cols: list[str]
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, pd.Series, pd.Series, np.ndarray]:
+    """Train/test split by mis_Date. Returns:
+    (X_train, y_train, X_test, y_test, bench_risk_score_rf, bench_score_RF, train_dates).
 
-def temporal_split(df: pd.DataFrame, feature_cols: list[str]):
-    df_model = df[df["mis_Date"] <= MATURITY_CUTOFF].dropna(subset=[TARGET]).copy()
+    The maturity invariant (basel_bad requires 12 months on book) is enforced
+    by enforce_matured_target, which also raises if upstream ever populates
+    immature targets — see training_features.enforce_matured_target.
+    """
+    df_model = enforce_matured_target(df)
     df_model[TARGET] = df_model[TARGET].astype(int)
 
     train_mask = df_model["mis_Date"] < SPLIT_DATE
@@ -765,6 +601,10 @@ def _run_data_preparation_stages(
     if len(X_calibration_booked) == 0:
         raise ValueError("Calibration split produced no booked ground-truth rows")
 
+    # Warn (don't fail) when the holdout has too few positives for stable
+    # isotonic calibration. See training_features.check_calibration_holdout_size.
+    check_calibration_holdout_size(y_calibration_booked)
+
     log_population_summary(
         "Development fit sample",
         summarize_population(
@@ -954,8 +794,12 @@ def _run_model_training_stages(
         }
         if stack_model is not None:
             models[EXPERIMENTAL_STACKING_NAME] = stack_model
+        # Per-model calibration method follows Niculescu-Mizil & Caruana (2005);
+        # see CALIBRATION_METHOD_BY_MODEL in training_constants.py for the full
+        # rationale. Sigmoid for LR/EBM (log-odds-like outputs), isotonic for
+        # tree ensembles (sigmoid-shaped reliability diagrams).
         for name in OFFICIAL_MODEL_NAMES:
-            method = "sigmoid" if name in ("Logistic Regression", "EBM") else "isotonic"
+            method = CALIBRATION_METHOD_BY_MODEL.get(name, DEFAULT_CALIBRATION_METHOD)
             cal = CalibratedClassifierCV(FrozenEstimator(models[name]), method=method)
             cal.fit(prepared["X_calibration_booked"], prepared["y_calibration_booked"])
             models[f"{name} (calibrated)"] = cal
@@ -1334,6 +1178,22 @@ def _run_artifact_persistence_stage(
             holdout_scores_df=eval_stage["holdout_scores_df"],
         )
 
+        # Regenerate stakeholder charts from the freshly-written CSVs so the
+        # PNGs cannot drift behind the metrics they visualise. Wrapped
+        # defensively — a chart failure must not invalidate the rest of the
+        # run's artifacts (the CSVs are the source of truth).
+        try:
+            from stakeholder_charts import generate_stakeholder_charts
+
+            generated = generate_stakeholder_charts(output_path)
+            logger.info("Regenerated {} stakeholder charts in {}", len(generated), output_path / "plots")
+        except Exception as exc:
+            logger.warning(
+                "Stakeholder chart regeneration failed: {}. CSVs are still authoritative; "
+                "run `uv run stakeholder_charts.py --output-dir {}` to retry.",
+                exc, output_path,
+            )
+
 
 def summarize_population(
     y,
@@ -1388,1040 +1248,33 @@ def log_population_summary(population_name: str, summary: dict) -> None:
         )
 
 
-def make_temporal_cv(dates, max_splits: int = 5) -> TemporalExpandingCV:
-    distinct_dates = pd.Index(np.sort(pd.to_datetime(np.asarray(dates), errors="raise").unique()))
-    if len(distinct_dates) < 3:
-        raise ValueError("Temporal CV requires at least 3 distinct date blocks")
-    n_splits = min(max_splits, len(distinct_dates) - 1)
-    if n_splits != max_splits:
-        logger.info(
-            "Temporal CV: using {} folds from {} distinct date blocks",
-            n_splits,
-            len(distinct_dates),
-        )
-    return TemporalExpandingCV(dates, n_splits=n_splits)
+# make_temporal_cv and build_rolling_oot_windows live in training_temporal.py.
 
 
-def build_rolling_oot_windows(
-    dates,
-    max_windows: int = ROLLING_OOT_MAX_WINDOWS,
-    min_train_date_blocks: int = 2,
-) -> list[dict]:
-    dates_series = pd.Series(pd.to_datetime(np.asarray(dates), errors="raise"))
-    if dates_series.isna().any():
-        raise ValueError("Rolling OOT dates must not contain missing values")
-    if max_windows < 1:
-        raise ValueError("max_windows must be at least 1")
-    if min_train_date_blocks < 1:
-        raise ValueError("min_train_date_blocks must be at least 1")
-
-    unique_dates = pd.Index(np.sort(dates_series.unique()))
-    if len(unique_dates) < min_train_date_blocks + 1:
-        raise ValueError(
-            "Rolling OOT validation requires at least "
-            f"{min_train_date_blocks + 1} distinct date blocks"
-        )
-
-    validation_blocks = unique_dates[min_train_date_blocks:]
-    n_windows = min(max_windows, len(validation_blocks))
-    window_groups = [
-        pd.Index(group)
-        for group in np.array_split(validation_blocks.to_numpy(), n_windows)
-        if len(group) > 0
-    ]
-
-    windows = []
-    dates_array = dates_series.to_numpy()
-    for fold_idx, validation_group in enumerate(window_groups, start=1):
-        validation_start = pd.Timestamp(validation_group[0])
-        validation_end = pd.Timestamp(validation_group[-1])
-        train_dates = unique_dates[unique_dates < validation_start]
-        if len(train_dates) < min_train_date_blocks:
-            raise ValueError("Rolling OOT validation produced too few training date blocks")
-
-        train_idx = np.flatnonzero(np.isin(dates_array, train_dates))
-        validation_idx = np.flatnonzero(np.isin(dates_array, validation_group))
-        if len(train_idx) == 0 or len(validation_idx) == 0:
-            raise ValueError("Rolling OOT validation produced an empty train or validation window")
-
-        windows.append(
-            {
-                "fold": fold_idx,
-                "train_idx": train_idx,
-                "validation_idx": validation_idx,
-                "train_start": pd.Timestamp(train_dates[0]),
-                "train_end": pd.Timestamp(train_dates[-1]),
-                "validation_start": validation_start,
-                "validation_end": validation_end,
-                "n_train": len(train_idx),
-                "n_validation": len(validation_idx),
-            }
-        )
-    return windows
-
-
-def reduce_cardinality(
-    X_train: pd.DataFrame, X_test: pd.DataFrame, cat_cols: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    return _training_features.reduce_cardinality(X_train, X_test, cat_cols)
-
-
-# ── Enhanced feature engineering (post-split) ─────────────────────────────────
-
-def add_frequency_encoding(
-    X_train: pd.DataFrame, X_test: pd.DataFrame, cat_cols: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    return _training_features.add_frequency_encoding(X_train, X_test, cat_cols)
-
-
-def add_group_stats(
-    X_train: pd.DataFrame, X_test: pd.DataFrame, num_cols: list[str], cat_cols: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    return _training_features.add_group_stats(X_train, X_test, num_cols, cat_cols)
-
-
-def prune_correlated(
-    X: pd.DataFrame, num_cols: list[str],
-) -> list[str]:
-    return _training_features.prune_correlated(X, num_cols)
-
-
-def add_modeling_features(
-    X_train: pd.DataFrame, X_test: pd.DataFrame, base_feature_cols: list[str], base_num_cols: list[str], base_cat_cols: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str], list[str], list[str], list[str]]:
-    return _training_features.add_modeling_features(
-        X_train,
-        X_test,
-        base_feature_cols,
-        base_num_cols,
-        base_cat_cols,
-    )
-
-
-def build_feature_provenance(
-    raw_feature_cols: list[str],
-    engineered_feature_cols: list[str],
-    interactions: pd.DataFrame,
-    freq_cols: list[str],
-    group_cols: list[str],
-    feature_space_num_cols: list[str],
-    feature_space_cat_cols: list[str],
-    rfecv_candidate_cols: list[str],
-    rfecv_kept_cols: list[str],
-) -> pd.DataFrame:
-    return _training_features.build_feature_provenance(
-        raw_feature_cols,
-        engineered_feature_cols,
-        interactions,
-        freq_cols,
-        group_cols,
-        feature_space_num_cols,
-        feature_space_cat_cols,
-        rfecv_candidate_cols,
-        rfecv_kept_cols,
-    )
+# reduce_cardinality, add_frequency_encoding, add_group_stats,
+# prune_correlated, add_modeling_features, and build_feature_provenance are
+# imported directly from training_features above.
 
 
 # ── Reject inference ──────────────────────────────────────────────────────────
-
-def compute_score_band_bad_rates(
-    df_booked: pd.DataFrame,
-) -> tuple[pd.DataFrame, np.ndarray]:
-    df_mat = df_booked[
-        (df_booked["mis_Date"] < SPLIT_DATE)
-        & (df_booked["mis_Date"] <= MATURITY_CUTOFF)
-        & df_booked[TARGET].notna()
-        & df_booked[REJECT_SCORE_COL].notna()
-    ].copy()
-    if df_mat.empty:
-        raise ValueError("Reject inference requires pre-split booked rows with observed targets and scores")
-    df_mat[TARGET] = df_mat[TARGET].astype(int)
-
-    bin_edges = np.quantile(df_mat[REJECT_SCORE_COL].values, np.linspace(0, 1, REJECT_N_BINS + 1))
-    bin_edges[0], bin_edges[-1] = -np.inf, np.inf
-
-    df_mat["score_band"] = pd.cut(df_mat[REJECT_SCORE_COL], bins=bin_edges, labels=False, include_lowest=True)
-    band_stats = (
-        df_mat.groupby("score_band")
-        .agg(n_booked=(TARGET, "count"), n_bad=(TARGET, "sum"))
-        .reset_index()
-    )
-    band_stats["bad_rate"] = band_stats["n_bad"] / band_stats["n_booked"]
-    band_stats.attrs["pre_split_only"] = True
-    band_stats.attrs["source_max_date"] = pd.Timestamp(df_mat["mis_Date"].max())
-    band_stats.attrs["source_min_date"] = pd.Timestamp(df_mat["mis_Date"].min())
-
-    logger.info("Score-band bad rates (booked, pre-split, matured):")
-    for _, row in band_stats.iterrows():
-        logger.info("  Band {:2.0f}: n={:>6,}  bad_rate={:.4f}", row["score_band"], int(row["n_booked"]), row["bad_rate"])
-
-    return band_stats, bin_edges
-
-
-def create_reject_pseudo_labels(
-    df_rejected: pd.DataFrame,
-    band_stats: pd.DataFrame,
-    bin_edges: np.ndarray,
-    n_booked_train: int,
-) -> pd.DataFrame:
-    if not band_stats.attrs.get("pre_split_only", False):
-        raise ValueError("band_stats must be computed from pre-split booked rows only")
-    if pd.Timestamp(band_stats.attrs["source_max_date"]) >= pd.Timestamp(SPLIT_DATE):
-        raise ValueError("band_stats must exclude post-split booked rows")
-
-    df_rej = df_rejected[
-        df_rejected[REJECT_SCORE_COL].notna()
-        & (df_rejected["mis_Date"] < SPLIT_DATE)
-    ].copy()
-    if not df_rej.empty and not (df_rej["mis_Date"] < SPLIT_DATE).all():
-        raise ValueError("Pseudo-labeled rejects must come from the pre-split period only")
-
-    df_rej["score_band"] = pd.cut(df_rej[REJECT_SCORE_COL], bins=bin_edges, labels=False, include_lowest=True)
-    df_rej = df_rej.merge(band_stats[["score_band", "bad_rate"]], on="score_band", how="left")
-    if df_rej["bad_rate"].isna().any():
-        df_rej = df_rej.loc[df_rej["bad_rate"].notna()].copy()
-    df_rej["pseudo_bad_rate"] = (df_rej["bad_rate"] * REJECT_MULTIPLIER).clip(upper=0.50)
-
-    # Down-sample
-    max_rejects = int(n_booked_train * REJECT_MAX_RATIO)
-    if len(df_rej) > max_rejects:
-        logger.info("Down-sampling rejects: {:,} -> {:,} (ratio {:.1f}:1)", len(df_rej), max_rejects, REJECT_MAX_RATIO)
-        df_rej = df_rej.sample(n=max_rejects, random_state=RANDOM_STATE)
-
-    # Stochastic pseudo-label assignment
-    rng = np.random.RandomState(RANDOM_STATE)
-    df_rej[TARGET] = (rng.random(len(df_rej)) < df_rej["pseudo_bad_rate"]).astype(int)
-
-    booked_bad_rate = band_stats["n_bad"].sum() / band_stats["n_booked"].sum()
-    logger.info(
-        "Pseudo-labeled: {:,} rejects, {:.2%} pseudo-bad (vs {:.2%} booked observed)",
-        len(df_rej), df_rej[TARGET].mean(), booked_bad_rate,
-    )
-    for band in sorted(df_rej["score_band"].dropna().unique()):
-        b = df_rej[df_rej["score_band"] == band]
-        logger.info("  Band {:2.0f}: n={:>6,}  pseudo_bad_rate={:.4f}  assigned_bad={:,}",
-                    band, len(b), b["pseudo_bad_rate"].iloc[0], int(b[TARGET].sum()))
-
-    return df_rej
-
-
-def augment_training_data(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    df_reject_labeled: pd.DataFrame,
-    feature_cols: list[str],
-) -> tuple[pd.DataFrame, pd.Series, np.ndarray]:
-    """Combine booked training data with pseudo-labeled rejects + sample weights."""
-    X_rej = df_reject_labeled[feature_cols].copy()
-    y_rej = df_reject_labeled[TARGET].copy()
-
-    w_booked = np.ones(len(X_train))
-    w_reject = np.full(len(X_rej), REJECT_SAMPLE_WEIGHT)
-
-    X_aug = pd.concat([X_train, X_rej], axis=0, ignore_index=True)
-    y_aug = pd.concat([y_train, y_rej], axis=0, ignore_index=True)
-    w_aug = np.concatenate([w_booked, w_reject])
-
-    logger.info(
-        "Augmented: {:,} booked + {:,} rejects = {:,}  "
-        "(booked {:.2%} bad, rejects {:.2%} pseudo-bad, combined {:.2%})",
-        len(X_train), len(X_rej), len(X_aug),
-        y_train.mean(), y_rej.mean(), y_aug.mean(),
-    )
-    return X_aug, y_aug, w_aug
+# compute_score_band_bad_rates, create_reject_pseudo_labels, augment_training_data
+# live in training_reject_inference.py and are imported below.
 
 
 # ── Preprocessors ──────────────────────────────────────────────────────────────
-
-def build_preprocessors(
-    num_cols: list[str],
-    cat_cols: list[str],
-    target_encoder_smooth="auto",
-):
-    return _training_features.build_preprocessors(
-        num_cols,
-        cat_cols,
-        target_encoder_smooth=target_encoder_smooth,
-    )
-
-
-def build_monotone_constraints(num_cols: list[str], cat_cols: list[str]) -> list[int]:
-    return _training_features.build_monotone_constraints(num_cols, cat_cols)
-
+# build_preprocessors and build_monotone_constraints are imported from
+# training_features above.
 
 # ── Feature Selection (temporal stability selection) ──────────────────────────
+# run_rfecv is imported from training_features above.
 
-def run_rfecv(
-    X_train: pd.DataFrame, y_train: pd.Series,
-    num_cols: list[str], cat_cols: list[str],
-    feature_cols: list[str],
-    cv,
-):
-    return _training_features.run_rfecv(X_train, y_train, num_cols, cat_cols, feature_cols, cv)
 
 
-def normalize_xgboost_monotone_constraints(monotone_constraints):
-    if monotone_constraints is None or isinstance(monotone_constraints, (tuple, str, dict)):
-        return monotone_constraints
-    if isinstance(monotone_constraints, np.ndarray):
-        return tuple(monotone_constraints.tolist())
-    if isinstance(monotone_constraints, list):
-        return tuple(monotone_constraints)
-    return monotone_constraints
-
-
-def train_logistic_regression(X_train, y_train, preprocessor, cv, n_trials: int, sample_weight=None,
-                              num_cols: list[str] | None = None, cat_cols: list[str] | None = None):
-    logger.info("Optuna: {} trials x {} folds (LR L2 + TargetEncoder smooth tuning)",
-                n_trials, cv.n_splits)
-    folds = list(cv.split(X_train, y_train))
-
-    def objective(trial):
-        C = trial.suggest_float("C", 1e-4, 100.0, log=True)
-        smooth = trial.suggest_float("smooth", 1.0, 200.0, log=True)
-
-        fold_scores = []
-        for train_idx, val_idx in folds:
-            if num_cols is not None and cat_cols is not None:
-                pre = build_preprocessors(num_cols, cat_cols, target_encoder_smooth=smooth)[0]
-            else:
-                pre = clone(preprocessor)
-            X_tr_t = pre.fit_transform(X_train.iloc[train_idx], y=y_train.iloc[train_idx])
-            X_va_t = pre.transform(X_train.iloc[val_idx])
-            w_fold = sample_weight[train_idx] if sample_weight is not None else None
-            clf = LogisticRegression(
-                C=C, class_weight="balanced",
-                max_iter=5000, random_state=RANDOM_STATE, solver="lbfgs",
-            )
-            clf.fit(X_tr_t, y_train.iloc[train_idx], sample_weight=w_fold)
-            y_pred = clf.predict_proba(X_va_t)[:, 1]
-            fold_scores.append(average_precision_score(y_train.iloc[val_idx], y_pred))
-
-        return np.mean(fold_scores)
-
-    study = optuna.create_study(
-        direction="maximize", study_name="lr",
-        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
-    )
-    # n_jobs=1: sequential trials. Tree objectives use n_jobs=1 per fold
-    # to avoid contention; parallel trials would multiply memory usage.
-    # Set n_jobs=-1 for parallel trials if memory allows.
-    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
-
-    bp = study.best_params
-    logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
-    logger.info("  C={:.4f}, smooth={:.1f} (penalty=l2, solver=lbfgs)", bp["C"], bp["smooth"])
-
-    if num_cols is not None and cat_cols is not None:
-        best_preprocessor = build_preprocessors(num_cols, cat_cols, target_encoder_smooth=bp["smooth"])[0]
-    else:
-        best_preprocessor = preprocessor
-    lr_model = Pipeline([
-        ("preprocessor", best_preprocessor),
-        ("classifier", LogisticRegression(
-            C=bp["C"], class_weight="balanced",
-            max_iter=5000, random_state=RANDOM_STATE, solver="lbfgs",
-        )),
-    ])
-    lr_model.fit(X_train, y_train, classifier__sample_weight=sample_weight)
-    return lr_model, study
-
-
-def train_ebm(X_train, y_train, preprocessor, cv, n_trials: int, sample_weight=None):
-    """Train an Explainable Boosting Machine (GAM) with Optuna hyperparameter search.
-
-    EBMs learn additive shape functions per feature + optional pairwise interactions.
-    They sit between LR and full tree ensembles in complexity: more flexible than LR
-    (captures non-linear effects per feature) but less prone to overfitting than
-    tree ensembles (additive structure prevents high-order interactions).
-    """
-    logger.info("Optuna: {} trials x {} folds (EBM — Explainable Boosting Machine)",
-                n_trials, cv.n_splits)
-    folds = list(cv.split(X_train, y_train))
-
-    def objective(trial):
-        max_bins = trial.suggest_int("max_bins", 64, 256)
-        learning_rate = trial.suggest_float("learning_rate", 0.005, 0.05, log=True)
-        max_interaction_bins = trial.suggest_int("max_interaction_bins", 16, 64)
-        interactions = trial.suggest_int("interactions", 0, 15)
-        inner_bags = trial.suggest_int("inner_bags", 0, 8)
-        outer_bags = trial.suggest_int("outer_bags", 4, 16)
-        smoothing_rounds = trial.suggest_int("smoothing_rounds", 0, 500)
-        min_samples_leaf = trial.suggest_int("min_samples_leaf", 2, 50)
-
-        fold_scores = []
-        for fold_i, (train_idx, val_idx) in enumerate(folds):
-            pre = clone(preprocessor)
-            X_tr_t = pre.fit_transform(X_train.iloc[train_idx], y=y_train.iloc[train_idx])
-            X_va_t = pre.transform(X_train.iloc[val_idx])
-            w_fold = sample_weight[train_idx] if sample_weight is not None else None
-
-            ebm = ExplainableBoostingClassifier(
-                max_bins=max_bins,
-                learning_rate=learning_rate,
-                max_interaction_bins=max_interaction_bins,
-                interactions=interactions,
-                inner_bags=inner_bags,
-                outer_bags=outer_bags,
-                smoothing_rounds=smoothing_rounds,
-                min_samples_leaf=min_samples_leaf,
-                random_state=RANDOM_STATE,
-            )
-            if w_fold is not None:
-                ebm.fit(X_tr_t, y_train.iloc[train_idx], sample_weight=w_fold)
-            else:
-                ebm.fit(X_tr_t, y_train.iloc[train_idx])
-            y_pred = ebm.predict_proba(X_va_t)[:, 1]
-            fold_scores.append(average_precision_score(y_train.iloc[val_idx], y_pred))
-
-            trial.report(np.mean(fold_scores), fold_i)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-
-        return np.mean(fold_scores)
-
-    study = optuna.create_study(
-        direction="maximize", study_name="ebm",
-        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
-    )
-    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
-
-    bp = study.best_params
-    logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
-    logger.info("  max_bins={}, lr={:.4f}, interactions={}, outer_bags={}, min_samples_leaf={}",
-                bp["max_bins"], bp["learning_rate"], bp["interactions"],
-                bp["outer_bags"], bp["min_samples_leaf"])
-
-    ebm_model = Pipeline([
-        ("preprocessor", preprocessor),
-        ("classifier", ExplainableBoostingClassifier(
-            max_bins=bp["max_bins"],
-            learning_rate=bp["learning_rate"],
-            max_interaction_bins=bp["max_interaction_bins"],
-            interactions=bp["interactions"],
-            inner_bags=bp["inner_bags"],
-            outer_bags=bp["outer_bags"],
-            smoothing_rounds=bp["smoothing_rounds"],
-            min_samples_leaf=bp["min_samples_leaf"],
-            random_state=RANDOM_STATE,
-        )),
-    ])
-    if sample_weight is not None:
-        ebm_model.fit(X_train, y_train, classifier__sample_weight=sample_weight)
-    else:
-        ebm_model.fit(X_train, y_train)
-    return ebm_model, study
-
-
-def _lgbm_prauc_eval(y_true, y_raw):
-    """Custom LightGBM eval: PR AUC on probabilities (for early stopping)."""
-    y_prob = 1.0 / (1.0 + np.exp(-np.clip(y_raw, -500, 500)))
-    return "prauc", float(average_precision_score(y_true, y_prob)), True
-
-
-def train_lgbm(X_train, y_train, lgbm_preprocessor, lgbm_cat_indices, pos_weight, cv, n_trials: int, sample_weight=None, monotone_constraints=None):
-    # When sample_weight is provided (e.g. reject inference), it already
-    # rebalances the class distribution.  Combining it with scale_pos_weight
-    # would over-amplify the minority class, biasing the model toward
-    # predicting more defaults than warranted.
-    effective_pos_weight = 1.0 if sample_weight is not None else pos_weight
-    if sample_weight is not None and pos_weight != 1.0:
-        logger.info("sample_weight provided — disabling scale_pos_weight to avoid double-rebalancing")
-    logger.info("Optuna: {} trials x {} folds, early stopping after {} rounds",
-                n_trials, cv.n_splits, EARLY_STOPPING_ROUNDS)
-    lgbm_subsample_freq = 1
-
-    def objective(trial):
-        params = {
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 8, 31),
-            "max_depth": trial.suggest_int("max_depth", 3, 5),
-            "min_child_samples": trial.suggest_int("min_child_samples", 50, 300),
-            "subsample": trial.suggest_float("subsample", 0.6, 0.85),
-            "subsample_freq": lgbm_subsample_freq,
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.85),
-            "colsample_bynode": trial.suggest_float("colsample_bynode", 0.6, 1.0),
-            "max_bin": trial.suggest_int("max_bin", 63, 127),
-            "min_split_gain": trial.suggest_float("min_split_gain", 1e-3, 1.0, log=True),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 20.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-2, 50.0, log=True),
-        }
-
-        fold_scores = []
-        fold_best_iters = []
-        folds = list(cv.split(X_train, y_train))
-        for fold_i, (train_idx, val_idx) in enumerate(tqdm(folds, desc=f"  Trial {trial.number} folds", leave=False)):
-            X_f_tr = X_train.iloc[train_idx]
-            y_f_tr = y_train.iloc[train_idx]
-            X_f_va = X_train.iloc[val_idx]
-            y_f_va = y_train.iloc[val_idx]
-            w_fold = sample_weight[train_idx] if sample_weight is not None else None
-
-            pre = clone(lgbm_preprocessor)
-            X_tr_t = pre.fit_transform(X_f_tr)
-            X_va_t = pre.transform(X_f_va)
-
-            clf = LGBMClassifier(
-                n_estimators=N_ESTIMATORS_CEILING,
-                scale_pos_weight=effective_pos_weight,
-                monotone_constraints=monotone_constraints,
-                random_state=RANDOM_STATE, n_jobs=1, verbosity=-1,
-                **params,
-            )
-            clf.fit(
-                X_tr_t, y_f_tr,
-                sample_weight=w_fold,
-                eval_set=[(X_va_t, y_f_va)],
-                eval_metric=_lgbm_prauc_eval,
-                callbacks=[
-                    early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
-                    log_evaluation(-1),
-                ],
-                categorical_feature=lgbm_cat_indices,
-            )
-            y_pred = clf.predict_proba(X_va_t)[:, 1]
-            fold_scores.append(average_precision_score(y_f_va, y_pred))
-            fold_best_iters.append(normalize_estimator_count(clf.best_iteration_, fallback=N_ESTIMATORS_CEILING))
-
-            # Report intermediate result for pruning
-            trial.report(np.mean(fold_scores), fold_i)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-
-        trial.set_user_attr(
-            "best_n_estimators",
-            select_conservative_boosting_rounds(fold_best_iters, fallback=N_ESTIMATORS_CEILING),
-        )
-        return np.mean(fold_scores)
-
-    study = optuna.create_study(
-        direction="maximize", study_name="lgbm",
-        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
-    )
-    # n_jobs=1: sequential trials. Tree objectives use n_jobs=1 per fold
-    # to avoid contention; parallel trials would multiply memory usage.
-    # Set n_jobs=-1 for parallel trials if memory allows.
-    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
-
-    best_n_estimators = normalize_estimator_count(
-        study.best_trial.user_attrs["best_n_estimators"],
-        fallback=N_ESTIMATORS_CEILING,
-    )
-    bp = study.best_params
-    logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
-    logger.info("  n_estimators={} (conservative early stop), lr={:.4f}, leaves={}, depth={}, min_child={}",
-                best_n_estimators, bp["learning_rate"], bp["num_leaves"], bp["max_depth"], bp["min_child_samples"])
-    logger.info("  subsample={:.2f} (freq={}), colsample_tree={:.2f}, colsample_node={:.2f}, max_bin={}, min_split_gain={:.2e}, alpha={:.2e}, lambda={:.2e}",
-                bp["subsample"], lgbm_subsample_freq, bp["colsample_bytree"], bp["colsample_bynode"], bp["max_bin"], bp["min_split_gain"], bp["reg_alpha"], bp["reg_lambda"])
-
-    lgbm_model = Pipeline([
-        ("preprocessor", lgbm_preprocessor),
-        ("classifier", LGBMClassifier(
-            n_estimators=best_n_estimators,
-            scale_pos_weight=effective_pos_weight,
-            subsample_freq=lgbm_subsample_freq,
-            monotone_constraints=monotone_constraints,
-            random_state=RANDOM_STATE, n_jobs=-1, verbosity=-1,
-            **study.best_params,
-        )),
-    ])
-    fit_params = {"classifier__categorical_feature": lgbm_cat_indices}
-    if sample_weight is not None:
-        fit_params["classifier__sample_weight"] = sample_weight
-    lgbm_model.fit(X_train, y_train, **fit_params)
-    return lgbm_model, study, best_n_estimators
-
-
-def train_xgboost(X_train, y_train, preprocessor, pos_weight, cv, n_trials: int, sample_weight=None, monotone_constraints=None):
-    # Same guard as LGBM: skip scale_pos_weight when sample_weight handles rebalancing.
-    effective_pos_weight = 1.0 if sample_weight is not None else pos_weight
-    if sample_weight is not None and pos_weight != 1.0:
-        logger.info("sample_weight provided — disabling scale_pos_weight to avoid double-rebalancing")
-    logger.info("Optuna: {} trials x {} folds, early stopping after {} rounds",
-                n_trials, cv.n_splits, EARLY_STOPPING_ROUNDS)
-    xgb_monotone_constraints = normalize_xgboost_monotone_constraints(monotone_constraints)
-
-    def objective(trial):
-        params = {
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
-            "max_depth": trial.suggest_int("max_depth", 2, 4),
-            "min_child_weight": trial.suggest_int("min_child_weight", 20, 100),
-            "subsample": trial.suggest_float("subsample", 0.5, 0.85),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.85),
-            "colsample_bynode": trial.suggest_float("colsample_bynode", 0.6, 1.0),
-            "gamma": trial.suggest_float("gamma", 1e-3, 10.0, log=True),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 20.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-2, 50.0, log=True),
-        }
-
-        fold_scores = []
-        fold_best_iters = []
-        folds = list(cv.split(X_train, y_train))
-        for fold_i, (train_idx, val_idx) in enumerate(tqdm(folds, desc=f"  Trial {trial.number} folds", leave=False)):
-            X_f_tr = X_train.iloc[train_idx]
-            y_f_tr = y_train.iloc[train_idx]
-            X_f_va = X_train.iloc[val_idx]
-            y_f_va = y_train.iloc[val_idx]
-            w_fold = sample_weight[train_idx] if sample_weight is not None else None
-
-            pre = clone(preprocessor)
-            X_tr_t = pre.fit_transform(X_f_tr, y=y_f_tr)
-            X_va_t = pre.transform(X_f_va)
-
-            clf = XGBClassifier(
-                n_estimators=N_ESTIMATORS_CEILING,
-                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-                scale_pos_weight=effective_pos_weight,
-                monotone_constraints=xgb_monotone_constraints,
-                random_state=RANDOM_STATE, n_jobs=1, verbosity=0,
-                eval_metric="aucpr", **params,
-            )
-            clf.fit(X_tr_t, y_f_tr, sample_weight=w_fold,
-                    eval_set=[(X_va_t, y_f_va)], verbose=False)
-            y_pred = clf.predict_proba(X_va_t)[:, 1]
-            fold_scores.append(average_precision_score(y_f_va, y_pred))
-            fold_best_iters.append(
-                normalize_estimator_count(
-                    None if clf.best_iteration is None else clf.best_iteration + 1,
-                    fallback=N_ESTIMATORS_CEILING,
-                )
-            )
-
-            trial.report(np.mean(fold_scores), fold_i)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-
-        trial.set_user_attr(
-            "best_n_estimators",
-            select_conservative_boosting_rounds(fold_best_iters, fallback=N_ESTIMATORS_CEILING),
-        )
-        return np.mean(fold_scores)
-
-    study = optuna.create_study(
-        direction="maximize", study_name="xgb",
-        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
-    )
-    # n_jobs=1: sequential trials. Tree objectives use n_jobs=1 per fold
-    # to avoid contention; parallel trials would multiply memory usage.
-    # Set n_jobs=-1 for parallel trials if memory allows.
-    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
-
-    best_n_estimators = normalize_estimator_count(
-        study.best_trial.user_attrs["best_n_estimators"],
-        fallback=N_ESTIMATORS_CEILING,
-    )
-    bp = study.best_params
-    logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
-    logger.info("  n_estimators={} (conservative early stop), lr={:.4f}, depth={}, min_child_w={}",
-                best_n_estimators, bp["learning_rate"], bp["max_depth"], bp["min_child_weight"])
-    logger.info("  subsample={:.2f}, colsample_tree={:.2f}, colsample_node={:.2f}, gamma={:.2e}, alpha={:.2e}, lambda={:.2e}",
-                bp["subsample"], bp["colsample_bytree"], bp["colsample_bynode"], bp["gamma"], bp["reg_alpha"], bp["reg_lambda"])
-
-    xgb_model = Pipeline([
-        ("preprocessor", preprocessor),
-        ("classifier", XGBClassifier(
-            n_estimators=best_n_estimators,
-            scale_pos_weight=effective_pos_weight,
-            monotone_constraints=xgb_monotone_constraints,
-            random_state=RANDOM_STATE, n_jobs=-1, verbosity=0,
-            eval_metric="aucpr", **study.best_params,
-        )),
-    ])
-    if sample_weight is not None:
-        xgb_model.fit(X_train, y_train, classifier__sample_weight=sample_weight)
-    else:
-        xgb_model.fit(X_train, y_train)
-    return xgb_model, study, best_n_estimators
-
-
-def train_catboost(X_train, y_train, lgbm_preprocessor, pos_weight, cv, n_trials: int, sample_weight=None, monotone_constraints=None):
-    logger.info("Optuna: {} trials x {} folds, early stopping (PRAUC) after {} rounds",
-                n_trials, cv.n_splits, EARLY_STOPPING_ROUNDS)
-
-    def objective(trial):
-        params = {
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
-            "depth": trial.suggest_int("depth", 3, 5),
-            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 50.0, log=True),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 300),
-            "random_strength": trial.suggest_float("random_strength", 0.1, 20.0, log=True),
-            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 5.0),
-        }
-
-        fold_scores = []
-        fold_best_iters = []
-        folds = list(cv.split(X_train, y_train))
-        for fold_i, (train_idx, val_idx) in enumerate(tqdm(folds, desc=f"  Trial {trial.number} folds", leave=False)):
-            X_f_tr = X_train.iloc[train_idx]
-            y_f_tr = y_train.iloc[train_idx]
-            X_f_va = X_train.iloc[val_idx]
-            y_f_va = y_train.iloc[val_idx]
-            w_fold = sample_weight[train_idx] if sample_weight is not None else None
-
-            pre = clone(lgbm_preprocessor)
-            X_tr_t = pre.fit_transform(X_f_tr)
-            X_va_t = pre.transform(X_f_va)
-
-            clf = CatBoostClassifier(
-                iterations=N_ESTIMATORS_CEILING,
-                auto_class_weights="Balanced",
-                monotone_constraints=monotone_constraints,
-                random_seed=RANDOM_STATE,
-                eval_metric="PRAUC",
-                verbose=0,
-                **params,
-            )
-            clf.fit(
-                X_tr_t, y_f_tr,
-                sample_weight=w_fold,
-                eval_set=[(X_va_t, y_f_va)],
-                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-                verbose=0,
-            )
-            y_pred = clf.predict_proba(X_va_t)[:, 1]
-            fold_scores.append(average_precision_score(y_f_va, y_pred))
-            fold_best_iters.append(
-                normalize_estimator_count(
-                    None if clf.best_iteration_ is None else clf.best_iteration_ + 1,
-                    fallback=N_ESTIMATORS_CEILING,
-                )
-            )
-
-            trial.report(np.mean(fold_scores), fold_i)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-
-        trial.set_user_attr(
-            "best_n_estimators",
-            select_conservative_boosting_rounds(fold_best_iters, fallback=N_ESTIMATORS_CEILING),
-        )
-        return np.mean(fold_scores)
-
-    study = optuna.create_study(
-        direction="maximize", study_name="catboost",
-        sampler=optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
-    )
-    # n_jobs=1: sequential trials. Tree objectives use n_jobs=1 per fold
-    # to avoid contention; parallel trials would multiply memory usage.
-    # Set n_jobs=-1 for parallel trials if memory allows.
-    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
-
-    best_n_estimators = normalize_estimator_count(
-        study.best_trial.user_attrs["best_n_estimators"],
-        fallback=N_ESTIMATORS_CEILING,
-    )
-    bp = study.best_params
-    logger.info("Best trial #{}: CV PR AUC {:.4f}", study.best_trial.number, study.best_value)
-    logger.info("  iterations={} (conservative early stop), lr={:.4f}, depth={}, min_data_in_leaf={}",
-                best_n_estimators, bp["learning_rate"], bp["depth"], bp["min_data_in_leaf"])
-    logger.info("  l2_leaf_reg={:.2e}, random_strength={:.2e}, bagging_temp={:.2f}",
-                bp["l2_leaf_reg"], bp["random_strength"], bp["bagging_temperature"])
-
-    catboost_model = Pipeline([
-        ("preprocessor", lgbm_preprocessor),
-        ("classifier", CatBoostClassifier(
-            iterations=best_n_estimators,
-            auto_class_weights="Balanced",
-            monotone_constraints=monotone_constraints,
-            random_seed=RANDOM_STATE, verbose=0,
-            **study.best_params,
-        )),
-    ])
-    if sample_weight is not None:
-        catboost_model.fit(X_train, y_train, classifier__sample_weight=sample_weight)
-    else:
-        catboost_model.fit(X_train, y_train)
-    return catboost_model, study, best_n_estimators
-
-
-class TemporalStackingClassifier:
-    def __init__(
-        self,
-        named_estimators_: dict[str, Pipeline],
-        final_estimator_: LogisticRegression,
-        base_model_names_: list[str],
-        meta_feature_names_: list[str],
-        meta_training_positions_: np.ndarray,
-        fold_training_positions_: list[np.ndarray],
-        fold_validation_positions_: list[np.ndarray],
-    ):
-        self.named_estimators_ = named_estimators_
-        self.final_estimator_ = final_estimator_
-        self.base_model_names_ = base_model_names_
-        self.meta_feature_names_ = meta_feature_names_
-        self.meta_training_positions_ = np.asarray(meta_training_positions_, dtype=int)
-        self.fold_training_positions_ = [np.asarray(idx, dtype=int) for idx in fold_training_positions_]
-        self.fold_validation_positions_ = [np.asarray(idx, dtype=int) for idx in fold_validation_positions_]
-        self.classes_ = final_estimator_.classes_
-
-    def _build_meta_features(self, X: pd.DataFrame) -> pd.DataFrame:
-        meta_features = {
-            feature_name: self.named_estimators_[model_name].predict_proba(X)[:, 1]
-            for model_name, feature_name in zip(self.base_model_names_, self.meta_feature_names_, strict=True)
-        }
-        return pd.DataFrame(meta_features, index=X.index)
-
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        return self.final_estimator_.predict_proba(self._build_meta_features(X))
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        return self.final_estimator_.predict(self._build_meta_features(X))
-
-
-def fit_pipeline_from_template(
-    model_template: Pipeline,
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    sample_weight: np.ndarray | None = None,
-) -> Pipeline:
-    fitted_model = build_fresh_pipeline_from_fitted(model_template)
-    class_counts = pd.Series(y_train).value_counts()
-    if len(class_counts) >= 2:
-        safe_target_encoder_cv = int(min(5, len(y_train), class_counts.min()))
-        params = fitted_model.get_params()
-        if "preprocessor__cat__encoder__cv" in params:
-            fitted_model.set_params(preprocessor__cat__encoder__cv=max(2, safe_target_encoder_cv))
-
-    classifier = fitted_model.named_steps["classifier"]
-    fit_kwargs = {}
-    if sample_weight is not None:
-        fit_kwargs["classifier__sample_weight"] = sample_weight
-    if isinstance(classifier, LGBMClassifier):
-        preprocessor = fitted_model.named_steps["preprocessor"]
-        num_cols = list(preprocessor.transformers[0][2])
-        cat_cols = list(preprocessor.transformers[1][2])
-        fit_kwargs["classifier__categorical_feature"] = list(range(len(num_cols), len(num_cols) + len(cat_cols)))
-    fitted_model.fit(X_train, y_train, **fit_kwargs)
-    return fitted_model
-
-
-def compute_temporal_oof_scores(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    model_templates: dict[str, Pipeline],
-    cv,
-    sample_weight: np.ndarray | None = None,
-) -> dict[str, np.ndarray]:
-    if not isinstance(y_train, pd.Series):
-        y_train = pd.Series(y_train, index=X_train.index)
-    else:
-        y_train = y_train.copy()
-
-    if len(X_train) != len(y_train):
-        raise ValueError("X_train and y_train must have the same length")
-
-    if sample_weight is not None:
-        sample_weight = np.asarray(sample_weight)
-        if len(sample_weight) != len(X_train):
-            raise ValueError("sample_weight must have the same length as X_train")
-
-    oof_scores: dict[str, np.ndarray] = {}
-    for name, model_template in model_templates.items():
-        if not isinstance(model_template, Pipeline):
-            logger.warning(
-                "Skipping temporal OOF scores for {}: unsupported model type {}",
-                name,
-                model_template.__class__.__name__,
-            )
-            continue
-
-        model_scores = np.full(len(X_train), np.nan, dtype=float)
-        folds_used = 0
-        for fold_number, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train), start=1):
-            y_fold_train = y_train.iloc[train_idx]
-            class_counts = pd.Series(y_fold_train).value_counts()
-            if len(class_counts) < 2 or class_counts.min() < 2:
-                logger.warning(
-                    "OOF fold {} for {} skipped: insufficient class support ({})",
-                    fold_number,
-                    name,
-                    class_counts.to_dict(),
-                )
-                continue
-
-            X_fold_train = X_train.iloc[train_idx].copy()
-            X_fold_validation = X_train.iloc[val_idx].copy()
-            w_fold_train = sample_weight[train_idx] if sample_weight is not None else None
-            fold_model = fit_pipeline_from_template(
-                model_template,
-                X_fold_train,
-                y_fold_train,
-                sample_weight=w_fold_train,
-            )
-            model_scores[val_idx] = fold_model.predict_proba(X_fold_validation)[:, 1]
-            folds_used += 1
-
-        logger.info(
-            "Temporal OOF scores for {}: {:,} / {:,} rows covered across {} folds",
-            name,
-            int(np.isfinite(model_scores).sum()),
-            len(model_scores),
-            folds_used,
-        )
-        oof_scores[name] = model_scores
-
-    return oof_scores
-
-
-def train_stacking(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    base_models: dict[str, Pipeline],
-    cv,
-    sample_weight: np.ndarray | None = None,
-):
-    if not base_models:
-        raise ValueError("Temporal stacking requires at least one base model")
-
-    if not isinstance(y_train, pd.Series):
-        y_train = pd.Series(y_train, index=X_train.index)
-    else:
-        y_train = y_train.copy()
-
-    if len(X_train) != len(y_train):
-        raise ValueError("X_train and y_train must have the same length")
-
-    if sample_weight is not None:
-        sample_weight = np.asarray(sample_weight)
-        if len(sample_weight) != len(X_train):
-            raise ValueError("sample_weight must have the same length as X_train")
-
-    base_model_names = list(base_models)
-    meta_feature_names = [f"stack__{sanitize_output_name(name)}" for name in base_model_names]
-    oof_meta_features = np.full((len(X_train), len(base_model_names)), np.nan, dtype=float)
-    fold_training_positions: list[np.ndarray] = []
-    fold_validation_positions: list[np.ndarray] = []
-
-    logger.info(
-        "{} base learners -> LR meta-learner, {} temporal folds",
-        len(base_model_names),
-        cv.n_splits,
-    )
-
-    for fold_number, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train), start=1):
-        y_fold_train = y_train.iloc[train_idx]
-        class_counts = pd.Series(y_fold_train).value_counts()
-        if len(class_counts) < 2 or class_counts.min() < 2:
-            logger.warning(
-                "Stacking fold {} skipped: fit window has insufficient class support ({})",
-                fold_number,
-                class_counts.to_dict(),
-            )
-            continue
-
-        X_fold_train = X_train.iloc[train_idx].copy()
-        X_fold_validation = X_train.iloc[val_idx].copy()
-        w_fold_train = sample_weight[train_idx] if sample_weight is not None else None
-
-        for model_idx, model_name in enumerate(base_model_names):
-            fold_model = fit_pipeline_from_template(
-                base_models[model_name],
-                X_fold_train,
-                y_fold_train,
-                sample_weight=w_fold_train,
-            )
-            oof_meta_features[val_idx, model_idx] = fold_model.predict_proba(X_fold_validation)[:, 1]
-
-        fold_training_positions.append(np.asarray(train_idx, dtype=int))
-        fold_validation_positions.append(np.asarray(val_idx, dtype=int))
-
-    meta_training_mask = np.isfinite(oof_meta_features).all(axis=1)
-    if not meta_training_mask.any():
-        raise ValueError("Temporal stacking produced no out-of-fold predictions")
-
-    y_meta = y_train.iloc[meta_training_mask]
-    meta_class_counts = pd.Series(y_meta).value_counts()
-    if len(meta_class_counts) < 2:
-        raise ValueError("Temporal stacking meta-learner requires at least 2 classes in OOF predictions")
-
-    meta_training_frame = pd.DataFrame(
-        oof_meta_features[meta_training_mask],
-        columns=meta_feature_names,
-        index=X_train.index[meta_training_mask],
-    )
-    meta_model = LogisticRegression(max_iter=20_000, random_state=RANDOM_STATE)
-    meta_fit_kwargs = {}
-    if sample_weight is not None:
-        meta_fit_kwargs["sample_weight"] = sample_weight[meta_training_mask]
-    meta_model.fit(meta_training_frame, y_meta, **meta_fit_kwargs)
-
-    logger.info(
-        "Temporal stacking meta-learner fit on {:,} OOF rows across {} folds ({} rows excluded)",
-        len(meta_training_frame),
-        len(fold_validation_positions),
-        len(X_train) - len(meta_training_frame),
-    )
-
-    return TemporalStackingClassifier(
-        named_estimators_=dict(base_models),
-        final_estimator_=meta_model,
-        base_model_names_=base_model_names,
-        meta_feature_names_=meta_feature_names,
-        meta_training_positions_=np.flatnonzero(meta_training_mask),
-        fold_training_positions_=fold_training_positions,
-        fold_validation_positions_=fold_validation_positions,
-    )
-
-
-def safe_stratified_n_splits(y, max_splits: int = 5) -> int:
-    class_counts = pd.Series(y).value_counts()
-    if len(class_counts) < 2 or class_counts.min() < 2:
-        raise ValueError("Stratified cross-validation requires at least 2 examples in each class")
-    return int(min(max_splits, len(y), class_counts.min()))
-
-
-def normalize_estimator_count(value, fallback: int = 1) -> int:
-    if value is None or pd.isna(value):
-        return fallback
-    return max(int(value), fallback)
-
-
-def select_conservative_boosting_rounds(
-    best_iterations: list[int],
-    fallback: int = N_ESTIMATORS_CEILING,
-    quantile: float = 0.25,
-) -> int:
-    if not best_iterations:
-        return normalize_estimator_count(fallback)
-    normalized = np.asarray(
-        [normalize_estimator_count(value, fallback=fallback) for value in best_iterations],
-        dtype=float,
-    )
-    conservative_value = np.floor(np.quantile(normalized, quantile))
-    return normalize_estimator_count(conservative_value, fallback=int(normalized.min()))
-
-
-def build_fresh_pipeline_from_fitted(model: Pipeline) -> Pipeline:
-    preprocessor = clone(model.named_steps["preprocessor"])
-    classifier = model.named_steps["classifier"]
-
-    if isinstance(classifier, LogisticRegression):
-        fresh_classifier = LogisticRegression(**classifier.get_params())
-    elif isinstance(classifier, LGBMClassifier):
-        fresh_classifier = LGBMClassifier(**classifier.get_params())
-    elif isinstance(classifier, XGBClassifier):
-        classifier_params = classifier.get_params()
-        classifier_params["monotone_constraints"] = normalize_xgboost_monotone_constraints(
-            classifier_params.get("monotone_constraints")
-        )
-        fresh_classifier = XGBClassifier(**classifier_params)
-    elif isinstance(classifier, CatBoostClassifier):
-        classifier_params = classifier.get_params()
-        monotone_constraints = classifier_params.get("monotone_constraints")
-        if isinstance(monotone_constraints, np.ndarray):
-            classifier_params["monotone_constraints"] = monotone_constraints.tolist()
-        fresh_classifier = CatBoostClassifier(**classifier_params)
-    else:
-        fresh_classifier = clone(classifier)
-
-    return Pipeline([
-        ("preprocessor", preprocessor),
-        ("classifier", fresh_classifier),
-    ])
+# Temporal stacking (TemporalStackingClassifier, fit_pipeline_from_template,
+# compute_temporal_oof_scores, train_stacking, build_fresh_pipeline_from_fitted)
+# lives in training_stacking.py and is imported below. safe_stratified_n_splits,
+# normalize_estimator_count, select_conservative_boosting_rounds live in
+# training_models.py.
 
 
 def build_population_summary_df(
@@ -2489,7 +1342,7 @@ def build_applicant_score_frame(
     if applicant_df.empty:
         return pd.DataFrame(
             columns=[
-                "authorization_id", "mis_Date", "status_name", "AGE_T1", TARGET,
+                "applicant_index", "mis_Date", "status_name", TARGET,
                 "has_observed_target", "target_source", "risk_score_rf", "score_RF",
             ]
         )
@@ -2502,12 +1355,19 @@ def build_applicant_score_frame(
         base_cat_cols,
     )
     X_applicant = X_applicant[frozen_feature_cols].copy()
-    if "AGE_T1" not in applicant_df.columns:
-        applicant_df["AGE_T1"] = np.nan
+
+    # Sort by mis_Date + original authorization_id for deterministic ordering,
+    # then drop the PII linkage key. The output frame uses an opaque
+    # applicant_index so downstream artifacts in output/ cannot link a score
+    # back to a specific applicant. AGE_T1 is also omitted (not consumed by
+    # downstream reports) to minimise PII surface.
+    applicant_df = applicant_df.sort_values(["mis_Date", "authorization_id"])
+    X_applicant = X_applicant.loc[applicant_df.index]
 
     score_frame = applicant_df.loc[:, [
-        "authorization_id", "mis_Date", "status_name", "AGE_T1", TARGET, "risk_score_rf", "score_RF",
+        "mis_Date", "status_name", TARGET, "risk_score_rf", "score_RF",
     ]].copy()
+    score_frame.insert(0, "applicant_index", np.arange(1, len(score_frame) + 1))
     score_frame["has_observed_target"] = score_frame[TARGET].notna()
     score_frame["target_source"] = np.where(
         score_frame["has_observed_target"],
@@ -2516,7 +1376,7 @@ def build_applicant_score_frame(
     )
     for name, model in models.items():
         score_frame[f"score__{sanitize_output_name(name)}"] = model.predict_proba(X_applicant)[:, 1]
-    return score_frame.sort_values(["mis_Date", "authorization_id"]).reset_index(drop=True)
+    return score_frame.reset_index(drop=True)
 
 
 def run_rolling_out_of_time_validation(
@@ -2652,7 +1512,11 @@ def run_rolling_out_of_time_validation(
 
             if len(np.unique(y_calibration)) >= 2:
                 calibration_cv = safe_stratified_n_splits(y_calibration)
-                cal_method = "sigmoid" if name == "Logistic Regression" else "isotonic"
+                # Use the same per-model method table as the official path so
+                # rolling-OOT calibration metrics are comparable to evaluation.
+                # (Pre-fix this site treated EBM as a tree model, which gave it
+                # isotonic in OOT but sigmoid in the official run.)
+                cal_method = CALIBRATION_METHOD_BY_MODEL.get(name, DEFAULT_CALIBRATION_METHOD)
                 calibrated_model = CalibratedClassifierCV(
                     FrozenEstimator(fold_model),
                     method=cal_method,
@@ -3328,13 +2192,18 @@ def run_stability_analysis(
             continue
         psi = compute_psi(train_scores[name], test_scores[name])
         psi_records.append({"model": name, "psi": psi})
-        flag = "OK" if psi < 0.10 else ("MODERATE" if psi < 0.25 else "HIGH DRIFT")
+        if psi < PSI_MODERATE_THRESHOLD:
+            flag = "OK"
+        elif psi < PSI_HIGH_DRIFT_THRESHOLD:
+            flag = "MODERATE"
+        else:
+            flag = "HIGH DRIFT"
         logger.info("  PSI {:<25s} = {:.4f}  [{}]", name, psi, flag)
     pd.DataFrame(psi_records).to_csv(output_dir / "psi.csv", index=False, float_format="%.6f")
     csi_df = compute_csi(X_train, X_test, num_cols, cat_cols)
     csi_df.to_csv(output_dir / "csi.csv", index=False, float_format="%.6f")
-    n_high = int((csi_df["csi"] >= 0.25).sum())
-    n_mod = int(((csi_df["csi"] >= 0.10) & (csi_df["csi"] < 0.25)).sum())
+    n_high = int((csi_df["csi"] >= PSI_HIGH_DRIFT_THRESHOLD).sum())
+    n_mod = int(((csi_df["csi"] >= PSI_MODERATE_THRESHOLD) & (csi_df["csi"] < PSI_HIGH_DRIFT_THRESHOLD)).sum())
     n_stable = len(csi_df) - n_high - n_mod
     logger.info(
         "  CSI: {} features — {} high drift, {} moderate, {} stable",
@@ -3344,7 +2213,7 @@ def run_stability_analysis(
         n_stable,
     )
     if n_high > 0:
-        for _, row in csi_df[csi_df["csi"] >= 0.25].iterrows():
+        for _, row in csi_df[csi_df["csi"] >= PSI_HIGH_DRIFT_THRESHOLD].iterrows():
             logger.info("    HIGH: {:<30s} CSI={:.4f}", row["feature"], row["csi"])
 
 
@@ -3497,7 +2366,10 @@ def _run_diagnostics_and_governance(
                 )
             n_flagged = int((overfit_df["overfit_flag"] == "YES").sum())
             if n_flagged > 0:
-                logger.warning("{} model(s) flagged for potential overfitting (AUC or PR AUC delta > 0.03)", n_flagged)
+                logger.warning(
+                    "{} model(s) flagged for potential overfitting (AUC or PR AUC delta > {:.2f})",
+                    n_flagged, OVERFIT_DELTA_THRESHOLD,
+                )
             else:
                 logger.info("No models flagged for overfitting")
 

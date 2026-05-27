@@ -9,6 +9,7 @@ import pytest
 import training_features as training_features_module
 from training_constants import (
     DROP_COLS,
+    MATURITY_CUTOFF,
     MISS_CANDIDATES,
     RAW_CAT,
     RAW_NUM,
@@ -20,6 +21,7 @@ from training_features import (
     add_interactions,
     build_feature_provenance,
     engineer_features,
+    enforce_matured_target,
     reduce_cardinality,
     search_interactions,
     select_features,
@@ -58,6 +60,16 @@ class TestSelectFeatures:
     def test_scrplust1_excluded(self, engineered_df):
         feature_cols, _, _ = select_features(engineered_df)
         assert "SCRPLUST1" not in feature_cols
+
+    def test_scrplust1_not_in_raw_num_or_raw_cat(self):
+        """Closes interaction-search exclusion gap.
+
+        select_features uses DROP_COLS, but the interaction search iterates over
+        RAW_NUM and RAW_CAT. If SCRPLUST1 is added to either, it would silently
+        enter the interaction grid even though DROP_COLS excludes the raw column.
+        """
+        assert "SCRPLUST1" not in RAW_NUM
+        assert "SCRPLUST1" not in RAW_CAT
 
     def test_target_excluded(self, engineered_df):
         feature_cols, _, _ = select_features(engineered_df)
@@ -310,3 +322,236 @@ class TestBuildFeatureProvenance:
         assert bool(engineered_row["rfecv_candidate"]) is True
         assert frequency_row["provenance"] == "frequency"
         assert bool(frequency_row["rfecv_kept"]) is False
+
+    def test_records_selector_source_when_split_kept_sets_provided(self):
+        """build_feature_provenance must surface which selector kept each feature."""
+        interactions = pd.DataFrame(columns=["name", "type", "feat_a", "feat_b"])
+
+        provenance_df = build_feature_provenance(
+            raw_feature_cols=["A", "B", "C", "D"],
+            engineered_feature_cols=[],
+            interactions=interactions,
+            freq_cols=[],
+            group_cols=[],
+            feature_space_num_cols=["A", "B", "C", "D"],
+            feature_space_cat_cols=[],
+            rfecv_candidate_cols=["A", "B", "C", "D"],
+            rfecv_kept_cols=["A", "B", "C"],
+            stability_kept_cols=["A", "B"],
+            tree_aware_kept_cols=["B", "C"],
+        )
+
+        rows = provenance_df.set_index("feature")
+        # A — only the LR stability selector kept it.
+        assert rows.loc["A", "kept_by"] == "stability_only"
+        assert bool(rows.loc["A", "stability_kept"]) is True
+        assert bool(rows.loc["A", "tree_aware_kept"]) is False
+        # B — both selectors agreed.
+        assert rows.loc["B", "kept_by"] == "both"
+        # C — only the tree-aware pass kept it; this is exactly the case the
+        # methodology audit said the LR-only contract was missing.
+        assert rows.loc["C", "kept_by"] == "tree_aware_only"
+        # D — neither selector kept it.
+        assert rows.loc["D", "kept_by"] == "dropped"
+
+
+class TestRunTreeAwareFeaturePass:
+    def test_drops_pure_noise_features(self):
+        """A feature that is pure noise should fall below the importance threshold."""
+        from training_features import run_tree_aware_feature_pass
+        from training_temporal import make_temporal_cv
+
+        rng = np.random.RandomState(0)
+        n = 600
+        # signal + noise: y depends only on signal, noise columns are random.
+        signal = rng.normal(size=n)
+        prob = 1 / (1 + np.exp(-1.8 * signal))
+        y = pd.Series((rng.uniform(size=n) < prob).astype(int))
+        # Construct three months of dates to allow a 2-fold temporal CV.
+        dates = pd.to_datetime(
+            ["2024-01-01"] * (n // 3) + ["2024-02-01"] * (n // 3) + ["2024-03-01"] * (n - 2 * (n // 3))
+        )
+        X = pd.DataFrame({
+            "signal": signal,
+            "noise_1": rng.normal(size=n),
+            "noise_2": rng.normal(size=n),
+            "noise_3": rng.normal(size=n),
+        })
+        cv = make_temporal_cv(dates, max_splits=2)
+
+        kept = run_tree_aware_feature_pass(
+            X,
+            y,
+            num_cols=["signal", "noise_1", "noise_2", "noise_3"],
+            cat_cols=[],
+            feature_cols=["signal", "noise_1", "noise_2", "noise_3"],
+            cv=cv,
+        )
+
+        assert "signal" in kept, "signal must be kept by the tree-aware pass"
+        # The noise features should mostly be dropped — at minimum the signal
+        # is kept and the kept set is a strict subset of the candidates.
+        assert len(kept) < 4
+
+    def test_returns_empty_when_no_folds_are_valid(self):
+        """If every fold has only one class, the pass returns [] gracefully."""
+        from training_features import run_tree_aware_feature_pass
+        from training_temporal import make_temporal_cv
+
+        n = 60
+        y = pd.Series([0] * n)  # Single-class — no fold can fit.
+        dates = pd.to_datetime(["2024-01-01"] * 20 + ["2024-02-01"] * 20 + ["2024-03-01"] * 20)
+        X = pd.DataFrame({"x": np.arange(n, dtype=float)})
+        cv = make_temporal_cv(dates, max_splits=2)
+
+        result = run_tree_aware_feature_pass(
+            X, y, num_cols=["x"], cat_cols=[], feature_cols=["x"], cv=cv,
+        )
+        assert result == []
+
+
+class TestEnforceMaturedTarget:
+    """Maturity invariant: basel_bad requires 12 months on book.
+
+    Filtering by mis_Date <= MATURITY_CUTOFF and dropping NaN targets used to
+    be done with implicit dropna(). enforce_matured_target makes the contract
+    explicit and surfaces upstream-data violations loudly.
+    """
+
+    def _frame(self, rows):
+        return pd.DataFrame(rows)
+
+    def test_keeps_mature_rows_with_observed_target(self):
+        cutoff = pd.Timestamp(MATURITY_CUTOFF)
+        df = self._frame([
+            {"mis_Date": cutoff - pd.Timedelta(days=400), TARGET: 0.0, "x": 1.0},
+            {"mis_Date": cutoff - pd.Timedelta(days=200), TARGET: 1.0, "x": 2.0},
+        ])
+        result = enforce_matured_target(df)
+        assert len(result) == 2
+        assert list(result["x"]) == [1.0, 2.0]
+
+    def test_drops_immature_rows_with_null_target(self):
+        cutoff = pd.Timestamp(MATURITY_CUTOFF)
+        df = self._frame([
+            {"mis_Date": cutoff - pd.Timedelta(days=200), TARGET: 0.0, "x": 1.0},
+            # immature row, target left NaN by upstream — must be silently dropped
+            {"mis_Date": cutoff + pd.Timedelta(days=30), TARGET: float("nan"), "x": 2.0},
+        ])
+        result = enforce_matured_target(df)
+        assert len(result) == 1
+        assert result.iloc[0]["x"] == 1.0
+
+    def test_drops_pre_cutoff_rows_that_are_still_unobserved(self):
+        cutoff = pd.Timestamp(MATURITY_CUTOFF)
+        df = self._frame([
+            {"mis_Date": cutoff - pd.Timedelta(days=400), TARGET: 0.0, "x": 1.0},
+            {"mis_Date": cutoff - pd.Timedelta(days=200), TARGET: float("nan"), "x": 2.0},
+        ])
+        result = enforce_matured_target(df)
+        assert len(result) == 1
+        assert result.iloc[0]["x"] == 1.0
+
+    def test_warns_and_drops_when_immature_row_has_observed_target(self):
+        """Audit fix F: when upstream populates immature targets (e.g. right-
+        censoring zeros), the helper emits a regulator-visible warning and
+        the static cutoff filter still drops the offending rows.
+
+        Originally this case raised — but real upstream feeds frequently fill
+        0 for 'no default observed yet' on rows that haven't matured, which
+        would block every legitimate training run. The warning preserves the
+        regulator-visible signal while letting the cutoff handle the safety.
+        """
+        from loguru import logger as _logger
+
+        cutoff = pd.Timestamp(MATURITY_CUTOFF)
+        df = self._frame([
+            {"mis_Date": cutoff - pd.Timedelta(days=200), TARGET: 0.0, "x": 1.0},
+            # adversarial: immature row with non-null target (e.g. censored 0)
+            {"mis_Date": cutoff + pd.Timedelta(days=30), TARGET: 0.0, "x": 2.0},
+        ])
+
+        messages: list[str] = []
+        handler_id = _logger.add(lambda m: messages.append(str(m)), level="WARNING")
+        try:
+            result = enforce_matured_target(df)
+        finally:
+            _logger.remove(handler_id)
+
+        # The static cutoff filter drops the offending row.
+        assert len(result) == 1
+        assert result.iloc[0]["x"] == 1.0
+        # And a regulator-visible warning fires.
+        assert any("Maturity contract drift" in m for m in messages)
+        assert any("right-censoring" in m for m in messages)
+
+    def test_returns_a_copy(self):
+        cutoff = pd.Timestamp(MATURITY_CUTOFF)
+        df = self._frame([
+            {"mis_Date": cutoff - pd.Timedelta(days=200), TARGET: 0.0, "x": 1.0},
+        ])
+        result = enforce_matured_target(df)
+        # Mutating the result must not touch the input.
+        result.loc[result.index[0], "x"] = 999.0
+        assert df.iloc[0]["x"] == 1.0
+
+
+class TestCheckCalibrationHoldoutSize:
+    """Audit fix G: warn when the calibration holdout is too small for stable isotonic.
+
+    Niculescu-Mizil & Caruana (2005) and follow-ups recommend ~100 positives as
+    the lower bound for monotonic-fit calibrators on imbalanced targets.
+    Below that the helper logs a regulator-visible warning but does NOT fail —
+    legitimate small-portfolio runs are allowed to proceed.
+    """
+
+    @staticmethod
+    def _capture_warnings():
+        """Return (messages_list, handler_id) — caller must remove the handler."""
+        from loguru import logger as _logger
+        messages: list[str] = []
+        handler_id = _logger.add(lambda message: messages.append(str(message)), level="WARNING")
+        return messages, handler_id
+
+    def test_returns_true_when_above_minimum(self):
+        from training_features import check_calibration_holdout_size
+        from loguru import logger as _logger
+
+        messages, handler_id = self._capture_warnings()
+        try:
+            y = pd.Series([0] * 1000 + [1] * 150)
+            assert check_calibration_holdout_size(y) is True
+        finally:
+            _logger.remove(handler_id)
+
+        # No warning should have been emitted.
+        assert not any("Calibration holdout has only" in m for m in messages)
+
+    def test_returns_false_and_warns_when_below_minimum(self):
+        from training_features import check_calibration_holdout_size
+        from loguru import logger as _logger
+
+        messages, handler_id = self._capture_warnings()
+        try:
+            y = pd.Series([0] * 1000 + [1] * 50)  # 50 < 100
+            assert check_calibration_holdout_size(y) is False
+        finally:
+            _logger.remove(handler_id)
+
+        # Warning text must mention both the actual count and the threshold.
+        assert any("Calibration holdout has only 50 positives" in m for m in messages)
+        assert any("100 recommended" in m for m in messages)
+
+    def test_threshold_is_overridable(self):
+        from training_features import check_calibration_holdout_size
+        from loguru import logger as _logger
+
+        messages, handler_id = self._capture_warnings()
+        try:
+            y = pd.Series([0] * 100 + [1] * 30)
+            # 30 positives is below the default 100 but at-or-above an
+            # explicit 30, so no warning should fire.
+            assert check_calibration_holdout_size(y, minimum_positives=30) is True
+        finally:
+            _logger.remove(handler_id)
+        assert not any("Calibration holdout has only" in m for m in messages)

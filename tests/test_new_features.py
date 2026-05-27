@@ -214,6 +214,79 @@ class TestScoringService:
         assert service.model_name == "Logistic Regression"
         assert 0.0 <= result.predicted_pd <= 1.0
 
+    def test_from_output_dir_rejects_path_traversal_in_model_name(self, tmp_path):
+        """A model_selection.csv that names ../../etc/passwd must not escape models_dir."""
+        import joblib
+        from sklearn.linear_model import LogisticRegression
+        from scoring import ScoringService
+
+        model = LogisticRegression().fit(np.array([[0.0], [1.0], [2.0], [3.0]]), np.array([0, 0, 1, 1]))
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        joblib.dump(model, models_dir / "logistic_regression.joblib")
+        pd.DataFrame([{"feature": "a"}]).to_csv(tmp_path / "variable_dictionary.csv", index=False)
+
+        # Adversarial model name with traversal sequence.
+        pd.DataFrame([{"model": "../../etc/passwd", "recommended": True}]).to_csv(
+            tmp_path / "model_selection.csv", index=False
+        )
+        # Sanitization reduces this to a basename, so the load fails as "not found"
+        # rather than escaping into the filesystem. Either FileNotFoundError or
+        # ValueError is acceptable; what matters is that no file outside models_dir
+        # is read.
+        with pytest.raises((FileNotFoundError, ValueError)):
+            ScoringService.from_output_dir(tmp_path)
+
+    def test_from_output_dir_verifies_checksum(self, tmp_path):
+        """Tampering with a .joblib after checksums.json is written must be detected."""
+        import json
+        import joblib
+        from sklearn.linear_model import LogisticRegression
+        from scoring import ScoringService
+
+        model = LogisticRegression().fit(np.array([[0.0], [1.0], [2.0], [3.0]]), np.array([0, 0, 1, 1]))
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        model_path = models_dir / "logistic_regression.joblib"
+        joblib.dump(model, model_path)
+
+        # Compute the correct checksum, then deliberately corrupt the file.
+        import hashlib
+        good = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        (models_dir / "checksums.json").write_text(json.dumps({"logistic_regression.joblib": good}))
+        # Append bytes to invalidate the checksum.
+        with model_path.open("ab") as f:
+            f.write(b"\x00")
+
+        pd.DataFrame([{"model": "Logistic Regression", "recommended": True}]).to_csv(
+            tmp_path / "model_selection.csv", index=False
+        )
+        pd.DataFrame([{"feature": "a"}]).to_csv(tmp_path / "variable_dictionary.csv", index=False)
+
+        with pytest.raises(ValueError, match="Checksum mismatch"):
+            ScoringService.from_output_dir(tmp_path)
+
+    def test_score_applicant_rejects_raw_input(self):
+        """A caller who forgot to run feature engineering must get a loud error."""
+        from scoring import ScoringService
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        model = Pipeline([("scaler", StandardScaler()), ("clf", LogisticRegression())])
+        model.fit(np.array([[1, 2], [3, 4], [5, 6], [7, 8]]), np.array([0, 0, 1, 1]))
+
+        # Model expects 10 engineered features, but caller passes only 1 raw key.
+        feature_cols = [
+            "INCOME_T1", "FREQ_CSP", "INSTALLMENT_TO_INCOME", "HAS_CODEBTOR",
+            "LOG_INCOME_T1", "INCOME_T1_VS_CSP", "BOOK_RATIO_LOAN",
+            "TOTAL_AMT_TO_HOUSEHOLD", "MISS_HOUSE_YEARS", "PRODTYPE3_X_HOUSE",
+        ]
+        service = ScoringService(model=model, model_name="test", feature_cols=feature_cols)
+
+        with pytest.raises(ValueError, match="engineering pipeline"):
+            service.score_applicant({"INCOME_T1": 45000})
+
     def test_from_output_dir_loads_risk_tiers(self, tmp_path):
         import json
         import joblib

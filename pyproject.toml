@@ -29,6 +29,7 @@ direct-score = "training:cli"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 filterwarnings = [
     "ignore::FutureWarning",
     "ignore::UserWarning",
